@@ -7,6 +7,21 @@
 - Initialized a fresh git repository on `main` and added a `.gitignore` for local artifacts/backups.
 - Created the initial commit and pushed `main` to GitHub (`tristonkautz-kautzperformance/MC-GAME`).
 
+### Renderer Polish + HUD GC Smoothing
+- Reduced per-frame allocations in `ChunkRenderer:draw()` by reusing a scratch forward vector and doing a single visibility pass.
+- Alpha chunk meshes are now drawn back-to-front (chunk-distance sorted) to reduce translucent blending artifacts.
+- Reduced HUD per-frame allocations by caching the HUD text and updating it at a configurable interval (`Constants.PERF.hudUpdateInterval`), and by reusing scratch vectors/line buffers.
+- Precomputed constant HUD help/tip strings to avoid per-frame concatenation.
+- Fixed LOVR runtime error "Attempt to use a temporary vector from a previous frame" by switching cached vectors to `lovr.math.newVec3`.
+
+### Inventory-Full Break Safety
+- Added `Inventory:canAdd(block, amount)` in `src/inventory.lua` to support a no-allocation capacity check for stacking/existing-empty-slot acceptance.
+- Updated `Interaction:tryBreak()` in `src/interaction/Interaction.lua` to check `inventory:canAdd` before removing a world block.
+- Breaking a block now leaves the block intact when the inventory cannot accept it, preventing item loss/disappearing blocks.
+
+### Docs
+- Updated `README.md` to describe the current `F3` performance overlay (frame/chunk stats) instead of “pass stats”.
+
 ## 2026-02-09
 
 ### Rebuild Scheduling + Perf HUD

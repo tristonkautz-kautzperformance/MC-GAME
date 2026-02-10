@@ -1,162 +1,102 @@
-Codex Instructions - Generation Refactor (ChunkWorld.generate)
-=============================================================
+Codex Instructions (Codex 5.3)
+==============================
 
-Date: 2026-02-09
-
-Objective
----------
-Refactor `src/world/ChunkWorld.lua` world generation to avoid calling `ChunkWorld:set()` for every voxel.
-Instead, generate base terrain by writing directly into chunk storage, then mark chunks dirty once.
-
-Why This Matters
-----------------
-The current generator loops over every block in the world and calls `set()`, which:
-- Computes chunk/local coordinates per voxel.
-- Marks the current chunk dirty per voxel.
-- Marks neighbor chunks dirty on boundaries per voxel.
-- Creates dirty key strings repeatedly.
-
-This is OK at `32x32x64`, but it becomes a load-time and GC bottleneck as world size or generation
-complexity grows. The base terrain should be the cheapest part of the pipeline.
-
-Constraints / Non-Goals
------------------------
-- Performance-first and low allocation.
-- Do not change input/pointer lock behavior.
-- Preserve finite world bounds and block semantics.
-- Keep runtime block edits using `ChunkWorld:set()` unchanged (still marks neighbors dirty).
-- This refactor is about generation; not adding new gameplay.
-
-High-Level Approach
--------------------
-1) Tighten chunk storage semantics (recommended):
-   - Treat AIR (block id 0) as "not stored" (nil) in chunk tables.
-   - This reduces memory and prevents "air entries" from accumulating when blocks are broken.
-
-2) Bulk-generate base terrain per chunk:
-   - Iterate chunks (cx, cy, cz).
-   - For each chunk, fill layers using direct writes into `chunk.blocks[...]`.
-   - Skip writing AIR.
-   - Do not call `ChunkWorld:set()` in the base terrain loops.
-
-3) Keep sparse features (trees) using existing code paths:
-   - Tree placement is sparse; using `self:set()` is acceptable for correctness and simplicity.
-   - Optionally migrate trees to the bulk-write path later.
-
-4) Dirty marking:
-   - After generation is complete, mark all chunks dirty once.
-   - Ensure no per-voxel dirty marking happens in base terrain generation.
-
-Detailed Implementation Steps
-----------------------------
-Step 1: Store AIR as nil (recommended)
-  File: `src/world/Chunk.lua`
-  - Update `Chunk:setLocal(x, y, z, value)`:
-    - Compute index.
-    - If `value == 0` (AIR), write `nil` to the table slot instead of `0`.
-    - Else write the block id.
-    - Keep `self.dirty = true` behavior unchanged.
-  Rationale:
-  - Memory stays proportional to non-air blocks.
-  - Breaking blocks doesn't permanently bloat `chunk.blocks`.
-
-Step 2: Add a chunk reset/clear helper (optional but clean)
-  File: `src/world/Chunk.lua`
-  - Add `Chunk:clear()`:
-    - `self.blocks = {}`
-    - `self.dirty = true`
-  Use it at the start of generation to guarantee deterministic state.
-
-Step 3: Refactor base terrain generation to write per chunk
-  File: `src/world/ChunkWorld.lua`
-  - Rewrite `ChunkWorld:generate()` so the base terrain fill does NOT call `self:set()`.
-  - Keep the tree pass (and any future sparse feature passes) after base fill.
-
-  Suggested bulk fill structure (pseudocode, avoids per-voxel coord conversion):
-
-    local cs = self.chunkSize
-    local sizeX, sizeY, sizeZ = self.sizeX, self.sizeY, self.sizeZ
-
-    for cy = 1, self.chunksY do
-      local originY = (cy - 1) * cs
-      for cz = 1, self.chunksZ do
-        local originZ = (cz - 1) * cs
-        for cx = 1, self.chunksX do
-          local originX = (cx - 1) * cs
-          local chunk = self:getChunk(cx, cy, cz)
-          chunk.blocks = {}  -- or chunk:clear()
-
-          for ly = 1, cs do
-            local wy = originY + ly
-            if wy > sizeY then break end
-
-            local block = AIR
-            if wy == bedrockY then block = BEDROCK
-            elseif wy <= stoneTop then block = STONE
-            elseif wy <= dirtTop then block = DIRT
-            elseif wy == grassY then block = GRASS
-            end
-
-            if block ~= AIR then
-              local yBase = (ly - 1) * cs * cs
-              for lz = 1, cs do
-                local wz = originZ + lz
-                if wz > sizeZ then break end
-                local zBase = yBase + (lz - 1) * cs
-                for lx = 1, cs do
-                  local wx = originX + lx
-                  if wx > sizeX then break end
-                  chunk.blocks[zBase + lx] = block
-                end
-              end
-            end
-          end
-        end
-      end
-    end
-
-  Notes:
-  - Index formula matches `Chunk`'s `index3`:
-    index = ((ly - 1) * cs + (lz - 1)) * cs + lx
-  - Skipping AIR writes avoids huge "air tables" and reduces memory.
-  - This keeps generation runtime mostly linear memory writes.
-
-Step 4: Keep sparse tree placement (unchanged for now)
-  File: `src/world/ChunkWorld.lua`
-  - Keep the existing tree loop + `_placeTree(...)` as-is.
-  - It can still call `self:set(...)` for WOOD/LEAF writes.
-  - Because WOOD/LEAF are non-air, AIR-as-nil semantics won't interfere.
-
-Step 5: Dirty marking once at end
-  File: `src/world/ChunkWorld.lua`
-  - Keep (or re-add) the "mark all chunks dirty once at end" loop.
-  - Ensure the new bulk base fill does not call `_markDirty` or `_markNeighborsIfBoundary`.
-
-Validation Checklist
---------------------
-Visual/Behavior:
-- World looks identical to before:
-  - bedrock at y=1, stone <= 4, dirt <= 6, grass at y=7, air above.
-  - trees still generate on grass.
-- Breaking/placing blocks still rebuilds the correct chunks (including neighbors on boundaries).
-- Bedrock remains unbreakable.
-
-Perf/Memory:
-- Startup generation time reduces (less GC churn).
-- Dirty queue at load still causes initial mesh build (all chunks become dirty once).
-- Memory stays stable as blocks are broken/placed (no persistent growth from "air entries").
-
-Definition of Done
+Status (2026-02-10)
 ------------------
-- `ChunkWorld:generate()` no longer uses `set()` for base terrain filling.
-- Base terrain generation does not mark dirty per voxel.
-- Runtime editing path (`set`) still marks dirty + neighbors correctly.
-- Game loads and plays the same, with improved headroom for larger worlds.
+- Next task is a correctness fix (no new features): prevent blocks from disappearing when the inventory/hotbar is full.
+- Controls must not change; `F3` must still toggle the performance HUD on/off.
 
-Optional Follow-Ups (if/when needed)
-------------------------------------
-- Precompute dirty key strings per chunk to reduce string allocations in `_markDirty`.
-- Add early-out in `ChunkWorld:getDirtyChunkKeys()` to avoid allocating a table when empty.
-- Move tree placement to a bulk-write path (only if tree density becomes high).
-- Add save/load (edited blocks + inventory) once generation is stable and scalable.
+Goal
+----
+Fix the edge case where breaking a block can delete it from the world even when it cannot be added to the player's
+inventory (inventory full).
 
+Background / Bug
+----------------
+In `src/interaction/Interaction.lua`, `Interaction:tryBreak()` currently:
+1) sets the world block to AIR, then
+2) calls `Inventory:add(block, 1)`
+
+If `Inventory:add` returns `false` (no room), the block is already removed and is effectively lost ("disappears").
+
+Desired Behavior (V1)
+---------------------
+- Breaking a block should never delete it without giving the player the item.
+- If the inventory cannot accept the block, the break action should do nothing (leave the block intact).
+- Do NOT implement item drops for this task.
+- Do NOT change inputs/controls; `F3` still toggles perf HUD.
+
+Implementation Plan
+-------------------
+
+1) Add capacity check API to Inventory
+
+File: `src/inventory.lua`
+Add:
+- `Inventory:canAdd(block, amount)` -> boolean
+
+Rules:
+- Return `false` if `block` is nil or `amount <= 0`.
+- Return `true` if there is an existing slot where `slot.block == block` (stacking is allowed; there is no max stack).
+- Return `true` if there is an empty slot:
+  - `slot.block == nil`, OR
+  - `slot.count == 0` (treat as empty even if `slot.block` is set).
+- Return `false` otherwise.
+
+Notes:
+- Keep it allocation-free (no temporary tables); just loops over `self.slots`.
+- Keep `Inventory:add` behavior unchanged, except it can optionally use `canAdd` to early-return `false`.
+
+2) Gate breaking on inventory capacity
+
+File: `src/interaction/Interaction.lua`
+Update `Interaction:tryBreak()`:
+- After reading the `block` and confirming it is breakable, check inventory capacity:
+  - If `not self.inventory:canAdd(block, 1)` then return (no world change).
+- If capacity is available:
+  - `self.world:set(hit.x, hit.y, hit.z, self.constants.BLOCK.AIR)`
+  - `self.inventory:add(block, 1)`
+
+Rationale:
+- This keeps the world mutation single-pass (no "break then undo").
+- It prevents the "block disappears" case without needing a drop system.
+
+3) Optional (nice-to-have): player feedback when inventory is full
+
+If quick and low-risk, add a short HUD message like "Inventory full" when a break is blocked.
+Keep it simple:
+- Add a `state.message` string + `state.messageTimer` in `GameState` (or similar).
+- When break fails due to `canAdd == false`, set message for ~1 second.
+- In `HUD:draw`, render the message near the tip text.
+
+This is optional; correctness fix (no disappearing blocks) is the requirement.
+
+Manual Test Checklist
+---------------------
+
+A) Baseline sanity
+- Start game, capture mouse, move/look.
+- Break/place blocks normally.
+- Verify `F3` toggles perf HUD on/off (no regressions).
+
+B) Repro inventory-full case (the default game can’t easily fill 8 slots with only a few block types)
+TEMPORARY TEST CONFIG (do not commit):
+- Edit `src/constants.lua`:
+  - Set `Constants.INVENTORY_SLOT_COUNT = 2`
+  - Set `Constants.HOTBAR_DEFAULTS = { Constants.BLOCK.GRASS }`
+
+Then:
+- Start game.
+- Break a `Stone` block: inventory should now contain Grass + Stone (2 slots full).
+- Attempt to break a `Dirt` block:
+  - EXPECTED after fix: Dirt block remains in the world (not removed).
+  - EXPECTED before fix: Dirt would be removed and not appear in inventory.
+
+After verification:
+- Revert the temporary constants changes.
+
+Acceptance Criteria
+-------------------
+- When inventory is full and cannot accept a new block type, attempting to break that block does not remove it.
+- No control changes; `F3` perf HUD toggle still works.
+- No per-frame allocation regressions (changes are in interaction/inventory code paths only).

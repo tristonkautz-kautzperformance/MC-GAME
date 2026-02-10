@@ -31,7 +31,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - `1-8`: select hotbar slot
 - `Tab`: toggle mouse capture
 - `F1`: toggle help text
-- `F3`: toggle performance overlay (FPS + pass stats)
+- `F3`: toggle performance overlay (FPS + frame/chunk stats)
 - `F11`: toggle fullscreen (restarts app)
 - `Esc`: unlock mouse if captured, otherwise quit
 

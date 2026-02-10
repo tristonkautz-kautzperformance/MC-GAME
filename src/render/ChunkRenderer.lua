@@ -52,6 +52,9 @@ function ChunkRenderer.new(constants, world)
   self._rebuildsLastFrame = 0
   self._visibleCount = 0
   self._useGreedyMeshing = not (constants.MESH and constants.MESH.greedy == false)
+  self._drawForward = lovr.math.newVec3(0, 0, -1)
+  self._alphaScratch = {}
+  self._alphaScratchCount = 0
 
   return self
 end
@@ -92,6 +95,10 @@ local function clamp(value, minValue, maxValue)
     return maxValue
   end
   return value
+end
+
+local function alphaSortBackToFront(a, b)
+  return a._alphaDistSq > b._alphaDistSq
 end
 
 function ChunkRenderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
@@ -709,7 +716,12 @@ function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward
 end
 
 function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
-  local forward = lovr.math.vec3(0, 0, -1)
+  local forward = self._drawForward
+  if forward.set then
+    forward:set(0, 0, -1)
+  else
+    forward.x, forward.y, forward.z = 0, 0, -1
+  end
   forward:rotate(cameraOrientation)
 
   self._visibleCount = 0
@@ -717,7 +729,11 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
   pass:push('state')
   pass:setCullMode('none')
 
-  -- Opaque first.
+  local alphaScratch = self._alphaScratch
+  local prevAlphaCount = self._alphaScratchCount or 0
+  local alphaCount = 0
+
+  -- Opaque first (gathers alpha to draw after).
   for _, entry in pairs(self._chunkMeshes) do
     if entry.opaque or entry.alpha then
       if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward.x, forward.y, forward.z) then
@@ -725,16 +741,32 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
         if entry.opaque then
           pass:draw(entry.opaque, entry.originX, entry.originY, entry.originZ)
         end
+        if entry.alpha then
+          alphaCount = alphaCount + 1
+          alphaScratch[alphaCount] = entry
+          local dx = entry.centerX - cameraX
+          local dy = entry.centerY - cameraY
+          local dz = entry.centerZ - cameraZ
+          entry._alphaDistSq = dx * dx + dy * dy + dz * dz
+        end
       end
     end
   end
 
-  -- Alpha after opaque.
-  for _, entry in pairs(self._chunkMeshes) do
-    if entry.alpha then
-      if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward.x, forward.y, forward.z) then
-        pass:draw(entry.alpha, entry.originX, entry.originY, entry.originZ)
-      end
+  for i = alphaCount + 1, prevAlphaCount do
+    alphaScratch[i] = nil
+  end
+  self._alphaScratchCount = alphaCount
+
+  -- Alpha after opaque, sorted back-to-front to reduce blending artifacts.
+  if alphaCount > 1 then
+    table.sort(alphaScratch, alphaSortBackToFront)
+  end
+
+  for i = 1, alphaCount do
+    local entry = alphaScratch[i]
+    if entry and entry.alpha then
+      pass:draw(entry.alpha, entry.originX, entry.originY, entry.originZ)
     end
   end
 

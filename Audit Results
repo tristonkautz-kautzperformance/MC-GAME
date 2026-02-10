@@ -11,11 +11,9 @@ Scope
 
 Findings (ordered by severity)
 ------------------------------
-- Medium: Renderer draw loops iterate `pairs(self._chunkMeshes)` twice per frame (opaque then alpha) and allocate a new forward vector each draw; OK now, but scales poorly as chunk count grows. See `src/render/ChunkRenderer.lua:701`.
-- Medium: Alpha meshes (leaves) are drawn in arbitrary table iteration order (not depth-sorted), which will produce blending artifacts as more translucent content is added. See `src/render/ChunkRenderer.lua:723`.
-- Low: HUD allocates vectors and rebuilds a concatenated text block every frame; currently fine, but it adds per-frame allocation noise if you later chase micro-stutter. See `src/ui/HUD.lua:23` and `src/ui/HUD.lua:36`.
 - Low/Design: Breaking a block always removes it; if inventory is full the block effectively disappears (no drop). Decide whether this is intended. See `src/interaction/Interaction.lua:21`.
 - Scaling note: Rebuild prioritization rebuckets queued dirty entries when the player changes chunk; this is O(queue) and can be noticeable if the dirty backlog becomes large. See `src/render/ChunkRenderer.lua:92` and `src/render/ChunkRenderer.lua:236`.
+- Scaling note: Alpha chunk sorting is O(n log n) in the number of visible alpha chunks; fine for now, but keep an eye on it if leaf-heavy scenes grow.
 
 Resolved
 --------
@@ -27,3 +25,9 @@ Resolved
 - Removed idle per-frame dirty-key list allocations:
   - Added `ChunkWorld:drainDirtyChunkKeys(out)` and a shared-empty fast path in `ChunkWorld:getDirtyChunkKeys()`. See `src/world/ChunkWorld.lua:5`.
   - Renderer now drains into a reusable scratch array and queues using an explicit count. See `src/render/ChunkRenderer.lua:41`.
+- Renderer draw-path polish:
+  - Single visibility pass over chunk meshes instead of iterating the table twice.
+  - Alpha chunk meshes are drawn back-to-front to reduce blending artifacts.
+  - Cached draw vectors use persistent `lovr.math.newVec3` to avoid "temporary vector from a previous frame" crashes. See `src/render/ChunkRenderer.lua:718`.
+- HUD GC smoothing:
+  - Reuses scratch vectors/line buffers and caches concatenated HUD text, rebuilding at a fixed interval. See `src/ui/HUD.lua:4`.

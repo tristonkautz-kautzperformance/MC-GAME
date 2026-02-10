@@ -69,6 +69,29 @@ function Inventory:consumeSelected(amount)
   return true
 end
 
+function Inventory:canAdd(block, amount)
+  amount = amount or 1
+  if not block or amount <= 0 then
+    return false
+  end
+
+  for i = 1, self.slotCount do
+    local slot = self.slots[i]
+    if slot.block == block then
+      return true
+    end
+  end
+
+  for i = 1, self.slotCount do
+    local slot = self.slots[i]
+    if not slot.block or slot.count == 0 then
+      return true
+    end
+  end
+
+  return false
+end
+
 function Inventory:add(block, amount)
   amount = amount or 1
   if not block or amount <= 0 then

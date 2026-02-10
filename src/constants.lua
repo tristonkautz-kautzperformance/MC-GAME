@@ -37,7 +37,8 @@ Constants.REBUILD = {
 }
 
 Constants.PERF = {
-  showHud = true
+  showHud = true,
+  hudUpdateInterval = 0.10
 }
 
 Constants.BLOCK = {

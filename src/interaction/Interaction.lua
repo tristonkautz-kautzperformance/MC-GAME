@@ -29,6 +29,10 @@ function Interaction:tryBreak()
     return
   end
 
+  if not self.inventory:canAdd(block, 1) then
+    return
+  end
+
   self.world:set(hit.x, hit.y, hit.z, self.constants.BLOCK.AIR)
   self.inventory:add(block, 1)
 end

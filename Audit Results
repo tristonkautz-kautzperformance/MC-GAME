@@ -2,7 +2,7 @@ Audit Results
 =============
 
 Date: 2026-02-09
-Updated: 2026-02-09
+Updated: 2026-02-10
 
 Scope
 -----
@@ -11,7 +11,6 @@ Scope
 
 Findings (ordered by severity)
 ------------------------------
-- High: Git repo is not initialized correctly in this working directory: `.git` exists but is incomplete (missing `HEAD`, `objects/`, `refs/`), and git commands report "not a git repository". This blocks normal rollback/bisect workflows until you re-initialize or reclone.
 - Medium: Renderer draw loops iterate `pairs(self._chunkMeshes)` twice per frame (opaque then alpha) and allocate a new forward vector each draw; OK now, but scales poorly as chunk count grows. See `src/render/ChunkRenderer.lua:701`.
 - Medium: Alpha meshes (leaves) are drawn in arbitrary table iteration order (not depth-sorted), which will produce blending artifacts as more translucent content is added. See `src/render/ChunkRenderer.lua:723`.
 - Low: HUD allocates vectors and rebuilds a concatenated text block every frame; currently fine, but it adds per-frame allocation noise if you later chase micro-stutter. See `src/ui/HUD.lua:23` and `src/ui/HUD.lua:36`.
@@ -20,6 +19,9 @@ Findings (ordered by severity)
 
 Resolved
 --------
+- Git is now initialized correctly in this working directory:
+  - Preserved the broken `.git` folder as `.git_incomplete_backup_2026-02-10/` for safety.
+  - Initialized a new repository on `main`, added a `.gitignore` for local artifacts/backups, and pushed to GitHub (`tristonkautz-kautzperformance/MC-GAME`).
 - Base terrain generation no longer calls `ChunkWorld:set()` for every voxel; it writes directly into chunk storage and marks chunks dirty once at the end. See `src/world/ChunkWorld.lua:163`.
 - AIR storage bloat addressed: writing AIR clears chunk slots (`nil`) to keep chunk data sparse as blocks are broken/placed. See `src/world/Chunk.lua:21`.
 - Removed idle per-frame dirty-key list allocations:

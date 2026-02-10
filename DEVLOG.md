@@ -1,5 +1,12 @@
 # Dev Log
 
+## 2026-02-10
+
+### Git / Version Control Setup
+- Detected an incomplete/broken `.git` folder that prevented normal git usage; preserved it as `.git_incomplete_backup_2026-02-10/`.
+- Initialized a fresh git repository on `main` and added a `.gitignore` for local artifacts/backups.
+- Created the initial commit and pushed `main` to GitHub (`tristonkautz-kautzperformance/MC-GAME`).
+
 ## 2026-02-09
 
 ### Rebuild Scheduling + Perf HUD

@@ -1,0 +1,147 @@
+return {
+  tag = 'graphics-objects',
+  summary = 'Create a new Buffer.',
+  description = 'Creates a Buffer.',
+  arguments = {
+    size = {
+      type = 'number',
+      description = 'The size of the Buffer, in bytes.'
+    },
+    length = {
+      type = 'number',
+      default = '1',
+      description = 'The length of the Buffer.'
+    },
+    data = {
+      type = 'table | Blob',
+      description = [[
+        The initial data to put into the Buffer.  The length of the Buffer will be determined by the
+        length of the table or the size of the Blob, combined with the format information.
+      ]]
+    },
+    blob = {
+      type = 'Blob',
+      description = 'A Blob with the initial contents of the Buffer.'
+    },
+    format = {
+      type = 'table | DataType',
+      description = [[
+        A list of fields in the Buffer.  A `DataType` can also be used for buffers that are simple
+        arrays.
+      ]],
+      table = {
+        {
+          name = 'layout',
+          type = 'DataLayout',
+          default = 'packed',
+          description = 'How to lay out the Buffer fields in memory.'
+        },
+        {
+          name = 'stride',
+          type = 'number',
+          description = [[
+            The stride of the Buffer, in bytes.  When `nil`, the stride will be automatically
+            computed based on the fields.  The stride can not be zero or smaller than the max byte
+            occupied by one of the fields.  The layout of the Buffer may adjust the stride.
+          ]]
+        }
+      }
+    }
+  },
+  returns = {
+    buffer = {
+      type = 'Buffer',
+      description = 'The new Buffer.'
+    }
+  },
+  variants = {
+    {
+      arguments = { 'size' },
+      returns = { 'buffer' }
+    },
+    {
+      arguments = { 'blob' },
+      returns = { 'buffer' }
+    },
+    {
+      arguments = { 'format', 'length' },
+      returns = { 'buffer' }
+    },
+    {
+      arguments = { 'format', 'data' },
+      returns = { 'buffer' }
+    }
+  },
+  notes = [[
+    The format table can contain a list of `DataType`s or a list of tables to provide extra
+    information about each field.  Each inner table has the following keys:
+
+    - `type` is the `DataType` of the field and is required.
+    - `name` is the name of the field.  The field name is used to match table keys up to buffer
+      fields when writing table data to the Buffer, and is also used to match up buffer fields with
+      vertex attribute names declared in a `Shader`.  LÖVR has a set of <a
+      href="Shaders#vertex-attributes">default vertex attributes</a> that shaders will automatically
+      use, allowing you to create a custom mesh without having to write shader code or add custom
+      vertex attributes in a shader.
+    - `offset` is the byte offset of the field.  Any fields with a `nil` offset will be placed next
+      to each other sequentially in memory, subject to any padding required by the Buffer's layout.
+      In practice this means that you probably want to provide an `offset` for either all of the
+      fields or none of them.
+    - `length` is the array size of the field (optional, leave as `nil` for non-arrays).
+    - `stride` is the number of bytes between each item in an array (optional).
+
+    As a shorthand, the name, type, and optionally the length of a field can be provided as a list
+    instead of using keys.
+
+    If no table or Blob is used to define the initial Buffer contents, its data will be undefined.
+  ]],
+  example = {
+    description = 'Examples of different buffer formats.',
+    code = [[
+      -- 2 matrices
+      lovr.graphics.newBuffer('mat4', 2)
+
+      -- 3 integers, with initial data
+      lovr.graphics.newBuffer('int', { 1, 2, 3 })
+
+      -- a simple mesh:
+      lovr.graphics.newBuffer({
+        { name = 'VertexPosition', type = 'vec3' },
+        { name = 'VertexColor', type = 'color' }
+      }, 4)
+
+      -- a uniform buffer with vec3's, using the std140 packing
+      lovr.graphics.newBuffer({ 'vec3', layout = 'std140' }, data)
+
+      -- a uniform buffer with key-value fields
+      lovr.graphics.newBuffer({
+        { 'AmbientColor', 'vec3' },
+        { 'LightPosition', 'vec3' },
+        { 'LightType', 'u32' },
+        { 'LightColor', 'vec4' },
+        layout = 'std140'
+      })
+
+      -- a buffer with nested structure and array types
+      lovr.graphics.newBuffer({
+        { 'globals', {
+          { 'ObjectCount', 'int' },
+          { 'WorldSize', 'vec2' },
+          { 'Scale', 'float' }
+        }},
+        { 'materials', {
+          { 'Color', 'vec4' },
+          { 'Glow', 'vec3' },
+          { 'Roughness', 'float' }
+        }, length = 32 },
+        layout = 'std430'
+      })
+
+      -- a buffer using a variable from a shader:
+      lovr.graphics.newBuffer(shader:getBufferFormat('transforms'))
+    ]]
+  },
+  related = {
+    'Shader:getBufferFormat'
+  }
+}

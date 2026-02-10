@@ -1,0 +1,81 @@
+# Dev Log
+
+## 2026-02-09
+
+### Rebuild Scheduling + Perf HUD
+- Added rebuild/perf configuration tables in `src/constants.lua`:
+  - `Constants.REBUILD` for rebuild budget and priority behavior.
+  - `Constants.PERF` for perf HUD/pass stats/timing defaults.
+- Replaced FIFO dirty chunk rebuild scheduling in `src/render/ChunkRenderer.lua` with distance-bucket prioritization.
+- Added renderer priority-origin API (`setPriorityOriginWorld`) and automatic queued dirty-chunk re-bucketing when the player changes chunk.
+- Wired player camera position into rebuild prioritization each update in `src/game/GameState.lua`.
+- Made rebuild budget configurable from constants (`Constants.REBUILD.maxPerFrame`).
+- Added optional timing enable on load via `Constants.PERF.enableTiming` with API guard.
+- Added runtime perf HUD toggle on `F3` in `src/input/Input.lua`.
+- Expanded HUD debug output in `src/ui/HUD.lua`:
+  - FPS via `lovr.timer.getFPS()`.
+  - Visible chunk count and rebuilds-per-frame.
+  - Guarded `pass:getStats()` fields (draws/computes/drawsCulled/cpu memory, plus optional timing fields).
+- Fixed perf stats sampling order so `pass:getStats()` is captured after draw calls and displayed from the previous frame (prevents persistent zero draw/CPU values).
+- Timing fields are now shown only when `Constants.PERF.enableTiming` is enabled.
+- Disabled VSync in `conf.lua` using `t.graphics.vsync = false` to allow uncapped FPS during performance testing.
+- Improved pass-stats capture path to sample after world draw commands on the active pass for more reliable counters.
+- Simplified perf HUD to focused runtime metrics: FPS, frame time, worst frame in the last second, visible chunks, rebuilds, and dirty queue depth.
+- Removed pass-stat/timing overlays from runtime HUD flow to avoid noisy or misleading zero-value readouts on some platforms.
+- Refactored base terrain generation in `ChunkWorld:generate()` to write directly into chunk storage instead of calling `set()` for every voxel.
+- Updated chunk storage semantics so AIR writes clear block slots (`nil`) to keep chunk data sparse and reduce memory bloat from block breaking.
+- Preserved sparse tree placement via existing `set()` path and kept final "mark all chunks dirty once" generation behavior.
+- Added low-allocation dirty drain path (`ChunkWorld:drainDirtyChunkKeys(out)`) with an empty fast path.
+- Added a compatibility fast path in `ChunkWorld:getDirtyChunkKeys()` to return a shared empty array when no dirty chunks exist.
+- Updated renderer dirty intake to use a reusable scratch table and explicit count (`_queueDirtyKeys(dirtyKeys, count)`), avoiding per-frame dirty list allocations in the idle case.
+- Updated `README.md` controls to document the new `F3` perf toggle.
+
+## 2026-02-08
+
+### Prototype + Performance Passes
+- Built a playable voxel sandbox prototype in LOVR with Lua.
+- Added static world dimensions (`32 x 32 x 64`).
+- Implemented block types: grass, dirt, stone, bedrock, wood, leaf.
+- Implemented FPS movement, jump, gravity, and collision.
+- Added break/place interactions and an 8-slot inventory/hotbar.
+- Added day/night cycle and in-world HUD.
+- Added pointer-lock flow with click-to-capture, `Tab` toggle, and `Esc` unlock.
+- Integrated `lovr-mouse.lua` for proper relative mouse mode on LOVR `0.18`.
+- Refactored into modules (GameState, input, UI, sky, interaction).
+- Implemented chunked world storage (`16 x 16 x 16`) and mesh-based rendering.
+- Added conservative chunk culling and visible-chunk caching.
+- Added internal face culling (including internal leaf culling).
+
+### Recovery Note
+- Reconstructed project files after an accidental workspace wipe (docs folder remained).
+
+### Audit Fixes
+- Fixed input key state handling by adding key-release plumbing (`lovr.keyreleased` -> `GameState` -> `Input`) to prevent sticky WASD movement.
+- On focus loss, input now clears held keys and one-shot intents (jump/break/place/help/quit) to avoid stale movement/actions after alt-tabbing.
+- Fixed dirty chunk rebuild scheduling to queue dirty keys across frames so rebuild budget limits no longer drop pending chunk updates.
+- Enforced finite player world bounds in collision checks so the player cannot move outside the playable volume.
+- Corrected `lovr-mouse.lua` GLFW FFI signatures for `glfwGetInputMode` and `glfwSetScrollCallback`.
+- Fixed HUD help text newline rendering (actual line break instead of literal `\n`).
+
+### Input/UI/Window Cleanup
+- Fixed pointer-lock integration regression by assigning `lovr.mouse = require('lovr-mouse')` during game init.
+- Added `F11` fullscreen toggle with restart-based apply and persisted state via `.fullscreen`.
+- Updated desktop config for non-VR module usage (`t.modules.headset = false`) and explicit window settings.
+- Reworked HUD layout/scales to prevent overlapping giant text and added chunk/relative-mouse status lines.
+- Set help overlay to hidden by default (`F1` still toggles it).
+
+### Culling Fix Pass
+- Reworked chunk visibility from center-only FOV tests to conservative sphere-aware FOV culling.
+- Added horizontal chunk radius metadata and FOV padding (`fovPaddingDegrees`) to reduce edge popping.
+- Updated draw-radius culling to account for chunk radius so near-edge chunks are not culled early.
+
+### Performance Fix
+- Optimized dirty chunk rebuild queue to avoid `table.remove(..., 1)` (O(n)) and use an O(1) head-index queue.
+- Corrected queue bookkeeping to explicit head/tail indices (without `#` on sparse tables) to prevent dropped or stalled dirty chunk rebuilds.
+
+### Greedy Meshing
+- Added chunk meshing mode toggle via `Constants.MESH.greedy` (greedy on by default, naive fallback retained).
+- Implemented 6-direction greedy meshing in `ChunkRenderer` using a per-slice 2D face mask and rectangle merge.
+- Preserved existing face visibility rules by reusing `_shouldDrawFace` for opaque/translucent behavior.
+- Removed per-face color table allocations in meshing by passing RGBA scalars directly into quad emission.
+- Added HUD mesh mode indicator (`Mesh: Greedy` / `Mesh: Naive`) for quick runtime verification.

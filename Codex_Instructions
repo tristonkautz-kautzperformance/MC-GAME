@@ -1,0 +1,162 @@
+Codex Instructions - Generation Refactor (ChunkWorld.generate)
+=============================================================
+
+Date: 2026-02-09
+
+Objective
+---------
+Refactor `src/world/ChunkWorld.lua` world generation to avoid calling `ChunkWorld:set()` for every voxel.
+Instead, generate base terrain by writing directly into chunk storage, then mark chunks dirty once.
+
+Why This Matters
+----------------
+The current generator loops over every block in the world and calls `set()`, which:
+- Computes chunk/local coordinates per voxel.
+- Marks the current chunk dirty per voxel.
+- Marks neighbor chunks dirty on boundaries per voxel.
+- Creates dirty key strings repeatedly.
+
+This is OK at `32x32x64`, but it becomes a load-time and GC bottleneck as world size or generation
+complexity grows. The base terrain should be the cheapest part of the pipeline.
+
+Constraints / Non-Goals
+-----------------------
+- Performance-first and low allocation.
+- Do not change input/pointer lock behavior.
+- Preserve finite world bounds and block semantics.
+- Keep runtime block edits using `ChunkWorld:set()` unchanged (still marks neighbors dirty).
+- This refactor is about generation; not adding new gameplay.
+
+High-Level Approach
+-------------------
+1) Tighten chunk storage semantics (recommended):
+   - Treat AIR (block id 0) as "not stored" (nil) in chunk tables.
+   - This reduces memory and prevents "air entries" from accumulating when blocks are broken.
+
+2) Bulk-generate base terrain per chunk:
+   - Iterate chunks (cx, cy, cz).
+   - For each chunk, fill layers using direct writes into `chunk.blocks[...]`.
+   - Skip writing AIR.
+   - Do not call `ChunkWorld:set()` in the base terrain loops.
+
+3) Keep sparse features (trees) using existing code paths:
+   - Tree placement is sparse; using `self:set()` is acceptable for correctness and simplicity.
+   - Optionally migrate trees to the bulk-write path later.
+
+4) Dirty marking:
+   - After generation is complete, mark all chunks dirty once.
+   - Ensure no per-voxel dirty marking happens in base terrain generation.
+
+Detailed Implementation Steps
+----------------------------
+Step 1: Store AIR as nil (recommended)
+  File: `src/world/Chunk.lua`
+  - Update `Chunk:setLocal(x, y, z, value)`:
+    - Compute index.
+    - If `value == 0` (AIR), write `nil` to the table slot instead of `0`.
+    - Else write the block id.
+    - Keep `self.dirty = true` behavior unchanged.
+  Rationale:
+  - Memory stays proportional to non-air blocks.
+  - Breaking blocks doesn't permanently bloat `chunk.blocks`.
+
+Step 2: Add a chunk reset/clear helper (optional but clean)
+  File: `src/world/Chunk.lua`
+  - Add `Chunk:clear()`:
+    - `self.blocks = {}`
+    - `self.dirty = true`
+  Use it at the start of generation to guarantee deterministic state.
+
+Step 3: Refactor base terrain generation to write per chunk
+  File: `src/world/ChunkWorld.lua`
+  - Rewrite `ChunkWorld:generate()` so the base terrain fill does NOT call `self:set()`.
+  - Keep the tree pass (and any future sparse feature passes) after base fill.
+
+  Suggested bulk fill structure (pseudocode, avoids per-voxel coord conversion):
+
+    local cs = self.chunkSize
+    local sizeX, sizeY, sizeZ = self.sizeX, self.sizeY, self.sizeZ
+
+    for cy = 1, self.chunksY do
+      local originY = (cy - 1) * cs
+      for cz = 1, self.chunksZ do
+        local originZ = (cz - 1) * cs
+        for cx = 1, self.chunksX do
+          local originX = (cx - 1) * cs
+          local chunk = self:getChunk(cx, cy, cz)
+          chunk.blocks = {}  -- or chunk:clear()
+
+          for ly = 1, cs do
+            local wy = originY + ly
+            if wy > sizeY then break end
+
+            local block = AIR
+            if wy == bedrockY then block = BEDROCK
+            elseif wy <= stoneTop then block = STONE
+            elseif wy <= dirtTop then block = DIRT
+            elseif wy == grassY then block = GRASS
+            end
+
+            if block ~= AIR then
+              local yBase = (ly - 1) * cs * cs
+              for lz = 1, cs do
+                local wz = originZ + lz
+                if wz > sizeZ then break end
+                local zBase = yBase + (lz - 1) * cs
+                for lx = 1, cs do
+                  local wx = originX + lx
+                  if wx > sizeX then break end
+                  chunk.blocks[zBase + lx] = block
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+  Notes:
+  - Index formula matches `Chunk`'s `index3`:
+    index = ((ly - 1) * cs + (lz - 1)) * cs + lx
+  - Skipping AIR writes avoids huge "air tables" and reduces memory.
+  - This keeps generation runtime mostly linear memory writes.
+
+Step 4: Keep sparse tree placement (unchanged for now)
+  File: `src/world/ChunkWorld.lua`
+  - Keep the existing tree loop + `_placeTree(...)` as-is.
+  - It can still call `self:set(...)` for WOOD/LEAF writes.
+  - Because WOOD/LEAF are non-air, AIR-as-nil semantics won't interfere.
+
+Step 5: Dirty marking once at end
+  File: `src/world/ChunkWorld.lua`
+  - Keep (or re-add) the "mark all chunks dirty once at end" loop.
+  - Ensure the new bulk base fill does not call `_markDirty` or `_markNeighborsIfBoundary`.
+
+Validation Checklist
+--------------------
+Visual/Behavior:
+- World looks identical to before:
+  - bedrock at y=1, stone <= 4, dirt <= 6, grass at y=7, air above.
+  - trees still generate on grass.
+- Breaking/placing blocks still rebuilds the correct chunks (including neighbors on boundaries).
+- Bedrock remains unbreakable.
+
+Perf/Memory:
+- Startup generation time reduces (less GC churn).
+- Dirty queue at load still causes initial mesh build (all chunks become dirty once).
+- Memory stays stable as blocks are broken/placed (no persistent growth from "air entries").
+
+Definition of Done
+------------------
+- `ChunkWorld:generate()` no longer uses `set()` for base terrain filling.
+- Base terrain generation does not mark dirty per voxel.
+- Runtime editing path (`set`) still marks dirty + neighbors correctly.
+- Game loads and plays the same, with improved headroom for larger worlds.
+
+Optional Follow-Ups (if/when needed)
+------------------------------------
+- Precompute dirty key strings per chunk to reduce string allocations in `_markDirty`.
+- Add early-out in `ChunkWorld:getDirtyChunkKeys()` to avoid allocating a table when empty.
+- Move tree placement to a bulk-write path (only if tree density becomes high).
+- Add save/load (edited blocks + inventory) once generation is stable and scalable.
+

@@ -1,0 +1,18 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.log
+
+# Local agent/sandbox artifacts
+.dot_test
+__write_test_root*.txt
+
+# Previous broken git metadata (kept as backup)
+.git_incomplete_backup_*/
+
+# Old embedded git repo experiment
+git_test/

@@ -10,6 +10,12 @@ function Sky.new(constants)
 end
 
 function Sky:setTime(timeOfDay)
+  if type(timeOfDay) ~= 'number'
+    or timeOfDay ~= timeOfDay
+    or timeOfDay == math.huge
+    or timeOfDay == -math.huge then
+    return
+  end
   self.timeOfDay = timeOfDay % 1
   self.daylight = self:getDaylight()
 end

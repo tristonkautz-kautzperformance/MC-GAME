@@ -33,6 +33,10 @@ function ChunkWorld.new(constants)
 
   self._chunks = {}
   self._dirty = {}
+  self._trackEdits = true
+  self._editOriginal = {}
+  self._editValues = {}
+  self._editCount = 0
 
   for cy = 1, self.chunksY do
     self._chunks[cy] = {}
@@ -117,7 +121,37 @@ function ChunkWorld:set(x, y, z, value)
     return false
   end
 
+  local oldValue = chunk:getLocal(lx, ly, lz)
+  if oldValue == value then
+    return true
+  end
+
+  if self._trackEdits then
+    local editKey = x .. ',' .. y .. ',' .. z
+    if self._editOriginal[editKey] == nil then
+      self._editOriginal[editKey] = oldValue
+    end
+  end
+
   chunk:setLocal(lx, ly, lz, value)
+
+  if self._trackEdits then
+    local editKey = x .. ',' .. y .. ',' .. z
+    local originalValue = self._editOriginal[editKey]
+    if value == originalValue then
+      if self._editValues[editKey] ~= nil then
+        self._editValues[editKey] = nil
+        self._editCount = self._editCount - 1
+      end
+      self._editOriginal[editKey] = nil
+    else
+      if self._editValues[editKey] == nil then
+        self._editCount = self._editCount + 1
+      end
+      self._editValues[editKey] = value
+    end
+  end
+
   self:_markDirty(cx, cy, cz)
   self:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
   return true
@@ -210,6 +244,7 @@ function ChunkWorld:generate()
   local DIRT = blockIds.DIRT
   local GRASS = blockIds.GRASS
 
+  self._trackEdits = false
   self._dirty = {}
 
   -- Base terrain fill: write directly into chunk storage (avoid per-voxel set/dirty bookkeeping).
@@ -277,6 +312,44 @@ function ChunkWorld:generate()
       end
     end
   end
+
+  self._trackEdits = true
+  self._editOriginal = {}
+  self._editValues = {}
+  self._editCount = 0
+end
+
+function ChunkWorld:getEditCount()
+  return self._editCount
+end
+
+function ChunkWorld:collectEdits(out)
+  if not out then
+    return 0
+  end
+
+  local count = 0
+  for key, block in pairs(self._editValues) do
+    local x, y, z = key:match('^(%d+),(%d+),(%d+)$')
+    if x and y and z then
+      count = count + 1
+      local entry = out[count]
+      if entry then
+        entry[1] = tonumber(x)
+        entry[2] = tonumber(y)
+        entry[3] = tonumber(z)
+        entry[4] = block
+      else
+        out[count] = { tonumber(x), tonumber(y), tonumber(z), block }
+      end
+    end
+  end
+
+  for i = count + 1, #out do
+    out[i] = nil
+  end
+
+  return count
 end
 
 function ChunkWorld:_placeTree(x, y, z, rng)

@@ -146,6 +146,15 @@ function HUD:draw(pass, state)
     pass:text(self._tipText, tipX, tipY, tipZ, 0.048, cameraOrientation)
   end
 
+  if state.saveStatusTimer and state.saveStatusTimer > 0 and state.saveStatusText and state.saveStatusText ~= '' then
+    pass:setColor(1.00, 0.84, 0.55, 1)
+    local saveX = baseX - right.x * 0.52 - up.x * 0.36
+    local saveY = baseY - right.y * 0.52 - up.y * 0.36
+    local saveZ = baseZ - right.z * 0.52 - up.z * 0.36
+    pass:text(state.saveStatusText, saveX, saveY, saveZ, 0.048, cameraOrientation)
+  end
+
+  pass:setColor(.98, .98, .95, 1)
   local crossX = cameraX + forward.x * 1.2
   local crossY = cameraY + forward.y * 1.2
   local crossZ = cameraZ + forward.z * 1.2

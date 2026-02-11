@@ -8,6 +8,8 @@ local Interaction = require 'src.interaction.Interaction'
 local HUD = require 'src.ui.HUD'
 local Sky = require 'src.sky.Sky'
 local ChunkRenderer = require 'src.render.ChunkRenderer'
+local SaveSystem = require 'src.save.SaveSystem'
+local MainMenu = require 'src.ui.MainMenu'
 
 local GameState = {}
 GameState.__index = GameState
@@ -36,6 +38,23 @@ local function writeFullscreenState(enabled)
   return true
 end
 
+local function isFiniteNumber(value)
+  return type(value) == 'number'
+    and value == value
+    and value ~= math.huge
+    and value ~= -math.huge
+end
+
+local function clamp(value, minValue, maxValue)
+  if value < minValue then
+    return minValue
+  end
+  if value > maxValue then
+    return maxValue
+  end
+  return value
+end
+
 function GameState.new(constants)
   local self = setmetatable({}, GameState)
   self.constants = constants
@@ -51,6 +70,16 @@ function GameState.new(constants)
   self.sky = nil
   self.renderer = nil
 
+  self.saveSystem = nil
+  self.menu = nil
+  self.mode = 'menu'
+  self._hasSave = false
+  self._canContinue = false
+  self._saveMeta = nil
+  self._autosaveTimer = 0
+  self._saveStatusText = nil
+  self._saveStatusTimer = 0
+
   self.showHelp = false
   self.showPerfHud = true
   self.rebuildMaxPerFrame = 3
@@ -65,7 +94,6 @@ function GameState.new(constants)
 end
 
 local function tryInitRelativeMouse()
-  -- Vendored module sets `lovr.mouse` for relative input + visibility.
   local ok, mouse = pcall(require, 'lovr-mouse')
   if ok and type(mouse) == 'table' then
     lovr.mouse = mouse
@@ -76,7 +104,6 @@ local function tryInitRelativeMouse()
     return true
   end
 
-  -- Fallback: define a tiny stub so MouseLock doesn't explode.  Relative mode won't work.
   if not lovr.mouse then
     lovr.mouse = {
       setRelativeMode = function() end,
@@ -85,6 +112,235 @@ local function tryInitRelativeMouse()
   end
 
   return false
+end
+
+function GameState:_hasSession()
+  return self.world ~= nil and self.player ~= nil and self.renderer ~= nil
+end
+
+function GameState:_updateFrameTiming(dt)
+  local frameMs = dt * 1000
+  self.frameMs = frameMs
+  if frameMs > self._worstFrameWindowMax then
+    self._worstFrameWindowMax = frameMs
+  end
+  self.worstFrameMs = self._worstFrameWindowMax
+  self._worstFrameWindowTime = self._worstFrameWindowTime + dt
+  if self._worstFrameWindowTime >= 1.0 then
+    self._worstFrameWindowTime = self._worstFrameWindowTime - 1.0
+    self._worstFrameWindowMax = frameMs
+  end
+end
+
+function GameState:_getSaveStatusDuration()
+  local saveConfig = self.constants.SAVE or {}
+  local duration = tonumber(saveConfig.autosaveShowHudSeconds)
+  if not duration or duration <= 0 then
+    return 1.5
+  end
+  return duration
+end
+
+function GameState:_setSaveStatus(text, durationSeconds)
+  self._saveStatusText = text
+  self._saveStatusTimer = durationSeconds or self:_getSaveStatusDuration()
+
+  if self.menu then
+    self.menu:setStatusText(text)
+  end
+end
+
+function GameState:_tickSaveStatus(dt)
+  if not self._saveStatusText or not self._saveStatusTimer or self._saveStatusTimer <= 0 then
+    return
+  end
+
+  self._saveStatusTimer = self._saveStatusTimer - (dt or 0)
+  if self._saveStatusTimer > 0 then
+    return
+  end
+
+  local expiredText = self._saveStatusText
+  self._saveStatusText = nil
+  self._saveStatusTimer = 0
+
+  if self.menu and self.menu.statusText == expiredText then
+    self.menu:setStatusText(nil)
+  end
+end
+
+function GameState:_saveNow()
+  if not self.saveSystem or not self.world then
+    return false, 'missing_session'
+  end
+
+  return self.saveSystem:save(self.world, self.constants, self.player, self.inventory, self.sky)
+end
+
+function GameState:_updateAutosave(dt)
+  local saveConfig = self.constants.SAVE or {}
+  if saveConfig.enabled == false then
+    return
+  end
+
+  local interval = tonumber(saveConfig.autosaveIntervalSeconds) or 60
+  if interval <= 0 then
+    return
+  end
+
+  self._autosaveTimer = (self._autosaveTimer or 0) + dt
+  if self._autosaveTimer < interval then
+    return
+  end
+
+  self._autosaveTimer = 0
+  self:_setSaveStatus('Autosaving...')
+  local ok, reason = self:_saveNow()
+  self:_refreshSaveState()
+  if ok then
+    self:_setSaveStatus('Autosaved')
+  else
+    local suffix = reason and (': ' .. tostring(reason)) or ''
+    self:_setSaveStatus('Autosave failed' .. suffix)
+  end
+end
+
+function GameState:_refreshSaveState()
+  if not self.saveSystem or not self.menu then
+    return
+  end
+
+  local hasSave = self.saveSystem:exists()
+  local canContinue = false
+  local meta = nil
+
+  if hasSave then
+    meta = self.saveSystem:peek(self.constants)
+    if meta and meta.ok then
+      canContinue = true
+    end
+  end
+
+  self._hasSave = hasSave
+  self._canContinue = canContinue
+  self._saveMeta = meta
+  self.menu:setSaveState(hasSave, canContinue, nil)
+  self.menu:setSaveMeta(meta)
+end
+
+function GameState:_teardownSession()
+  self.world = nil
+  self.player = nil
+  self.inventory = nil
+
+  self.input = nil
+  self.interaction = nil
+  self.hud = nil
+  self.sky = nil
+  self.renderer = nil
+  self._autosaveTimer = 0
+
+  if self.mouseLock then
+    self.mouseLock:unlock()
+  end
+end
+
+function GameState:_startSession(loadSave)
+  self:_teardownSession()
+  self._saveStatusText = nil
+  self._saveStatusTimer = 0
+
+  self.world = World.new(self.constants)
+  self.world:generate()
+  local savedPlayerState = nil
+  local savedInventoryState = nil
+  local savedTimeOfDay = nil
+
+  if loadSave then
+    local edits, count, err, playerState, inventoryState, timeOfDay = self.saveSystem:load(self.constants)
+    if edits then
+      self.saveSystem:apply(self.world, edits, count)
+      if playerState then
+        savedPlayerState = playerState
+      end
+      if inventoryState then
+        savedInventoryState = inventoryState
+      end
+      if timeOfDay ~= nil then
+        savedTimeOfDay = timeOfDay
+      end
+    elseif err and err ~= 'missing' then
+      self:_teardownSession()
+      self.mode = 'menu'
+      self.menu:setMode('main')
+      self:_refreshSaveState()
+      return false
+    end
+  end
+
+  local spawnX, spawnY, spawnZ = self.world:getSpawnPoint()
+  local startX = spawnX
+  local startY = spawnY
+  local startZ = spawnZ
+  local startYaw = 0
+  local startPitch = 0
+
+  if savedPlayerState
+    and isFiniteNumber(savedPlayerState.x)
+    and isFiniteNumber(savedPlayerState.y)
+    and isFiniteNumber(savedPlayerState.z)
+    and isFiniteNumber(savedPlayerState.yaw)
+    and isFiniteNumber(savedPlayerState.pitch) then
+    startX = savedPlayerState.x
+    startY = savedPlayerState.y
+    startZ = savedPlayerState.z
+    startYaw = savedPlayerState.yaw
+    startPitch = clamp(savedPlayerState.pitch, -1.50, 1.50)
+  end
+
+  self.player = Player.new(self.constants.PLAYER, startX, startY, startZ)
+  self.player.yaw = startYaw
+  self.player.pitch = startPitch
+  self.player.velocityY = 0
+  self.player.onGround = false
+
+  if savedPlayerState and self.player:_collides(self.world) then
+    self.player.x = spawnX
+    self.player.y = spawnY
+    self.player.z = spawnZ
+    self.player.yaw = 0
+    self.player.pitch = 0
+    self.player.velocityY = 0
+    self.player.onGround = false
+  end
+
+  self.inventory = Inventory.new(
+    self.constants.HOTBAR_DEFAULTS,
+    self.constants.INVENTORY_SLOT_COUNT,
+    self.constants.INVENTORY_START_COUNT
+  )
+  if savedInventoryState then
+    self.inventory:applyState(savedInventoryState)
+  end
+
+  self.input = Input.new(self.mouseLock, self.inventory)
+  self.interaction = Interaction.new(self.constants, self.world, self.player, self.inventory)
+  self.hud = HUD.new(self.constants)
+  self.sky = Sky.new(self.constants)
+  if savedTimeOfDay ~= nil then
+    self.sky:setTime(savedTimeOfDay)
+  end
+  self.renderer = ChunkRenderer.new(self.constants, self.world)
+
+  local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
+  self.renderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
+  self.renderer:rebuildDirty(999)
+
+  self.mode = 'game'
+  self.menu:setMode('pause')
+  self.mouseLock:unlock()
+  self._autosaveTimer = 0
+  return true
 end
 
 function GameState:load()
@@ -101,44 +357,123 @@ function GameState:load()
   local rebuildConfig = self.constants.REBUILD or {}
   self.rebuildMaxPerFrame = rebuildConfig.maxPerFrame or 3
 
-  self.world = World.new(self.constants)
-  self.world:generate()
-
-  local spawnX, spawnY, spawnZ = self.world:getSpawnPoint()
-  self.player = Player.new(self.constants.PLAYER, spawnX, spawnY, spawnZ)
-
-  self.inventory = Inventory.new(self.constants.HOTBAR_DEFAULTS, self.constants.INVENTORY_SLOT_COUNT, self.constants.INVENTORY_START_COUNT)
-
   self.mouseLock = MouseLock.new()
-  self.input = Input.new(self.mouseLock, self.inventory)
-  self.interaction = Interaction.new(self.constants, self.world, self.player, self.inventory)
-  self.hud = HUD.new(self.constants)
-  self.sky = Sky.new(self.constants)
-  self.renderer = ChunkRenderer.new(self.constants, self.world)
+  self.mouseLock:unlock()
 
-  local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
-  self.renderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
-
-  -- Build initial meshes.
-  self.renderer:rebuildDirty(999)
+  self.saveSystem = SaveSystem.new()
+  self.menu = MainMenu.new()
+  self.mode = 'menu'
+  self:_refreshSaveState()
 end
 
-function GameState:update(dt)
-  if not self._loaded then
-    self:load()
+function GameState:_handleMenuAction(action)
+  if not action then
+    return
   end
 
-  local frameMs = dt * 1000
-  self.frameMs = frameMs
-  if frameMs > self._worstFrameWindowMax then
-    self._worstFrameWindowMax = frameMs
+  local menuMode = self.menu:getMode()
+
+  if menuMode == 'main' then
+    if action == 'continue' then
+      if self._hasSave and self._canContinue then
+        self:_startSession(true)
+      end
+      return
+    end
+
+    if action == 'new_game' or action == 'new_game_confirmed' then
+      if self._hasSave then
+        self.saveSystem:delete()
+      end
+      self:_refreshSaveState()
+      self:_startSession(false)
+      return
+    end
+
+    if action == 'delete_save_confirmed' then
+      self.saveSystem:delete()
+      self:_refreshSaveState()
+      return
+    end
+
+    if action == 'quit' then
+      lovr.event.quit()
+    end
+    return
   end
-  self.worstFrameMs = self._worstFrameWindowMax
-  self._worstFrameWindowTime = self._worstFrameWindowTime + dt
-  if self._worstFrameWindowTime >= 1.0 then
-    self._worstFrameWindowTime = self._worstFrameWindowTime - 1.0
-    self._worstFrameWindowMax = frameMs
+
+  if action == 'resume' then
+    if self:_hasSession() then
+      self.menu:setStatusText(nil)
+      self.mode = 'game'
+    else
+      self.menu:setMode('main')
+      self.mode = 'menu'
+    end
+    return
   end
+
+  if action == 'save' then
+    if self.world then
+      self:_setSaveStatus('Saving...')
+      local ok, reason = self:_saveNow()
+      self._autosaveTimer = 0
+      self:_refreshSaveState()
+      if ok then
+        self:_setSaveStatus('World saved')
+      else
+        local suffix = reason and (': ' .. tostring(reason)) or ''
+        self:_setSaveStatus('Save failed' .. suffix)
+      end
+    end
+    return
+  end
+
+  if action == 'delete_save_confirmed' then
+    self.saveSystem:delete()
+    self:_teardownSession()
+    self.mode = 'menu'
+    self.menu:setMode('main')
+    self:_refreshSaveState()
+    return
+  end
+
+  if action == 'quit' then
+    local savedOk = true
+    local savedReason = nil
+    if self.world then
+      self:_setSaveStatus('Saving...')
+      savedOk, savedReason = self:_saveNow()
+    end
+    self:_teardownSession()
+    self.mode = 'menu'
+    self.menu:setMode('main')
+    self:_refreshSaveState()
+
+    if savedOk then
+      self.menu:setStatusText('Saved and returned to menu.')
+    else
+      local suffix = savedReason and (': ' .. tostring(savedReason)) or ''
+      self.menu:setStatusText('Auto-save failed' .. suffix)
+    end
+    return
+  end
+end
+
+function GameState:_updateMenu()
+  local action = self.menu:consumeAction()
+  self:_handleMenuAction(action)
+end
+
+function GameState:_updateGame(dt)
+  if not self:_hasSession() or not self.input then
+    self.mode = 'menu'
+    self.menu:setMode('main')
+    self:_refreshSaveState()
+    return
+  end
+
+  self:_updateFrameTiming(dt)
 
   local dx, dy = self.input:getLookDelta()
   if dx ~= 0 or dy ~= 0 then
@@ -157,7 +492,7 @@ function GameState:update(dt)
   local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
   self.renderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
 
-  local timeOfDay, daylight = self.sky:update(dt)
+  local _, daylight = self.sky:update(dt)
   self.sky:applyBackground(daylight)
 
   self.interaction:updateTarget()
@@ -180,19 +515,54 @@ function GameState:update(dt)
     self.showPerfHud = not self.showPerfHud
   end
 
-  if self.input:consumeQuit() then
-    lovr.event.quit()
+  if self.input:consumeOpenMenu() then
+    self.mode = 'menu'
+    self.menu:setMode('pause')
+    if self._saveStatusText and self._saveStatusTimer > 0 then
+      self.menu:setStatusText(self._saveStatusText)
+    else
+      self.menu:setStatusText(nil)
+    end
+    self.input:onFocus(false)
+    self.input:beginFrame()
+    return
   end
 
-  -- Keep rebuild work bounded to avoid spikes.
+  self:_updateAutosave(dt)
   self.renderer:rebuildDirty(self.rebuildMaxPerFrame)
-
   self.input:beginFrame()
+end
+
+function GameState:update(dt)
+  if not self._loaded then
+    self:load()
+  end
+
+  self:_tickSaveStatus(dt)
+
+  if self.mode == 'menu' then
+    self:_updateMenu()
+    return
+  end
+
+  self:_updateGame(dt)
 end
 
 function GameState:draw(pass)
   if not self._loaded then
     self:load()
+  end
+
+  if self.mode == 'menu' then
+    self.menu:draw(pass)
+    return
+  end
+
+  if not self:_hasSession() then
+    self.menu:setMode('main')
+    self.mode = 'menu'
+    self.menu:draw(pass)
+    return
   end
 
   local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
@@ -218,6 +588,8 @@ function GameState:draw(pass)
     timeOfDay = self.sky.timeOfDay,
     targetName = self.interaction:getTargetName(),
     mouseStatusText = self.mouseLock:getStatusText(),
+    saveStatusText = self._saveStatusText,
+    saveStatusTimer = self._saveStatusTimer,
     relativeMouseReady = self.relativeMouseReady,
     meshingMode = self.renderer:getMeshingModeLabel(),
     inventory = self.inventory,
@@ -239,28 +611,54 @@ function GameState:_toggleFullscreen()
   end
 end
 
+function GameState:onQuit()
+  if self.world and self.saveSystem then
+    self:_saveNow()
+  end
+  return nil
+end
+
 function GameState:onKeyPressed(key)
-  self.input:onKeyPressed(key)
+  if self.mode == 'menu' then
+    self.menu:onKeyPressed(key)
+  elseif self.input then
+    self.input:onKeyPressed(key)
+  end
 end
 
 function GameState:onKeyReleased(key)
-  self.input:onKeyReleased(key)
+  if self.mode == 'game' and self.input then
+    self.input:onKeyReleased(key)
+  end
 end
 
 function GameState:onMouseMoved(dx, dy)
-  self.input:onMouseMoved(dx, dy)
+  if self.mode == 'game' and self.input then
+    self.input:onMouseMoved(dx, dy)
+  end
 end
 
 function GameState:onMousePressed(button)
-  self.input:onMousePressed(button)
+  if self.mode == 'game' and self.input then
+    self.input:onMousePressed(button)
+  end
 end
 
 function GameState:onWheelMoved(dy)
-  self.input:onWheelMoved(dy)
+  if self.mode == 'game' and self.input then
+    self.input:onWheelMoved(dy)
+  end
 end
 
 function GameState:onFocus(focused)
-  self.input:onFocus(focused)
+  if self.mode == 'game' and self.input then
+    self.input:onFocus(focused)
+    return
+  end
+
+  if not focused and self.mouseLock then
+    self.mouseLock:unlock()
+  end
 end
 
 return GameState

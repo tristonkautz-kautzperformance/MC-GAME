@@ -44,8 +44,7 @@ This file describes the project's intent, tech stack, and engineering constraint
   - `README.md`: run + controls.
   - `GAME_CONCEPT.md`: design outline + milestones.
   - `DEVLOG.md`: chronological progress notes.
-  - `CODEX_INSTRUCTIONS.txt`: current engineering task spec for Codex.
-  - `CODEX_POINTER_LOCK_INSTRUCTIONS.txt`: notes for pointer lock / relative mouse.
+  - `Codex_Instructions`: current engineering task spec for Codex.
 
 ## Engineering Guidelines
 - Performance-first for voxels:

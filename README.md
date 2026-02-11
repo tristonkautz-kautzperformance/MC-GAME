@@ -19,6 +19,11 @@ Simple Minecraft-style prototype in Lua using LOVR.
   - Number keys and mouse wheel selection
 - Day/night cycle with animated sky color and sun/moon
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling
+- Main menu + pause menu with keyboard navigation
+- Single-slot save/load for world block edits (diff-based)
+- Continue restores player position/look, inventory/hotbar state, and time-of-day
+- Autosave every 60 seconds during active gameplay with HUD/menu status text
+- Main menu save metadata (availability, last saved time, edit count, version health)
 
 ## Controls
 
@@ -33,7 +38,17 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - `F1`: toggle help text
 - `F3`: toggle performance overlay (FPS + frame/chunk stats)
 - `F11`: toggle fullscreen (restarts app)
-- `Esc`: unlock mouse if captured, otherwise quit
+- `Esc`: unlock mouse if captured; if already unlocked, open pause menu
+- `Up/Down` or `W/S`: menu navigation
+- `Enter`: menu select / confirm
+
+Quit and save:
+- Use pause menu `Save` to save without exiting.
+- Autosave runs every 60 seconds while actively playing (not paused/menu).
+- In pause menu, `Quit` saves and returns to the main menu.
+- In main menu, `Quit` exits the game.
+- Window close/Alt+F4 also saves world edits.
+- In main menu, `New Game` requires pressing `Enter` twice when a save already exists.
 
 ## Run
 

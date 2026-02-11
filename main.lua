@@ -38,3 +38,7 @@ end
 function lovr.focus(focused)
   game:onFocus(focused)
 end
+
+function lovr.quit()
+  return game:onQuit()
+end

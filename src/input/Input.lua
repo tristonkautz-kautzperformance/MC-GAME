@@ -16,6 +16,7 @@ function Input.new(mouseLock, inventory)
   self.wantToggleHelp = false
   self.wantTogglePerfHud = false
   self.wantToggleFullscreen = false
+  self.wantOpenMenu = false
   self.wantQuit = false
 
   return self
@@ -47,7 +48,7 @@ function Input:onKeyPressed(key)
     if self.mouseLock and self.mouseLock:isLocked() then
       self.mouseLock:unlock()
     else
-      self.wantQuit = true
+      self.wantOpenMenu = true
     end
   else
     local index = tonumber(key)
@@ -107,6 +108,7 @@ function Input:onFocus(focused)
     self.wantToggleHelp = false
     self.wantTogglePerfHud = false
     self.wantToggleFullscreen = false
+    self.wantOpenMenu = false
     self.wantQuit = false
   end
 end
@@ -160,6 +162,12 @@ end
 function Input:consumeToggleFullscreen()
   local v = self.wantToggleFullscreen
   self.wantToggleFullscreen = false
+  return v
+end
+
+function Input:consumeOpenMenu()
+  local v = self.wantOpenMenu
+  self.wantOpenMenu = false
   return v
 end
 

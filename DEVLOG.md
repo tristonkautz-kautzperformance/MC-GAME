@@ -1,5 +1,52 @@
 # Dev Log
 
+## 2026-02-11
+
+### Save V2 + Autosave + Menu Metadata
+- Upgraded save serialization in `src/save/SaveSystem.lua` to always write `MC_SAVE_V2` at `saves/world_v1.txt`.
+- Added backward-compatible load support for both `MC_SAVE_V1` and `MC_SAVE_V2`.
+- Extended save payload to include:
+  - `savedAt` unix timestamp
+  - `time` (`Sky.timeOfDay`)
+  - `inv` + `slot` entries for hotbar/inventory state
+  - existing player transform and diff-based edits (`BEGIN_EDITS` marker layout)
+- Added `SaveSystem:peek(constants)` metadata parsing for main-menu save health/details without building edit tables.
+- Added inventory serialization APIs in `src/inventory.lua`:
+  - `Inventory:getState(out)` for reusable export tables
+  - `Inventory:applyState(state)` with validation/clamping and empty-slot normalization
+- Updated session boot flow in `src/game/GameState.lua` so Continue restores inventory/hotbar selection and time-of-day.
+- Added autosave support in `src/game/GameState.lua` using new `Constants.SAVE` config:
+  - `enabled`
+  - `autosaveIntervalSeconds`
+  - `autosaveShowHudSeconds`
+- Added shared save-status messaging used by autosave + manual save:
+  - HUD transient status text (`Saving...`, `Autosaving...`, `Autosaved`, failures)
+  - pause menu status line integration
+- Added main-menu save metadata rendering in `src/ui/MainMenu.lua`:
+  - availability/corrupt/incompatible state
+  - version info
+  - last saved timestamp (when available)
+  - edit count
+- Added New Game overwrite confirmation when any save file exists:
+  - first Enter arms confirmation
+  - second Enter emits `new_game_confirmed`
+  - navigation/Esc cancels
+
+### Persistence + Menu Foundation
+- Added world edit diff tracking in `src/world/ChunkWorld.lua` (`_editOriginal/_editValues`) so only block edits are persisted.
+- Added `ChunkWorld:getEditCount()` and `ChunkWorld:collectEdits(out)` for save serialization.
+- Added `src/save/SaveSystem.lua` with single-slot save support at `saves/world_v1.txt` using `lovr.filesystem` and versioned header validation.
+- Added `src/ui/MainMenu.lua` with startup/pause modes, keyboard navigation, and delete-save confirmation flow.
+- Refactored `src/game/GameState.lua` to support `menu` vs `game` modes, session start/teardown, and menu intent handling.
+- Updated `src/input/Input.lua` so `Esc` opens pause menu when mouse is already unlocked (while preserving unlock behavior when captured).
+- Added `lovr.quit` hook in `main.lua` to save diffs on window close/Alt+F4.
+- Added explicit in-game `Save` action in the pause menu with on-screen save status feedback.
+- Changed pause menu `Quit` behavior to save and return to the main menu instead of exiting the app.
+- Hardened save detection/parse flow for save availability checks in main menu.
+- Updated save behavior so an explicit save creates a valid save file even with zero world edits (Continue now registers reliably).
+- Extended save format to persist player position and look direction; Continue now restores player state with safe spawn fallback if invalid/colliding.
+- Updated `README.md` controls and feature list for menu/save behavior.
+
 ## 2026-02-10
 
 ### Git / Version Control Setup
@@ -21,6 +68,7 @@
 
 ### Docs
 - Updated `README.md` to describe the current `F3` performance overlay (frame/chunk stats) instead of “pass stats”.
+- Updated `AGENTS.md` to reference `Codex_Instructions` (removed stale `CODEX_*.txt` references).
 
 ## 2026-02-09
 

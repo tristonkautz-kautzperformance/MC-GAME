@@ -1,102 +1,252 @@
 Codex Instructions (Codex 5.3)
 ==============================
 
-Status (2026-02-10)
+Status (2026-02-11)
 ------------------
-- Next task is a correctness fix (no new features): prevent blocks from disappearing when the inventory/hotbar is full.
-- Controls must not change; `F3` must still toggle the performance HUD on/off.
+Next cohesive update: (1) session-state persistence (inventory + time), (2) autosave, (3) main-menu metadata + New Game confirmation.
 
-Goal
-----
-Fix the edge case where breaking a block can delete it from the world even when it cannot be added to the player's
-inventory (inventory full).
+This spec builds on what already exists:
+- Diff-based world edits persist.
+- Player position/orientation persist.
+- Main menu + pause menu exist.
+- Pause "Quit" returns to menu (do not revert this).
 
-Background / Bug
-----------------
-In `src/interaction/Interaction.lua`, `Interaction:tryBreak()` currently:
-1) sets the world block to AIR, then
-2) calls `Inventory:add(block, 1)`
+Bundle Goals (Implement Together)
+--------------------------------
+1) Persist additional session state:
+   - Inventory/hotbar contents (block ids + counts) and selected slot.
+   - Time-of-day (`Sky.timeOfDay`).
+2) Autosave:
+   - Timer-based autosave every N seconds during gameplay.
+   - Minimal, clear feedback: "Autosaved" (and failure reason if needed).
+3) Menu polish:
+   - Show save metadata in the main menu (last saved time, edit count, version/corrupt).
+   - New Game requires confirmation if it would overwrite an existing save.
 
-If `Inventory:add` returns `false` (no room), the block is already removed and is effectively lost ("disappears").
+Constraints / Non-Goals
+-----------------------
+- Pointer lock must remain unchanged:
+  - Click captures mouse.
+  - Tab toggles lock.
+  - Esc unlocks when locked.
+- Avoid per-frame allocations in update/draw.
+- Use `lovr.filesystem` for save IO.
+- Single-slot save (no multiple save slots yet).
+- No crafting/hunger/AI/etc in this update.
 
-Desired Behavior (V1)
+
+Save Format Upgrade (Versioned)
+-------------------------------
+Current saves use a versioned magic string. Upgrade to a new version that includes inventory/time/metadata while keeping backward compatibility.
+
+Implementation Requirements
+---------------------------
+- Writer: always write `MC_SAVE_V2`.
+- Loader: support BOTH `MC_SAVE_V1` and `MC_SAVE_V2`.
+- Keep the same save path (no migration step required).
+- A save with *zero* edits must still count as a valid save (Continue should work even if the player just started a world and saved without editing blocks).
+
+Recommended Save Path
 ---------------------
-- Breaking a block should never delete it without giving the player the item.
-- If the inventory cannot accept the block, the break action should do nothing (leave the block intact).
-- Do NOT implement item drops for this task.
-- Do NOT change inputs/controls; `F3` still toggles perf HUD.
+- `saves/world_v1.txt` (keep path, upgrade contents)
 
-Implementation Plan
--------------------
+MC_SAVE_V2 Layout (Text, ASCII)
+-------------------------------
+Line 1:
+- `MC_SAVE_V2`
 
-1) Add capacity check API to Inventory
-
-File: `src/inventory.lua`
-Add:
-- `Inventory:canAdd(block, amount)` -> boolean
-
-Rules:
-- Return `false` if `block` is nil or `amount <= 0`.
-- Return `true` if there is an existing slot where `slot.block == block` (stacking is allowed; there is no max stack).
-- Return `true` if there is an empty slot:
-  - `slot.block == nil`, OR
-  - `slot.count == 0` (treat as empty even if `slot.block` is set).
-- Return `false` otherwise.
+Required headers (one per line):
+- `seed <int>`
+- `world <sizeX> <sizeY> <sizeZ>`
+- `chunk <chunkSize>`
+- `savedAt <unixSeconds>` (0 if unavailable)
+- `time <timeOfDayFloat>` (range [0, 1))
+- `player <xFloat> <yFloat> <zFloat> <yawFloat> <pitchFloat>`
+- `inv <slotCountInt> <selectedIndexInt>`
+- `slot <indexInt> <blockIdInt> <countInt>` (repeat `slotCountInt` times)
+- `edits <countInt>`
+- `BEGIN_EDITS`
+- `<xInt> <yInt> <zInt> <blockIdInt>` (repeat `countInt` times)
 
 Notes:
-- Keep it allocation-free (no temporary tables); just loops over `self.slots`.
-- Keep `Inventory:add` behavior unchanged, except it can optionally use `canAdd` to early-return `false`.
+- Keep floats to reasonable precision (e.g. `%.6f`).
+- Use 1-based slot indices in the file (match Lua tables).
+- `blockId` uses your `Constants.BLOCK` ids; `0` means empty/AIR.
+- For empty slots write `slot i 0 0`.
 
-2) Gate breaking on inventory capacity
+MC_SAVE_V1 Support
+------------------
+`MC_SAVE_V1` currently stores:
+- seed/world/chunk/edits
+- optional player line
+- edit lines
 
-File: `src/interaction/Interaction.lua`
-Update `Interaction:tryBreak()`:
-- After reading the `block` and confirming it is breakable, check inventory capacity:
-  - If `not self.inventory:canAdd(block, 1)` then return (no world change).
-- If capacity is available:
-  - `self.world:set(hit.x, hit.y, hit.z, self.constants.BLOCK.AIR)`
-  - `self.inventory:add(block, 1)`
+When loading V1:
+- Inventory defaults to New Game inventory.
+- Time-of-day defaults to `Sky.new` default.
+- `savedAt` is nil/0.
+- The next explicit Save/autosave should write `MC_SAVE_V2`.
 
-Rationale:
-- This keeps the world mutation single-pass (no "break then undo").
-- It prevents the "block disappears" case without needing a drop system.
 
-3) Optional (nice-to-have): player feedback when inventory is full
+Code Tasks
+----------
 
-If quick and low-risk, add a short HUD message like "Inventory full" when a break is blocked.
-Keep it simple:
-- Add a `state.message` string + `state.messageTimer` in `GameState` (or similar).
-- When break fails due to `canAdd == false`, set message for ~1 second.
-- In `HUD:draw`, render the message near the tip text.
+1) Inventory Persistence
+------------------------
+Files: `src/inventory.lua`, `src/save/SaveSystem.lua`, `src/game/GameState.lua`
 
-This is optional; correctness fix (no disappearing blocks) is the requirement.
+Add APIs to Inventory (recommended):
+- `Inventory:getState(out)`:
+  - Fill `out` (reuse table to reduce GC).
+  - Shape:
+    - `out.slotCount = N`
+    - `out.selected = selectedIndex`
+    - `out.slots = { { block = <id>, count = <int> }, ... }` (length N)
+  - Store `block=0,count=0` for empty.
+- `Inventory:applyState(state)`:
+  - Apply slots up to `self.slotCount` (ignore extras).
+  - Any invalid/missing slot becomes empty:
+    - `count <= 0` OR `blockId == 0` OR missing -> empty
+  - Clamp selected index to `[1, slotCount]`.
+
+SaveSystem changes:
+- Extend `SaveSystem:save(...)` to accept (or reach) `inventory`:
+  - Write V2 `inv` + `slot` lines from inventory state.
+
+GameState changes:
+- On Continue/New Game start:
+  - Create inventory.
+  - If a save provides an inventory state, apply it after inventory creation (before HUD draw is fine).
+
+2) Time-of-Day Persistence
+--------------------------
+Files: `src/sky/Sky.lua`, `src/save/SaveSystem.lua`, `src/game/GameState.lua`
+
+- Save `sky.timeOfDay` into the V2 `time` line.
+- Load:
+  - After `Sky.new`, call `sky:setTime(savedTime)` if present.
+
+3) Autosave
+-----------
+Files: `src/constants.lua`, `src/game/GameState.lua`, `src/save/SaveSystem.lua`, `src/ui/HUD.lua`, `src/ui/MainMenu.lua`
+
+Constants:
+- Add `Constants.SAVE`:
+  - `enabled = true`
+  - `autosaveIntervalSeconds = 60`
+  - `autosaveShowHudSeconds = 1.5`
+
+GameState:
+- Track:
+  - `self._autosaveTimer`
+  - `self._saveStatusText`
+  - `self._saveStatusTimer`
+- When in gameplay mode (not main menu; ideally also not while paused):
+  - If `Constants.SAVE.enabled`:
+    - Accumulate `dt`.
+    - When timer >= interval:
+      - Set status to "Autosaving..."
+      - Call `saveSystem:save(world, constants, player, inventory, sky)`
+      - If ok: set status "Autosaved"
+      - If not ok: set status "Autosave failed: <reason>"
+      - Reset timer to 0
+- When user triggers manual Save (pause menu):
+  - Show "Saving..." then "World saved" using the same status system.
+  - Reset autosave timer so an autosave doesn't immediately happen afterward.
+
+HUD:
+- Display `saveStatusText` when `saveStatusTimer > 0`:
+  - Render a single line in the HUD (near existing tip/status text).
+  - Avoid rebuilding lots of text objects every frame: just draw a string when active.
+
+Menu:
+- When pause menu is open, show the current save status text in the menu status line.
+
+4) Menu Metadata + Confirm New Game
+-----------------------------------
+Files: `src/save/SaveSystem.lua`, `src/ui/MainMenu.lua`, `src/game/GameState.lua`
+
+Save metadata to show:
+- Save availability + status (ok / corrupt / incompatible)
+- Version (V1 vs V2)
+- Last saved time (`savedAt`)
+- `editCount`
+- Optional: player coords
+
+Implementation approach:
+- Add `SaveSystem:peek(constants)`:
+  - Parse just enough to return metadata (do not build full edits table).
+  - Return meta table:
+    - `{ ok = true, version = 1|2, savedAt = <int>, editCount = <int>, player = {x,y,z}, timeOfDay = <float> }`
+    - Or `{ ok = false, err = "..." }`
+- GameState:
+  - Refresh menu meta when entering the main menu and after save/delete.
+  - Pass meta into `MainMenu`.
+
+MainMenu:
+- Add `MainMenu:setSaveMeta(meta)` and render metadata under the options:
+  - `Save: Available` / `Save: Corrupt` / `Save: Incompatible`
+  - `Last saved: <formatted>` or `Last saved: Unknown`
+  - `Edits: N`
+- Format savedAt:
+  - Prefer `os.date("%Y-%m-%d %H:%M:%S", savedAt)` if available.
+  - If not available or savedAt==0: show Unknown.
+
+New Game confirmation:
+- If a save exists (meta ok OR even corrupt-but-present), selecting New Game should confirm:
+  - First Enter: arm confirmation state and set status text: "Press Enter again to overwrite save."
+  - Second Enter: emit `new_game_confirmed` event.
+  - Any navigation / Esc cancels confirmation.
+- Keep existing delete-save confirmation behavior.
+
+5) Docs
+-------
+Files: `README.md`, `DEVLOG.md`
+
+When implementing:
+- `README.md`:
+  - Mention Continue restores inventory + time-of-day.
+  - Mention autosave behavior/interval.
+  - Mention New Game confirmation behavior.
+- `DEVLOG.md`:
+  - Add a dated entry describing this cohesive update.
+
 
 Manual Test Checklist
 ---------------------
 
-A) Baseline sanity
-- Start game, capture mouse, move/look.
-- Break/place blocks normally.
-- Verify `F3` toggles perf HUD on/off (no regressions).
+Inventory persistence
+1. Start New Game.
+2. Change hotbar counts/selection (place/break).
+3. Save.
+4. Quit to menu, Continue.
+5. Verify hotbar blocks/counts/selection are restored.
 
-B) Repro inventory-full case (the default game can’t easily fill 8 slots with only a few block types)
-TEMPORARY TEST CONFIG (do not commit):
-- Edit `src/constants.lua`:
-  - Set `Constants.INVENTORY_SLOT_COUNT = 2`
-  - Set `Constants.HOTBAR_DEFAULTS = { Constants.BLOCK.GRASS }`
+Time-of-day persistence
+1. Note day percent in HUD.
+2. Save.
+3. Quit to menu, Continue.
+4. Verify time-of-day is close to saved value.
 
-Then:
-- Start game.
-- Break a `Stone` block: inventory should now contain Grass + Stone (2 slots full).
-- Attempt to break a `Dirt` block:
-  - EXPECTED after fix: Dirt block remains in the world (not removed).
-  - EXPECTED before fix: Dirt would be removed and not appear in inventory.
+Autosave
+1. Temporarily set autosave interval to `5s`.
+2. Play and wait for autosave message.
+3. Quit to menu, Continue.
+4. Verify state persists.
 
-After verification:
-- Revert the temporary constants changes.
+Menu metadata
+1. Main menu shows last saved time + edit count.
+2. Corrupt save behavior:
+   - Tamper the save file and verify menu shows corrupt status and allows delete.
+
+New Game confirmation
+1. With a save present:
+2. Selecting New Game requires confirm.
+3. Cancel with Esc or moving selection.
 
 Acceptance Criteria
 -------------------
-- When inventory is full and cannot accept a new block type, attempting to break that block does not remove it.
-- No control changes; `F3` perf HUD toggle still works.
-- No per-frame allocation regressions (changes are in interaction/inventory code paths only).
+- Continue restores player position/orientation, inventory state, and time-of-day.
+- Autosave runs on a timer and provides minimal feedback.
+- Main menu shows save metadata and New Game requires confirmation.
+- Pointer lock behavior remains correct.

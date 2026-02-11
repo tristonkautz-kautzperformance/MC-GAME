@@ -1,0 +1,569 @@
+local SaveSystem = {}
+SaveSystem.__index = SaveSystem
+
+local SAVE_DIR = 'saves'
+local SAVE_FILE = SAVE_DIR .. '/world_v1.txt'
+local SAVE_MAGIC_V1 = 'MC_SAVE_V1'
+local SAVE_MAGIC_V2 = 'MC_SAVE_V2'
+
+function SaveSystem.new()
+  local self = setmetatable({}, SaveSystem)
+  self._linesScratch = {}
+  self._editsScratch = {}
+  self._loadLinesScratch = {}
+  self._inventoryScratch = { slots = {} }
+  return self
+end
+
+local function getFilesystem()
+  if lovr and lovr.filesystem then
+    return lovr.filesystem
+  end
+  return nil
+end
+
+local function clearArray(array)
+  for i = #array, 1, -1 do
+    array[i] = nil
+  end
+end
+
+local function isFiniteNumber(value)
+  return type(value) == 'number'
+    and value == value
+    and value ~= math.huge
+    and value ~= -math.huge
+end
+
+local function parseInteger(token)
+  local value = tonumber(token)
+  if not value or value % 1 ~= 0 then
+    return nil
+  end
+  return value
+end
+
+local function parseFiniteNumber(token)
+  local value = tonumber(token)
+  if not isFiniteNumber(value) then
+    return nil
+  end
+  return value
+end
+
+local function parsePlayerLine(line)
+  local px, py, pz, yaw, pitch = (line or ''):match(
+    '^player%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)$'
+  )
+  if not px or not py or not pz or not yaw or not pitch then
+    return nil
+  end
+
+  local x = parseFiniteNumber(px)
+  local y = parseFiniteNumber(py)
+  local z = parseFiniteNumber(pz)
+  local yawValue = parseFiniteNumber(yaw)
+  local pitchValue = parseFiniteNumber(pitch)
+  if not x or not y or not z or not yawValue or not pitchValue then
+    return nil
+  end
+
+  return {
+    x = x,
+    y = y,
+    z = z,
+    yaw = yawValue,
+    pitch = pitchValue
+  }
+end
+
+local function parseEditLine(line)
+  local xToken, yToken, zToken, blockToken = (line or ''):match(
+    '^(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)$'
+  )
+  if not xToken or not yToken or not zToken or not blockToken then
+    return nil
+  end
+
+  local x = parseInteger(xToken)
+  local y = parseInteger(yToken)
+  local z = parseInteger(zToken)
+  local block = parseInteger(blockToken)
+  if not x or not y or not z or not block then
+    return nil
+  end
+
+  return x, y, z, block
+end
+
+local function parseCoreHeaders(lines, constants)
+  local seed = parseInteger((lines[2] or ''):match('^seed%s+(-?%d+)$'))
+  local sizeX, sizeY, sizeZ = (lines[3] or ''):match('^world%s+(%d+)%s+(%d+)%s+(%d+)$')
+  local chunkSize = parseInteger((lines[4] or ''):match('^chunk%s+(%d+)$'))
+  if not seed or not sizeX or not sizeY or not sizeZ or not chunkSize then
+    return nil, 'corrupt'
+  end
+
+  sizeX = parseInteger(sizeX)
+  sizeY = parseInteger(sizeY)
+  sizeZ = parseInteger(sizeZ)
+
+  if seed ~= (constants.WORLD_SEED or 0)
+    or sizeX ~= (constants.WORLD_SIZE_X or 0)
+    or sizeY ~= (constants.WORLD_SIZE_Y or 0)
+    or sizeZ ~= (constants.WORLD_SIZE_Z or 0)
+    or chunkSize ~= (constants.CHUNK_SIZE or 0) then
+    return nil, 'incompatible'
+  end
+
+  return {
+    seed = seed,
+    sizeX = sizeX,
+    sizeY = sizeY,
+    sizeZ = sizeZ,
+    chunkSize = chunkSize
+  }, nil
+end
+
+local function buildErrorInfo(version, savedAt, editCount)
+  local info = { version = version }
+  if savedAt ~= nil then
+    info.savedAt = savedAt
+  end
+  if editCount ~= nil then
+    info.editCount = editCount
+  end
+  return info
+end
+
+local function parseSave(lines, constants, options)
+  options = options or {}
+  local includeEdits = options.includeEdits == true
+  local includeInventory = options.includeInventory == true
+
+  local magic = lines[1]
+  local version = nil
+  if magic == SAVE_MAGIC_V1 then
+    version = 1
+  elseif magic == SAVE_MAGIC_V2 then
+    version = 2
+  else
+    if type(magic) == 'string' and magic:match('^MC_SAVE_') then
+      return nil, 'incompatible', buildErrorInfo(nil)
+    end
+    return nil, 'corrupt', buildErrorInfo(nil)
+  end
+
+  local core, coreErr = parseCoreHeaders(lines, constants)
+  if not core then
+    return nil, coreErr, buildErrorInfo(version)
+  end
+
+  local result = {
+    version = version,
+    seed = core.seed,
+    sizeX = core.sizeX,
+    sizeY = core.sizeY,
+    sizeZ = core.sizeZ,
+    chunkSize = core.chunkSize,
+    savedAt = 0,
+    timeOfDay = nil,
+    player = nil,
+    inventory = nil,
+    editCount = 0,
+    edits = includeEdits and {} or nil
+  }
+
+  local index = 5
+  if version == 1 then
+    local editCount = parseInteger((lines[index] or ''):match('^edits%s+(%-?%d+)$'))
+    if not editCount or editCount < 0 then
+      return nil, 'corrupt', buildErrorInfo(version)
+    end
+    result.editCount = editCount
+    index = index + 1
+
+    local playerLine = lines[index]
+    if playerLine and playerLine:match('^player%s+') then
+      local player = parsePlayerLine(playerLine)
+      if not player then
+        return nil, 'corrupt', buildErrorInfo(version, 0, editCount)
+      end
+      result.player = player
+      index = index + 1
+    end
+
+    for i = 1, editCount do
+      local x, y, z, block = parseEditLine(lines[index + i - 1])
+      if not x then
+        return nil, 'corrupt', buildErrorInfo(version, 0, editCount)
+      end
+      if includeEdits then
+        result.edits[i] = { x, y, z, block }
+      end
+    end
+
+    return result, nil, nil
+  end
+
+  local savedAt = parseInteger((lines[index] or ''):match('^savedAt%s+(-?%d+)$'))
+  if not savedAt or savedAt < 0 then
+    return nil, 'corrupt', buildErrorInfo(version)
+  end
+  result.savedAt = savedAt
+  index = index + 1
+
+  local timeToken = (lines[index] or ''):match('^time%s+([^%s]+)$')
+  local timeOfDay = parseFiniteNumber(timeToken)
+  if not timeOfDay then
+    return nil, 'corrupt', buildErrorInfo(version, savedAt)
+  end
+  result.timeOfDay = timeOfDay % 1
+  index = index + 1
+
+  local player = parsePlayerLine(lines[index])
+  if not player then
+    return nil, 'corrupt', buildErrorInfo(version, savedAt)
+  end
+  result.player = player
+  index = index + 1
+
+  local slotCountToken, selectedToken = (lines[index] or ''):match('^inv%s+(%-?%d+)%s+(%-?%d+)$')
+  local slotCount = parseInteger(slotCountToken)
+  local selected = parseInteger(selectedToken)
+  if not slotCount or slotCount < 0 or not selected then
+    return nil, 'corrupt', buildErrorInfo(version, savedAt)
+  end
+  index = index + 1
+
+  local inventoryState = nil
+  if includeInventory then
+    inventoryState = {
+      slotCount = slotCount,
+      selected = selected,
+      slots = {}
+    }
+    result.inventory = inventoryState
+  end
+
+  local seenSlot = {}
+  for i = 1, slotCount do
+    local slotIndexToken, blockToken, countToken = (lines[index] or ''):match(
+      '^slot%s+(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)$'
+    )
+    local slotIndex = parseInteger(slotIndexToken)
+    local blockId = parseInteger(blockToken)
+    local count = parseInteger(countToken)
+    if not slotIndex or slotIndex < 1 or slotIndex > slotCount or seenSlot[slotIndex] or not blockId or not count then
+      return nil, 'corrupt', buildErrorInfo(version, savedAt)
+    end
+
+    seenSlot[slotIndex] = true
+    if inventoryState then
+      inventoryState.slots[slotIndex] = {
+        block = blockId,
+        count = count
+      }
+    end
+    index = index + 1
+  end
+
+  local editCount = parseInteger((lines[index] or ''):match('^edits%s+(%-?%d+)$'))
+  if not editCount or editCount < 0 then
+    return nil, 'corrupt', buildErrorInfo(version, savedAt)
+  end
+  result.editCount = editCount
+  index = index + 1
+
+  if lines[index] ~= 'BEGIN_EDITS' then
+    return nil, 'corrupt', buildErrorInfo(version, savedAt, editCount)
+  end
+  index = index + 1
+
+  for i = 1, editCount do
+    local x, y, z, block = parseEditLine(lines[index + i - 1])
+    if not x then
+      return nil, 'corrupt', buildErrorInfo(version, savedAt, editCount)
+    end
+    if includeEdits then
+      result.edits[i] = { x, y, z, block }
+    end
+  end
+
+  if includeInventory and inventoryState then
+    for i = 1, slotCount do
+      if inventoryState.slots[i] == nil then
+        inventoryState.slots[i] = { block = 0, count = 0 }
+      end
+    end
+  end
+
+  return result, nil, nil
+end
+
+local function getCurrentUnixSeconds()
+  if not os or not os.time then
+    return 0
+  end
+
+  local ok, value = pcall(os.time)
+  if not ok then
+    return 0
+  end
+
+  local seconds = parseInteger(value)
+  if not seconds or seconds < 0 then
+    return 0
+  end
+  return seconds
+end
+
+local function normalizeReadResult(a, b)
+  local data = a
+  if type(data) == 'boolean' then
+    data = b
+  end
+  if data and type(data) ~= 'string' and data.getString then
+    data = data:getString()
+  end
+  return data
+end
+
+function SaveSystem:exists()
+  local filesystem = getFilesystem()
+  if not filesystem then
+    return false
+  end
+
+  if filesystem.getInfo and filesystem.getInfo(SAVE_FILE) ~= nil then
+    return true
+  end
+
+  if filesystem.read then
+    local data = normalizeReadResult(filesystem.read(SAVE_FILE))
+    return type(data) == 'string' and data ~= ''
+  end
+
+  return false
+end
+
+function SaveSystem:delete()
+  local filesystem = getFilesystem()
+  if not filesystem or not filesystem.remove then
+    return false
+  end
+
+  if not self:exists() then
+    return true
+  end
+
+  local ok = filesystem.remove(SAVE_FILE)
+  if ok then
+    return true
+  end
+
+  return filesystem.getInfo(SAVE_FILE) == nil
+end
+
+function SaveSystem:save(world, constants, player, inventory, sky)
+  local filesystem = getFilesystem()
+  if not filesystem or not filesystem.write then
+    return false, 'filesystem_unavailable'
+  end
+  if not world or not constants then
+    return false, 'invalid_arguments'
+  end
+
+  if filesystem.createDirectory then
+    filesystem.createDirectory(SAVE_DIR)
+  end
+
+  local edits = self._editsScratch
+  local editCount = world:collectEdits(edits)
+  local lines = self._linesScratch
+  clearArray(lines)
+
+  lines[1] = SAVE_MAGIC_V2
+  lines[2] = string.format('seed %d', constants.WORLD_SEED or 0)
+  lines[3] = string.format(
+    'world %d %d %d',
+    constants.WORLD_SIZE_X or 0,
+    constants.WORLD_SIZE_Y or 0,
+    constants.WORLD_SIZE_Z or 0
+  )
+  lines[4] = string.format('chunk %d', constants.CHUNK_SIZE or 0)
+
+  local savedAt = getCurrentUnixSeconds()
+  lines[5] = string.format('savedAt %d', savedAt)
+
+  local timeOfDay = 0
+  if sky and isFiniteNumber(sky.timeOfDay) then
+    timeOfDay = sky.timeOfDay % 1
+  end
+  lines[6] = string.format('time %.6f', timeOfDay)
+
+  local playerX = 0
+  local playerY = 0
+  local playerZ = 0
+  local playerYaw = 0
+  local playerPitch = 0
+  if player then
+    playerX = tonumber(player.x) or 0
+    playerY = tonumber(player.y) or 0
+    playerZ = tonumber(player.z) or 0
+    playerYaw = tonumber(player.yaw) or 0
+    playerPitch = tonumber(player.pitch) or 0
+  end
+  lines[7] = string.format('player %.6f %.6f %.6f %.6f %.6f', playerX, playerY, playerZ, playerYaw, playerPitch)
+
+  local inventoryState = self._inventoryScratch
+  inventoryState.slotCount = 0
+  inventoryState.selected = 1
+  clearArray(inventoryState.slots)
+  if inventory and inventory.getState then
+    inventory:getState(inventoryState)
+  end
+
+  local slotCount = parseInteger(inventoryState.slotCount) or 0
+  local selectedIndex = parseInteger(inventoryState.selected) or 1
+  lines[8] = string.format('inv %d %d', slotCount, selectedIndex)
+
+  local lineCount = 8
+  local slotLines = inventoryState.slots or {}
+  for i = 1, slotCount do
+    local slot = slotLines[i]
+    local blockId = 0
+    local count = 0
+    if slot then
+      blockId = parseInteger(slot.block) or 0
+      count = parseInteger(slot.count) or 0
+      if blockId <= 0 or count <= 0 then
+        blockId = 0
+        count = 0
+      end
+    end
+    lineCount = lineCount + 1
+    lines[lineCount] = string.format('slot %d %d %d', i, blockId, count)
+  end
+
+  lineCount = lineCount + 1
+  lines[lineCount] = string.format('edits %d', editCount)
+  lineCount = lineCount + 1
+  lines[lineCount] = 'BEGIN_EDITS'
+
+  for i = 1, editCount do
+    local entry = edits[i]
+    lineCount = lineCount + 1
+    lines[lineCount] = string.format('%d %d %d %d', entry[1], entry[2], entry[3], entry[4])
+  end
+
+  local payload = table.concat(lines, '\n', 1, lineCount)
+  local ok = filesystem.write(SAVE_FILE, payload)
+  if ok == false or ok == nil then
+    return false, 'write_failed'
+  end
+  if editCount <= 0 then
+    return true, 'saved_empty'
+  end
+  return true, 'saved'
+end
+
+function SaveSystem:load(constants)
+  local filesystem = getFilesystem()
+  if not filesystem or not filesystem.read then
+    return nil, 0, 'filesystem_unavailable'
+  end
+  if not constants then
+    return nil, 0, 'invalid_arguments'
+  end
+  if not self:exists() then
+    return nil, 0, 'missing'
+  end
+
+  local data = normalizeReadResult(filesystem.read(SAVE_FILE))
+  if type(data) ~= 'string' or data == '' then
+    return nil, 0, 'corrupt'
+  end
+
+  local lines = self._loadLinesScratch
+  clearArray(lines)
+  for line in data:gmatch('[^\r\n]+') do
+    lines[#lines + 1] = line
+  end
+
+  local parsed, err = parseSave(lines, constants, {
+    includeEdits = true,
+    includeInventory = true
+  })
+  if not parsed then
+    return nil, 0, err or 'corrupt'
+  end
+
+  return parsed.edits or {}, parsed.editCount or 0, nil, parsed.player, parsed.inventory, parsed.timeOfDay, parsed.savedAt, parsed.version
+end
+
+function SaveSystem:peek(constants)
+  local filesystem = getFilesystem()
+  if not filesystem or not filesystem.read then
+    return { ok = false, err = 'filesystem_unavailable' }
+  end
+  if not constants then
+    return { ok = false, err = 'invalid_arguments' }
+  end
+  if not self:exists() then
+    return { ok = false, err = 'missing' }
+  end
+
+  local data = normalizeReadResult(filesystem.read(SAVE_FILE))
+  if type(data) ~= 'string' or data == '' then
+    return { ok = false, err = 'corrupt' }
+  end
+
+  local lines = self._loadLinesScratch
+  clearArray(lines)
+  for line in data:gmatch('[^\r\n]+') do
+    lines[#lines + 1] = line
+  end
+
+  local parsed, err, info = parseSave(lines, constants, {
+    includeEdits = false,
+    includeInventory = false
+  })
+
+  if not parsed then
+    return {
+      ok = false,
+      err = err or 'corrupt',
+      version = info and info.version or nil,
+      savedAt = info and info.savedAt or nil,
+      editCount = info and info.editCount or nil
+    }
+  end
+
+  return {
+    ok = true,
+    version = parsed.version,
+    savedAt = parsed.savedAt or 0,
+    editCount = parsed.editCount or 0,
+    player = parsed.player,
+    timeOfDay = parsed.timeOfDay
+  }
+end
+
+function SaveSystem:apply(world, edits, count)
+  if not world or not edits then
+    return false
+  end
+
+  local limit = count or #edits
+  for i = 1, limit do
+    local entry = edits[i]
+    if entry then
+      world:set(entry[1], entry[2], entry[3], entry[4])
+    end
+  end
+
+  return true
+end
+
+return SaveSystem

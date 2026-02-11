@@ -1,6 +1,24 @@
 local Inventory = {}
 Inventory.__index = Inventory
 
+local function parseInteger(value)
+  local n = tonumber(value)
+  if not n or n % 1 ~= 0 then
+    return nil
+  end
+  return n
+end
+
+local function clamp(value, minValue, maxValue)
+  if value < minValue then
+    return minValue
+  end
+  if value > maxValue then
+    return maxValue
+  end
+  return value
+end
+
 function Inventory.new(defaultBlocks, slotCount, startCount)
   local self = setmetatable({}, Inventory)
   self.slotCount = slotCount or 8
@@ -116,6 +134,80 @@ function Inventory:add(block, amount)
   end
 
   return false
+end
+
+function Inventory:getState(out)
+  if type(out) ~= 'table' then
+    out = {}
+  end
+
+  out.slotCount = self.slotCount
+  out.selected = self.selected
+
+  local slotsOut = out.slots
+  if type(slotsOut) ~= 'table' then
+    slotsOut = {}
+    out.slots = slotsOut
+  end
+
+  for i = 1, self.slotCount do
+    local slot = self.slots[i]
+    local blockId = 0
+    local count = 0
+    if slot and slot.block and slot.count and slot.count > 0 then
+      blockId = parseInteger(slot.block) or 0
+      count = parseInteger(slot.count) or 0
+      if blockId <= 0 or count <= 0 then
+        blockId = 0
+        count = 0
+      end
+    end
+
+    local outSlot = slotsOut[i]
+    if outSlot then
+      outSlot.block = blockId
+      outSlot.count = count
+    else
+      slotsOut[i] = { block = blockId, count = count }
+    end
+  end
+
+  for i = self.slotCount + 1, #slotsOut do
+    slotsOut[i] = nil
+  end
+
+  return out
+end
+
+function Inventory:applyState(state)
+  if type(state) ~= 'table' then
+    return false
+  end
+
+  local slots = state.slots
+  for i = 1, self.slotCount do
+    local source = (type(slots) == 'table') and slots[i] or nil
+    local blockId = source and parseInteger(source.block) or nil
+    local count = source and parseInteger(source.count) or nil
+
+    local slot = self.slots[i]
+    if not slot then
+      slot = { block = nil, count = 0 }
+      self.slots[i] = slot
+    end
+
+    if not blockId or blockId <= 0 or not count or count <= 0 then
+      slot.block = nil
+      slot.count = 0
+    else
+      slot.block = blockId
+      slot.count = count
+    end
+  end
+
+  local selected = parseInteger(state.selected) or self.selected
+  self.selected = clamp(selected, 1, self.slotCount)
+  return true
 end
 
 return Inventory

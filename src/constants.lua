@@ -41,6 +41,12 @@ Constants.PERF = {
   hudUpdateInterval = 0.10
 }
 
+Constants.SAVE = {
+  enabled = true,
+  autosaveIntervalSeconds = 60,
+  autosaveShowHudSeconds = 1.5
+}
+
 Constants.BLOCK = {
   AIR = 0,
   GRASS = 1,

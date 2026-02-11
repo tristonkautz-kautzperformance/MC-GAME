@@ -334,7 +334,24 @@ function GameState:_startSession(loadSave)
 
   local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
   self.renderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
-  self.renderer:rebuildDirty(999)
+  do
+    local cull = self.constants.CULL or {}
+    local rebuild = self.constants.REBUILD or {}
+    local radius = tonumber(cull.drawRadiusChunks) or 4
+    local pad = tonumber(cull.alwaysVisiblePaddingChunks) or 0
+    local chunksY = (self.world and self.world.chunksY) or (self.constants.WORLD_CHUNKS_Y or 1)
+
+    -- Conservative square coverage (not FOV-based) so the initial view is mostly meshed.
+    local r = math.max(0, radius + pad + 1)
+    local d = r * 2 + 1
+    local target = d * d * math.max(1, chunksY)
+    local cap = tonumber(rebuild.initialBurstMax)
+    if cap and cap > 0 then
+      target = math.min(target, cap)
+    end
+
+    self.renderer:rebuildDirty(target)
+  end
 
   self.mode = 'game'
   self.menu:setMode('pause')

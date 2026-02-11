@@ -1,7 +1,7 @@
 local Constants = {}
 
-Constants.WORLD_SIZE_X = 32
-Constants.WORLD_SIZE_Z = 32
+Constants.WORLD_SIZE_X = 256
+Constants.WORLD_SIZE_Z = 256
 Constants.WORLD_SIZE_Y = 64
 Constants.CHUNK_SIZE = 16
 Constants.CHUNK_VOLUME = Constants.CHUNK_SIZE * Constants.CHUNK_SIZE * Constants.CHUNK_SIZE
@@ -10,7 +10,7 @@ Constants.WORLD_CHUNKS_Y = math.ceil(Constants.WORLD_SIZE_Y / Constants.CHUNK_SI
 Constants.WORLD_CHUNKS_Z = math.ceil(Constants.WORLD_SIZE_Z / Constants.CHUNK_SIZE)
 
 Constants.WORLD_SEED = 1337
-Constants.TREE_DENSITY = 0.035
+Constants.TREE_DENSITY = 0.0175
 
 Constants.DAY_LENGTH_SECONDS = 300
 
@@ -32,6 +32,8 @@ Constants.MESH = {
 
 Constants.REBUILD = {
   maxPerFrame = 3,
+  -- Prevents a huge startup hitch when the world has many chunks.
+  initialBurstMax = 700,
   prioritize = true,
   prioritizeHorizontalOnly = true
 }

@@ -32,6 +32,9 @@
   - second Enter emits `new_game_confirmed`
   - navigation/Esc cancels
 
+### World Gen Tuning
+- Reduced `Constants.TREE_DENSITY` by ~50% to lower average foliage density (less overdraw + simpler sightlines).
+
 ### Persistence + Menu Foundation
 - Added world edit diff tracking in `src/world/ChunkWorld.lua` (`_editOriginal/_editValues`) so only block edits are persisted.
 - Added `ChunkWorld:getEditCount()` and `ChunkWorld:collectEdits(out)` for save serialization.

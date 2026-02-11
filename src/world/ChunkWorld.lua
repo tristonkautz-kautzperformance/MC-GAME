@@ -26,6 +26,7 @@ function ChunkWorld.new(constants)
   self.sizeY = constants.WORLD_SIZE_Y
   self.sizeZ = constants.WORLD_SIZE_Z
   self.chunkSize = constants.CHUNK_SIZE
+  self.groundY = nil
 
   self.chunksX = constants.WORLD_CHUNKS_X
   self.chunksY = constants.WORLD_CHUNKS_Y
@@ -182,7 +183,7 @@ function ChunkWorld:getSpawnPoint()
   -- Center-ish, a couple blocks above the ground.
   local x = math.floor(self.sizeX / 2) + 0.5
   local z = math.floor(self.sizeZ / 2) + 0.5
-  local y = 10
+  local y = (self.groundY or 7) + 3
   return x, y, z
 end
 
@@ -233,11 +234,27 @@ function ChunkWorld:generate()
   local sizeZ = self.sizeZ
   local blockIds = self.constants.BLOCK
 
-  -- Simple flat world: bedrock base + stone + dirt + grass.
+  -- Flat world: bedrock base + stone + dirt + grass (tunable strata thickness).
   local bedrockY = 1
-  local stoneTop = 4
-  local dirtTop = 6
-  local grassY = 7
+  local gen = self.constants.GEN or {}
+  local bedrockDepth = tonumber(gen.bedrockDepth) or 6
+  if bedrockDepth < 1 then bedrockDepth = 1 end
+
+  local grassY = bedrockY + math.floor(bedrockDepth + 0.5)
+  grassY = clampInt(grassY, bedrockY + 1, sizeY)
+  self.groundY = grassY
+
+  local subsurfaceLayers = math.max(0, grassY - (bedrockY + 1))
+  local dirtFraction = tonumber(gen.dirtFraction) or (2 / 3)
+  if dirtFraction < 0 then dirtFraction = 0 end
+  if dirtFraction > 1 then dirtFraction = 1 end
+
+  local dirtLayers = math.floor(subsurfaceLayers * dirtFraction + 0.5)
+  dirtLayers = clampInt(dirtLayers, 0, subsurfaceLayers)
+  local stoneLayers = subsurfaceLayers - dirtLayers
+
+  local stoneTop = clampInt(bedrockY + stoneLayers, bedrockY, grassY - 1)
+  local dirtTop = grassY - 1
   local AIR = blockIds.AIR
   local BEDROCK = blockIds.BEDROCK
   local STONE = blockIds.STONE

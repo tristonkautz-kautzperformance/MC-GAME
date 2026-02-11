@@ -34,6 +34,7 @@
 
 ### World Gen Tuning
 - Reduced `Constants.TREE_DENSITY` by ~50% to lower average foliage density (less overdraw + simpler sightlines).
+- Increased baseline strata depth so bedrock is reached after ~15 blocks of digging (with an approximate 2/3 dirt, 1/3 stone split).
 
 ### Persistence + Menu Foundation
 - Added world edit diff tracking in `src/world/ChunkWorld.lua` (`_editOriginal/_editValues`) so only block edits are persisted.

@@ -12,6 +12,14 @@ Constants.WORLD_CHUNKS_Z = math.ceil(Constants.WORLD_SIZE_Z / Constants.CHUNK_SI
 Constants.WORLD_SEED = 1337
 Constants.TREE_DENSITY = 0.0175
 
+-- World-gen tuning (flat-world baseline).
+-- `bedrockDepth`: number of blocks from the grass layer down to bedrock (y=1).
+-- For example, bedrockDepth=15 means grass at y=16 with bedrock at y=1.
+Constants.GEN = {
+  bedrockDepth = 15,
+  dirtFraction = 2 / 3
+}
+
 Constants.DAY_LENGTH_SECONDS = 300
 
 Constants.SKY_DAY = { .53, .78, .96 }

@@ -55,6 +55,11 @@ local function clamp(value, minValue, maxValue)
   return value
 end
 
+local function worldToChunk(value, chunkSize, maxChunks)
+  local chunk = math.floor((value or 0) / chunkSize) + 1
+  return clamp(chunk, 1, maxChunks)
+end
+
 function GameState.new(constants)
   local self = setmetatable({}, GameState)
   self.constants = constants
@@ -79,10 +84,20 @@ function GameState.new(constants)
   self._autosaveTimer = 0
   self._saveStatusText = nil
   self._saveStatusTimer = 0
+  self._chunkDirtyRadius = 0
+  self._activeMinChunkY = 1
+  self._activeMaxChunkY = 1
+  self._lastPlayerChunkX = nil
+  self._lastPlayerChunkZ = nil
+  self._enqueueScratch = {}
+  self._enqueuedCount = 0
+  self._enqueuedTimer = 0
+  self._enqueuedShowSeconds = 0.5
 
   self.showHelp = false
   self.showPerfHud = true
-  self.rebuildMaxPerFrame = 3
+  self.rebuildMaxPerFrame = nil
+  self.rebuildMaxMillisPerFrame = nil
   self.frameMs = 0
   self.worstFrameMs = 0
   self._worstFrameWindowMax = 0
@@ -169,6 +184,29 @@ function GameState:_tickSaveStatus(dt)
   end
 end
 
+function GameState:_setEnqueuedMetric(count)
+  local value = tonumber(count) or 0
+  if value < 0 then
+    value = 0
+  end
+
+  self._enqueuedCount = math.floor(value + 0.5)
+  self._enqueuedTimer = self._enqueuedShowSeconds or 0.5
+end
+
+function GameState:_tickEnqueuedMetric(dt)
+  local timer = self._enqueuedTimer or 0
+  if timer <= 0 then
+    return
+  end
+
+  timer = timer - (dt or 0)
+  if timer < 0 then
+    timer = 0
+  end
+  self._enqueuedTimer = timer
+end
+
 function GameState:_saveNow()
   if not self.saveSystem or not self.world then
     return false, 'missing_session'
@@ -239,6 +277,13 @@ function GameState:_teardownSession()
   self.sky = nil
   self.renderer = nil
   self._autosaveTimer = 0
+  self._chunkDirtyRadius = 0
+  self._activeMinChunkY = 1
+  self._activeMaxChunkY = 1
+  self._lastPlayerChunkX = nil
+  self._lastPlayerChunkZ = nil
+  self._enqueuedCount = 0
+  self._enqueuedTimer = 0
 
   if self.mouseLock then
     self.mouseLock:unlock()
@@ -339,18 +384,44 @@ function GameState:_startSession(loadSave)
     local rebuild = self.constants.REBUILD or {}
     local radius = tonumber(cull.drawRadiusChunks) or 4
     local pad = tonumber(cull.alwaysVisiblePaddingChunks) or 0
-    local chunksY = (self.world and self.world.chunksY) or (self.constants.WORLD_CHUNKS_Y or 1)
 
     -- Conservative square coverage (not FOV-based) so the initial view is mostly meshed.
     local r = math.max(0, radius + pad + 1)
-    local d = r * 2 + 1
-    local target = d * d * math.max(1, chunksY)
-    local cap = tonumber(rebuild.initialBurstMax)
-    if cap and cap > 0 then
-      target = math.min(target, cap)
+    self._chunkDirtyRadius = r
+
+    local minCy = 1
+    local maxCy = self.world.chunksY
+    if self.world.getActiveChunkYRange then
+      minCy, maxCy = self.world:getActiveChunkYRange()
+    end
+    self._activeMinChunkY = minCy
+    self._activeMaxChunkY = maxCy
+
+    local pcx = worldToChunk(cameraX, self.world.chunkSize, self.world.chunksX)
+    local pcz = worldToChunk(cameraZ, self.world.chunkSize, self.world.chunksZ)
+    self._lastPlayerChunkX = pcx
+    self._lastPlayerChunkZ = pcz
+
+    local seedKeys = self._enqueueScratch
+    local seedCount = self.world:enqueueChunkSquare(pcx, pcz, r, minCy, maxCy, seedKeys)
+    local enqueued = self.renderer:enqueueMissingKeys(seedKeys, seedCount)
+    self:_setEnqueuedMetric(enqueued)
+
+    local target = enqueued
+    local cap = tonumber(rebuild.initialBurstMax) or 0
+    if cap > 0 then
+      target = math.min(target, math.floor(cap))
     end
 
-    self.renderer:rebuildDirty(target)
+    local burstMillis = tonumber(rebuild.initialBurstMaxMillis)
+    if not burstMillis or burstMillis <= 0 then
+      local baseMillis = tonumber(rebuild.maxMillisPerFrame)
+      if baseMillis and baseMillis > 0 then
+        burstMillis = baseMillis * 4
+      end
+    end
+
+    self.renderer:rebuildDirty(target, burstMillis)
   end
 
   self.mode = 'game'
@@ -370,9 +441,21 @@ function GameState:load()
 
   local perfConfig = self.constants.PERF or {}
   self.showPerfHud = perfConfig.showHud ~= false
+  local enqueuedShowSeconds = tonumber(perfConfig.enqueuedShowSeconds)
+  if enqueuedShowSeconds and enqueuedShowSeconds > 0 then
+    self._enqueuedShowSeconds = enqueuedShowSeconds
+  else
+    self._enqueuedShowSeconds = 0.5
+  end
 
   local rebuildConfig = self.constants.REBUILD or {}
-  self.rebuildMaxPerFrame = rebuildConfig.maxPerFrame or 3
+  local rebuildMaxPerFrame = tonumber(rebuildConfig.maxPerFrame)
+  if rebuildMaxPerFrame and rebuildMaxPerFrame > 0 then
+    self.rebuildMaxPerFrame = math.floor(rebuildMaxPerFrame)
+  else
+    self.rebuildMaxPerFrame = nil
+  end
+  self.rebuildMaxMillisPerFrame = tonumber(rebuildConfig.maxMillisPerFrame)
 
   self.mouseLock = MouseLock.new()
   self.mouseLock:unlock()
@@ -491,6 +574,7 @@ function GameState:_updateGame(dt)
   end
 
   self:_updateFrameTiming(dt)
+  self:_tickEnqueuedMetric(dt)
 
   local dx, dy = self.input:getLookDelta()
   if dx ~= 0 or dy ~= 0 then
@@ -508,6 +592,29 @@ function GameState:_updateGame(dt)
 
   local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
   self.renderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
+
+  local pcx = worldToChunk(cameraX, self.world.chunkSize, self.world.chunksX)
+  local pcz = worldToChunk(cameraZ, self.world.chunkSize, self.world.chunksZ)
+  local oldPcx = self._lastPlayerChunkX
+  local oldPcz = self._lastPlayerChunkZ
+  if pcx ~= oldPcx or pcz ~= oldPcz then
+    local minCy = self._activeMinChunkY
+    local maxCy = self._activeMaxChunkY
+    local queueKeys = self._enqueueScratch
+    local queueCount = -1
+    if oldPcx and oldPcz then
+      queueCount = self.world:enqueueRingDelta(oldPcx, oldPcz, pcx, pcz, self._chunkDirtyRadius or 0, minCy, maxCy, queueKeys)
+    end
+    if queueCount == nil or queueCount < 0 then
+      queueCount = self.world:enqueueChunkSquare(pcx, pcz, self._chunkDirtyRadius or 0, minCy, maxCy, queueKeys)
+    end
+
+    local enqueued = self.renderer:enqueueMissingKeys(queueKeys, queueCount)
+    self:_setEnqueuedMetric(enqueued)
+
+    self._lastPlayerChunkX = pcx
+    self._lastPlayerChunkZ = pcz
+  end
 
   local _, daylight = self.sky:update(dt)
   self.sky:applyBackground(daylight)
@@ -546,7 +653,7 @@ function GameState:_updateGame(dt)
   end
 
   self:_updateAutosave(dt)
-  self.renderer:rebuildDirty(self.rebuildMaxPerFrame)
+  self.renderer:rebuildDirty(self.rebuildMaxPerFrame, self.rebuildMaxMillisPerFrame)
   self.input:beginFrame()
 end
 
@@ -595,7 +702,7 @@ function GameState:draw(pass)
   self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
   self.interaction:drawOutline(pass)
 
-  local visibleCount, rebuilds = self.renderer:getLastFrameStats()
+  local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
   local dirtyQueue = self.renderer:getDirtyQueueSize()
   self.hud:draw(pass, {
     cameraX = cameraX,
@@ -617,7 +724,16 @@ function GameState:draw(pass)
     worstFrameMs = self.worstFrameMs,
     visibleChunks = visibleCount,
     rebuilds = rebuilds,
-    dirtyQueue = dirtyQueue
+    dirtyQueue = dirtyQueue,
+    dirtyDrained = dirtyDrained,
+    dirtyQueued = dirtyQueued,
+    rebuildMs = rebuildMs,
+    rebuildBudgetMs = rebuildBudgetMs,
+    pruneScanned = pruneScanned,
+    pruneRemoved = pruneRemoved,
+    prunePending = prunePendingFlag == 1,
+    enqueuedCount = self._enqueuedCount,
+    enqueuedTimer = self._enqueuedTimer
   })
 end
 

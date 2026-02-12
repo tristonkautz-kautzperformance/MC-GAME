@@ -1,252 +1,157 @@
 Codex Instructions (Codex 5.3)
 ==============================
 
-Status (2026-02-11)
+Status (2026-02-12)
 ------------------
-Next cohesive update: (1) session-state persistence (inventory + time), (2) autosave, (3) main-menu metadata + New Game confirmation.
+Current state:
+- Streaming is ring-delta (newly-visible chunks enqueue only when mesh is missing).
+- Dirty rebuild scheduling is amortized/lazy (no O(queue) rebucket spikes under backlog).
+- Rebuild is ms-budgeted.
+- HUD diagnostics exist for:
+  - streaming enqueue count (`Stream: Enqueued N`)
+  - dirty intake vs queued (`DirtyIn` / `Queued`)
+  - rebuild ms spent vs budget (`Rebuild: <ms> / <budget> ms`)
 
-This spec builds on what already exists:
-- Diff-based world edits persist.
-- Player position/orientation persist.
-- Main menu + pause menu exist.
-- Pause "Quit" returns to menu (do not revert this).
+On desktop hardware it now plays smoothly and typically averages ~90-100 FPS.
 
-Bundle Goals (Implement Together)
---------------------------------
-1) Persist additional session state:
-   - Inventory/hotbar contents (block ids + counts) and selected slot.
-   - Time-of-day (`Sky.timeOfDay`).
-2) Autosave:
-   - Timer-based autosave every N seconds during gameplay.
-   - Minimal, clear feedback: "Autosaved" (and failure reason if needed).
-3) Menu polish:
-   - Show save metadata in the main menu (last saved time, edit count, version/corrupt).
-   - New Game requires confirmation if it would overwrite an existing save.
+Remaining potential spike from the audit:
+- `ChunkRenderer:_pruneChunkMeshes()` is O(meshCache) and is called on priority chunk changes.
+  - Even if it is not currently noticeable, this is the last obvious one-frame O(n) maintenance path tied to chunk crossings.
 
-Constraints / Non-Goals
+Update (2026-02-12)
+------------------
+Implemented:
+- Incremental mesh-cache pruning with per-frame caps (removes O(meshCache) crossing spikes).
+- Prune diagnostics in HUD (`Prune: scanned ... removed ... pending ...`).
+- New config knobs in `Constants.REBUILD`:
+  - `pruneMaxChecksPerFrame`
+  - `pruneMaxMillisPerFrame`
+
+Goal ("Clear Done Line")
 -----------------------
-- Pointer lock must remain unchanged:
+Remove any one-frame O(meshCache) maintenance work on chunk crossings while preserving:
+- Stable, bounded mesh cache size while traveling.
+- Existing renderer + streaming architecture (no major rewrite).
+- Pointer lock/input behavior unchanged.
+
+Non-Goals
+---------
+- Infinite world
+- New worldgen systems/biomes/caves
+- Multiplayer
+- Input/control changes
+- Major renderer redesign
+
+Key Constraints
+---------------
+- Do not regress pointer lock:
   - Click captures mouse.
   - Tab toggles lock.
-  - Esc unlocks when locked.
-- Avoid per-frame allocations in update/draw.
-- Use `lovr.filesystem` for save IO.
-- Single-slot save (no multiple save slots yet).
-- No crafting/hunger/AI/etc in this update.
+  - Esc unlocks first, then existing menu behavior.
+- Keep hot loops allocation-light:
+  - Avoid creating new tables/strings per-frame in prune/rebuild loops.
 
+Implementation Tasks (Do Together)
+----------------------------------
 
-Save Format Upgrade (Versioned)
--------------------------------
-Current saves use a versioned magic string. Upgrade to a new version that includes inventory/time/metadata while keeping backward compatibility.
+1) Amortize Mesh Cache Pruning (Incremental Pass)
+-------------------------------------------------
+Files: src/render/ChunkRenderer.lua, src/constants.lua
 
-Implementation Requirements
----------------------------
-- Writer: always write `MC_SAVE_V2`.
-- Loader: support BOTH `MC_SAVE_V1` and `MC_SAVE_V2`.
-- Keep the same save path (no migration step required).
-- A save with *zero* edits must still count as a valid save (Continue should work even if the player just started a world and saved without editing blocks).
+Problem
+- `ChunkRenderer:setPriorityOriginWorld` currently calls `_pruneChunkMeshes()` directly.
+- `_pruneChunkMeshes()` scans the entire mesh cache table with `pairs(...)` and can hitch on chunk crossings when the cache is large.
 
-Recommended Save Path
----------------------
-- `saves/world_v1.txt` (keep path, upgrade contents)
+Fix
+Convert pruning into an incremental pass spread across frames using a safe cursor.
 
-MC_SAVE_V2 Layout (Text, ASCII)
--------------------------------
-Line 1:
-- `MC_SAVE_V2`
+A) Add prune state to ChunkRenderer
+- `self._prunePending` (bool)
+- `self._pruneCursorKey` (table key or nil)
+- `self._pruneKeepRadius` (int)
 
-Required headers (one per line):
-- `seed <int>`
-- `world <sizeX> <sizeY> <sizeZ>`
-- `chunk <chunkSize>`
-- `savedAt <unixSeconds>` (0 if unavailable)
-- `time <timeOfDayFloat>` (range [0, 1))
-- `player <xFloat> <yFloat> <zFloat> <yawFloat> <pitchFloat>`
-- `inv <slotCountInt> <selectedIndexInt>`
-- `slot <indexInt> <blockIdInt> <countInt>` (repeat `slotCountInt` times)
-- `edits <countInt>`
-- `BEGIN_EDITS`
-- `<xInt> <yInt> <zInt> <blockIdInt>` (repeat `countInt` times)
+Optional per-frame diagnostics (for HUD verification):
+- `self._pruneScannedLastFrame` (int)
+- `self._pruneRemovedLastFrame` (int)
 
-Notes:
-- Keep floats to reasonable precision (e.g. `%.6f`).
-- Use 1-based slot indices in the file (match Lua tables).
-- `blockId` uses your `Constants.BLOCK` ids; `0` means empty/AIR.
-- For empty slots write `slot i 0 0`.
+B) On priority chunk change, schedule pruning (do not prune immediately)
+In `ChunkRenderer:setPriorityOriginWorld(...)`:
+- Update priority chunk coords as usual.
+- Do NOT scan `_chunkMeshes` in this function.
+- Compute and cache `keepRadius = drawRadius + alwaysVisiblePadding + meshCachePadding` (same logic as current prune).
+- Set:
+  - `self._prunePending = true`
+  - `self._pruneCursorKey = nil` (restart pass)
+  - `self._pruneKeepRadius = keepRadius`
 
-MC_SAVE_V1 Support
-------------------
-`MC_SAVE_V1` currently stores:
-- seed/world/chunk/edits
-- optional player line
-- edit lines
+C) Add a bounded prune step that runs each frame
+Add `ChunkRenderer:_pruneChunkMeshesStep(maxChecks, maxMillis)`:
+- If `_prunePending` is false, return quickly.
+- Iterate incrementally using `next(self._chunkMeshes, cursorKey)`.
+- Keep iteration safe while deleting:
+  - For each `key, entry`, compute `afterKey, afterEntry = next(self._chunkMeshes, key)` BEFORE any deletion.
+  - Decide whether to delete `self._chunkMeshes[key] = nil` based on distance.
+  - Advance using `key, entry = afterKey, afterEntry` so you never call `next` with a removed key.
+  - Track a `lastKeptKey` so the saved cursor is always a key that still exists (or nil).
+- Stop when:
+  - scanned >= `maxChecks`, OR
+  - time >= `maxMillis` (if timer is available), OR
+  - end-of-table (then clear `_prunePending` and reset cursor).
 
-When loading V1:
-- Inventory defaults to New Game inventory.
-- Time-of-day defaults to `Sky.new` default.
-- `savedAt` is nil/0.
-- The next explicit Save/autosave should write `MC_SAVE_V2`.
+D) Where to call the prune step
+Run the prune step once per frame.
+Recommended: call it inside `ChunkRenderer:rebuildDirty(...)` (it already runs in the update loop).
+Pruning should have its own small budget so it does not steal rebuild budget unpredictably.
 
+E) No extra allocations
+- Do not allocate a `remove = {}` list each prune step.
+- Prefer cached `entry.cx/entry.cz` (entries built by `_rebuildChunk` should already have these).
+  - If missing, `parseKey(key)` once and cache back onto `entry` so it becomes a one-time cost.
 
-Code Tasks
-----------
+F) Add config knobs (defaults)
+In `src/constants.lua`, add under `Constants.REBUILD`:
+- `pruneMaxChecksPerFrame = 128`
+- `pruneMaxMillisPerFrame = 0.25`
+These defaults are intentionally small: eliminate spikes, not finish pruning instantly.
 
-1) Inventory Persistence
-------------------------
-Files: `src/inventory.lua`, `src/save/SaveSystem.lua`, `src/game/GameState.lua`
+2) Optional: HUD Prune Diagnostics (Verification)
+-------------------------------------------------
+Files: src/render/ChunkRenderer.lua, src/game/GameState.lua, src/ui/HUD.lua
 
-Add APIs to Inventory (recommended):
-- `Inventory:getState(out)`:
-  - Fill `out` (reuse table to reduce GC).
-  - Shape:
-    - `out.slotCount = N`
-    - `out.selected = selectedIndex`
-    - `out.slots = { { block = <id>, count = <int> }, ... }` (length N)
-  - Store `block=0,count=0` for empty.
-- `Inventory:applyState(state)`:
-  - Apply slots up to `self.slotCount` (ignore extras).
-  - Any invalid/missing slot becomes empty:
-    - `count <= 0` OR `blockId == 0` OR missing -> empty
-  - Clamp selected index to `[1, slotCount]`.
+Goal
+Make it easy to confirm pruning is incremental and bounded.
 
-SaveSystem changes:
-- Extend `SaveSystem:save(...)` to accept (or reach) `inventory`:
-  - Write V2 `inv` + `slot` lines from inventory state.
-
-GameState changes:
-- On Continue/New Game start:
-  - Create inventory.
-  - If a save provides an inventory state, apply it after inventory creation (before HUD draw is fine).
-
-2) Time-of-Day Persistence
---------------------------
-Files: `src/sky/Sky.lua`, `src/save/SaveSystem.lua`, `src/game/GameState.lua`
-
-- Save `sky.timeOfDay` into the V2 `time` line.
-- Load:
-  - After `Sky.new`, call `sky:setTime(savedTime)` if present.
-
-3) Autosave
------------
-Files: `src/constants.lua`, `src/game/GameState.lua`, `src/save/SaveSystem.lua`, `src/ui/HUD.lua`, `src/ui/MainMenu.lua`
-
-Constants:
-- Add `Constants.SAVE`:
-  - `enabled = true`
-  - `autosaveIntervalSeconds = 60`
-  - `autosaveShowHudSeconds = 1.5`
-
-GameState:
-- Track:
-  - `self._autosaveTimer`
-  - `self._saveStatusText`
-  - `self._saveStatusTimer`
-- When in gameplay mode (not main menu; ideally also not while paused):
-  - If `Constants.SAVE.enabled`:
-    - Accumulate `dt`.
-    - When timer >= interval:
-      - Set status to "Autosaving..."
-      - Call `saveSystem:save(world, constants, player, inventory, sky)`
-      - If ok: set status "Autosaved"
-      - If not ok: set status "Autosave failed: <reason>"
-      - Reset timer to 0
-- When user triggers manual Save (pause menu):
-  - Show "Saving..." then "World saved" using the same status system.
-  - Reset autosave timer so an autosave doesn't immediately happen afterward.
-
-HUD:
-- Display `saveStatusText` when `saveStatusTimer > 0`:
-  - Render a single line in the HUD (near existing tip/status text).
-  - Avoid rebuilding lots of text objects every frame: just draw a string when active.
-
-Menu:
-- When pause menu is open, show the current save status text in the menu status line.
-
-4) Menu Metadata + Confirm New Game
------------------------------------
-Files: `src/save/SaveSystem.lua`, `src/ui/MainMenu.lua`, `src/game/GameState.lua`
-
-Save metadata to show:
-- Save availability + status (ok / corrupt / incompatible)
-- Version (V1 vs V2)
-- Last saved time (`savedAt`)
-- `editCount`
-- Optional: player coords
-
-Implementation approach:
-- Add `SaveSystem:peek(constants)`:
-  - Parse just enough to return metadata (do not build full edits table).
-  - Return meta table:
-    - `{ ok = true, version = 1|2, savedAt = <int>, editCount = <int>, player = {x,y,z}, timeOfDay = <float> }`
-    - Or `{ ok = false, err = "..." }`
-- GameState:
-  - Refresh menu meta when entering the main menu and after save/delete.
-  - Pass meta into `MainMenu`.
-
-MainMenu:
-- Add `MainMenu:setSaveMeta(meta)` and render metadata under the options:
-  - `Save: Available` / `Save: Corrupt` / `Save: Incompatible`
-  - `Last saved: <formatted>` or `Last saved: Unknown`
-  - `Edits: N`
-- Format savedAt:
-  - Prefer `os.date("%Y-%m-%d %H:%M:%S", savedAt)` if available.
-  - If not available or savedAt==0: show Unknown.
-
-New Game confirmation:
-- If a save exists (meta ok OR even corrupt-but-present), selecting New Game should confirm:
-  - First Enter: arm confirmation state and set status text: "Press Enter again to overwrite save."
-  - Second Enter: emit `new_game_confirmed` event.
-  - Any navigation / Esc cancels confirmation.
-- Keep existing delete-save confirmation behavior.
-
-5) Docs
--------
-Files: `README.md`, `DEVLOG.md`
-
-When implementing:
-- `README.md`:
-  - Mention Continue restores inventory + time-of-day.
-  - Mention autosave behavior/interval.
-  - Mention New Game confirmation behavior.
-- `DEVLOG.md`:
-  - Add a dated entry describing this cohesive update.
-
+Implementation
+- Track `pruneScanned` and `pruneRemoved` each frame on the renderer (plus whether prune is pending).
+- Expose them to the HUD alongside existing renderer stats.
+- Add a perf HUD line (only when perf HUD is on), e.g.:
+  - `Prune: scanned <n>  removed <m>  pending <yes/no>`
 
 Manual Test Checklist
 ---------------------
+1) Stand still:
+- `Dirty` reaches 0 and stays stable.
+- `Prune` should go idle (pending false) quickly.
 
-Inventory persistence
-1. Start New Game.
-2. Change hotbar counts/selection (place/break).
-3. Save.
-4. Quit to menu, Continue.
-5. Verify hotbar blocks/counts/selection are restored.
+2) Walk in a single direction for 2+ minutes:
+- No chunk-crossing hitch spikes from pruning.
+- Mesh cache remains bounded (no unbounded growth).
 
-Time-of-day persistence
-1. Note day percent in HUD.
-2. Save.
-3. Quit to menu, Continue.
-4. Verify time-of-day is close to saved value.
+3) Stress:
+- Increase `Constants.CULL.drawRadiusChunks` and `Constants.CULL.meshCachePaddingChunks`.
+- Ensure crossing remains smooth and prune stats show bounded per-frame work.
 
-Autosave
-1. Temporarily set autosave interval to `5s`.
-2. Play and wait for autosave message.
-3. Quit to menu, Continue.
-4. Verify state persists.
+4) Visual correctness:
+- No near-field chunks disappear unexpectedly.
+- Only far cached meshes get pruned.
 
-Menu metadata
-1. Main menu shows last saved time + edit count.
-2. Corrupt save behavior:
-   - Tamper the save file and verify menu shows corrupt status and allows delete.
-
-New Game confirmation
-1. With a save present:
-2. Selecting New Game requires confirm.
-3. Cancel with Esc or moving selection.
+5) Input/menu/save:
+- Pointer lock + menu behavior unchanged.
+- Save/load unaffected.
 
 Acceptance Criteria
 -------------------
-- Continue restores player position/orientation, inventory state, and time-of-day.
-- Autosave runs on a timer and provides minimal feedback.
-- Main menu shows save metadata and New Game requires confirmation.
-- Pointer lock behavior remains correct.
+- `ChunkRenderer:setPriorityOriginWorld` performs no full mesh-cache scan on chunk crossings.
+- Pruning work is amortized and bounded per frame (checks/ms caps), eliminating O(meshCache) spikes.
+- Mesh cache still converges to the keep radius while traveling (bounded memory).
+- Optional: HUD verifies prune work and pending state.

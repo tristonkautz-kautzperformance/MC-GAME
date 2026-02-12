@@ -1,6 +1,80 @@
 # Dev Log
 
+## 2026-02-12
+
+### Streaming + Frame-Pacing Fixes
+- Replaced per-boundary full-radius dirty reseeding in `src/game/GameState.lua` with chunk-ring enqueueing:
+  - movement now uses `ChunkWorld:enqueueRingDelta(...)`
+  - initial session boot uses a one-time square seed (`ChunkWorld:enqueueChunkSquare(...)`)
+- Added `ChunkWorld:getActiveChunkYRange()` with conservative precomputed generation/feature bounds, and limited startup + movement enqueue work to that Y chunk range (skips guaranteed-empty upper layers).
+- Added renderer missing-mesh enqueue path in `src/render/ChunkRenderer.lua`:
+  - `enqueueMissingKeys(...)` only queues chunks without cached meshes
+  - explicit world dirties (edits/boundary neighbors) still force rebuilds through the dirty path
+- Switched rebuild pacing from chunk-count-only to millisecond budgeting:
+  - new `Constants.REBUILD.maxMillisPerFrame`
+  - `ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)` now stops on time budget and still respects a hard chunk cap safety guard
+- Added transient streaming metric in HUD:
+  - `GameState` tracks last chunk-crossing enqueue count
+  - `HUD` shows `Stream: Enqueued N` for `Constants.PERF.enqueuedShowSeconds` (default `0.5s`)
+- Added tree bound tuning fields in `Constants.GEN` (`treeTrunkMin`, `treeTrunkMax`, `treeLeafPad`) and aligned feature height usage so active Y-range estimation stays conservative/deterministic.
+
+### Rebuild Queue Spike Mitigation + Diagnostics
+- Updated `ChunkRenderer` priority handling to avoid O(queue) rebucketing spikes on chunk crossings:
+  - added `_priorityVersion` stamping for dirty entries
+  - added lazy stale-entry requeue on pop when priority changed
+  - full `_rebucketDirtyEntries()` now runs only when backlog is small (`Constants.REBUILD.rebucketFullThreshold`)
+  - stale requeue work per rebuild call is capped (`Constants.REBUILD.staleRequeueCap`) to guarantee forward progress
+- Added renderer rebuild diagnostics captured each frame:
+  - dirty intake drained count from `world:drainDirtyChunkKeys`
+  - newly queued dirty count from that drain
+  - rebuild time spent in `rebuildDirty` (ms)
+  - active rebuild budget (ms, or off)
+- Extended `GameState` HUD payload and `HUD` perf lines:
+  - `Rebuild: <spent> / <budget> ms`
+  - `DirtyIn: <drained>  Queued: <queued>`
+  - existing transient `Stream: Enqueued N` retained
+- Reduced greedy meshing allocation churn by reusing a persistent 2D mask array (`ChunkRenderer._greedyMask`) instead of allocating a new mask table per chunk rebuild.
+
+### Clear Done Line: Incremental Mesh Pruning
+- Removed chunk-crossing full-cache prune spikes by replacing immediate `_pruneChunkMeshes()` scans with incremental pruning in `src/render/ChunkRenderer.lua`.
+- `setPriorityOriginWorld(...)` now only schedules prune work (`_prunePending`, cursor reset, cached keep radius) and no longer performs O(meshCache) maintenance directly.
+- Added bounded per-frame prune stepping:
+  - new `ChunkRenderer:_pruneChunkMeshesStep(maxChecks, maxMillis)` uses a safe `next(...)` cursor and supports deletion while iterating
+  - default per-frame caps added in `Constants.REBUILD`:
+    - `pruneMaxChecksPerFrame = 128`
+    - `pruneMaxMillisPerFrame = 0.25`
+- Pruning now runs each frame from `rebuildDirty(...)` under its own small budget, so mesh cache convergence is amortized.
+- Added prune diagnostics to renderer/HUD:
+  - `Prune: scanned <n>  removed <m>  pending <yes/no>`
+  - useful for confirming bounded prune work and pending-state drain.
+
 ## 2026-02-11
+
+### Large-World Procedural Terrain Refactor
+- Replaced eager per-chunk base voxel storage in `src/world/ChunkWorld.lua` with layered lookup:
+  - procedural base terrain (`_getBaseBlock`)
+  - deterministic feature overrides (lazy trees in `_featureChunks`)
+  - sparse persisted edit overrides (`_editChunks`, including carved air `0`)
+- `ChunkWorld:generate()` is now O(1) and no longer scans/fills the entire world volume.
+- Added numeric-key chunk/local indexing helpers (`_chunkKey`, `_localIndex`) to keep `world:get()` allocation-free in meshing hot paths.
+- Refactored edit persistence APIs:
+  - `getEditCount()` now reflects sparse edit entries
+  - `collectEdits(out)` now decodes numeric chunk/index storage back to world coordinates
+- Added deterministic lazy tree preparation:
+  - `prepareChunk(cx, cy, cz)` seeds per-column feature generation once
+  - per-column RNG is derived from `(WORLD_SEED, cx, cz)` so results are generation-order independent
+  - tree placement uses a safe chunk-edge margin and keeps writes within a single chunk
+- Added dirty seeding for lazy meshing with `ChunkWorld:markDirtyRadius(centerCx, centerCz, radiusChunks)`.
+- Updated `GameState` dirty/meshing flow:
+  - seeds dirty chunks around the spawn/player chunk on session start
+  - reseeds when the player crosses chunk boundaries so newly visible chunks queue for rebuild
+- Updated `ChunkRenderer` integration:
+  - calls `world:prepareChunk` once before chunk rebuilds
+  - prunes far chunk meshes when priority chunk changes to keep mesh memory bounded
+  - mesh cache retention radius now uses `drawRadius + alwaysVisiblePadding + meshCachePadding`
+- Increased finite world X/Z dimensions to `1280 x 1280` (`WORLD_SIZE_Y` remains `64`) and added `Constants.CULL.meshCachePaddingChunks`.
+- Note: existing saves from smaller world dimensions will fail compatibility checks (header world-size validation).
+- Updated `README.md` feature bullets to match the new world scale/storage model.
 
 ### Save V2 + Autosave + Menu Metadata
 - Upgraded save serialization in `src/save/SaveSystem.lua` to always write `MC_SAVE_V2` at `saves/world_v1.txt`.

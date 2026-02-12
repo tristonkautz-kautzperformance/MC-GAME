@@ -45,13 +45,44 @@ function ChunkRenderer.new(constants, world)
   self._priorityChunkX = 1
   self._priorityChunkY = 1
   self._priorityChunkZ = 1
+  self._priorityVersion = 0
   self._hasPriorityChunk = false
   self._rebuildConfig = constants.REBUILD or {}
   self._usePriorityRebuild = self._rebuildConfig.prioritize ~= false
   self._priorityHorizontalOnly = self._rebuildConfig.prioritizeHorizontalOnly ~= false
+  self._rebucketFullThreshold = math.floor(tonumber(self._rebuildConfig.rebucketFullThreshold) or 128)
+  if self._rebucketFullThreshold < 0 then
+    self._rebucketFullThreshold = 0
+  end
+  self._staleRequeueCap = math.floor(tonumber(self._rebuildConfig.staleRequeueCap) or 32)
+  if self._staleRequeueCap < 0 then
+    self._staleRequeueCap = 0
+  end
+  self._pruneMaxChecksPerFrame = math.floor(tonumber(self._rebuildConfig.pruneMaxChecksPerFrame) or 128)
+  if self._pruneMaxChecksPerFrame < 0 then
+    self._pruneMaxChecksPerFrame = 0
+  end
+  self._pruneMaxMillisPerFrame = tonumber(self._rebuildConfig.pruneMaxMillisPerFrame) or 0.25
+  if self._pruneMaxMillisPerFrame < 0 then
+    self._pruneMaxMillisPerFrame = 0
+  end
   self._rebuildsLastFrame = 0
+  self._dirtyDrainedLastFrame = 0
+  self._dirtyQueuedLastFrame = 0
+  self._rebuildMsLastFrame = 0
+  self._rebuildBudgetMsLastFrame = 0
+  self._pruneScannedLastFrame = 0
+  self._pruneRemovedLastFrame = 0
+  self._prunePending = false
+  self._pruneCursorKey = nil
+  self._pruneKeepRadius = 0
   self._visibleCount = 0
   self._useGreedyMeshing = not (constants.MESH and constants.MESH.greedy == false)
+  self._greedyMask = {}
+  local greedyMaskSize = self.chunkSize * self.chunkSize
+  for i = 1, greedyMaskSize do
+    self._greedyMask[i] = 0
+  end
   self._drawForward = lovr.math.newVec3(0, 0, -1)
   self._alphaScratch = {}
   self._alphaScratchCount = 0
@@ -60,7 +91,15 @@ function ChunkRenderer.new(constants, world)
 end
 
 function ChunkRenderer:getLastFrameStats()
-  return self._visibleCount or 0, self._rebuildsLastFrame or 0
+  return self._visibleCount or 0,
+    self._rebuildsLastFrame or 0,
+    self._dirtyDrainedLastFrame or 0,
+    self._dirtyQueuedLastFrame or 0,
+    self._rebuildMsLastFrame or 0,
+    self._rebuildBudgetMsLastFrame or 0,
+    self._pruneScannedLastFrame or 0,
+    self._pruneRemovedLastFrame or 0,
+    self._prunePending and 1 or 0
 end
 
 function ChunkRenderer:getDirtyQueueSize()
@@ -125,11 +164,143 @@ function ChunkRenderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
   self._priorityChunkX = pcx
   self._priorityChunkY = pcy
   self._priorityChunkZ = pcz
+  self._priorityVersion = self._priorityVersion + 1
   self._hasPriorityChunk = true
 
   if self._usePriorityRebuild and self._dirtyCount > 0 then
-    self:_rebucketDirtyEntries()
+    if self._dirtyCount <= self._rebucketFullThreshold then
+      self:_rebucketDirtyEntries()
+    end
   end
+
+  self._pruneKeepRadius = self:_computePruneKeepRadius()
+  self._prunePending = true
+  self._pruneCursorKey = nil
+end
+
+function ChunkRenderer:_computePruneKeepRadius()
+  local cull = self.constants.CULL or {}
+  local drawRadius = tonumber(cull.drawRadiusChunks) or 0
+  local alwaysVisiblePadding = tonumber(cull.alwaysVisiblePaddingChunks) or 0
+  local meshCachePadding = tonumber(cull.meshCachePaddingChunks) or 0
+  local keepRadius = math.floor(drawRadius + alwaysVisiblePadding + meshCachePadding)
+  if keepRadius < 0 then
+    keepRadius = 0
+  end
+  return keepRadius
+end
+
+function ChunkRenderer:_pruneChunkMeshesStep(maxChecks, maxMillis)
+  self._pruneScannedLastFrame = 0
+  self._pruneRemovedLastFrame = 0
+  if not self._prunePending or not self._hasPriorityChunk then
+    return 0, 0
+  end
+
+  local checksLimit = tonumber(maxChecks)
+  if checksLimit == nil then
+    checksLimit = self._pruneMaxChecksPerFrame
+  else
+    checksLimit = math.floor(checksLimit)
+    if checksLimit < 0 then
+      checksLimit = 0
+    end
+  end
+
+  local millisLimit = tonumber(maxMillis)
+  if millisLimit == nil then
+    millisLimit = self._pruneMaxMillisPerFrame
+  end
+
+  local hasTimer = lovr.timer and lovr.timer.getTime
+  local useTimeBudget = hasTimer and millisLimit and millisLimit > 0
+  local startTime = 0
+  if useTimeBudget then
+    startTime = lovr.timer.getTime()
+  end
+  if checksLimit <= 0 and not useTimeBudget then
+    checksLimit = 1
+  end
+
+  local keepRadius = self._pruneKeepRadius or self:_computePruneKeepRadius()
+  local scanned = 0
+  local removed = 0
+  local resumeKey = self._pruneCursorKey
+  local lastKeptKey = nil
+
+  local key, entry
+  if resumeKey then
+    key, entry = next(self._chunkMeshes, resumeKey)
+  else
+    key, entry = next(self._chunkMeshes)
+  end
+
+  local pcx = self._priorityChunkX
+  local pcz = self._priorityChunkZ
+
+  while key do
+    if checksLimit > 0 and scanned >= checksLimit then
+      break
+    end
+    if useTimeBudget and scanned > 0 then
+      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+      if elapsedMs >= millisLimit then
+        break
+      end
+    end
+
+    local nextKey, nextEntry = next(self._chunkMeshes, key)
+    scanned = scanned + 1
+
+    local keep = true
+    local cx = entry.cx
+    local cy = entry.cy
+    local cz = entry.cz
+    if not cx or not cz then
+      cx, cy, cz = parseKey(key)
+      entry.cx = cx
+      entry.cy = cy
+      entry.cz = cz
+    end
+
+    if cx and cz then
+      local dx = math.abs(cx - pcx)
+      local dz = math.abs(cz - pcz)
+      local dist = dx
+      if dz > dist then
+        dist = dz
+      end
+
+      if dist > keepRadius then
+        self._chunkMeshes[key] = nil
+        removed = removed + 1
+        keep = false
+      end
+    end
+
+    if keep then
+      lastKeptKey = key
+    end
+    key, entry = nextKey, nextEntry
+  end
+
+  if key then
+    if lastKeptKey then
+      self._pruneCursorKey = lastKeptKey
+    elseif resumeKey and self._chunkMeshes[resumeKey] then
+      self._pruneCursorKey = resumeKey
+    else
+      self._pruneCursorKey = nil
+    end
+    self._prunePending = true
+  else
+    self._prunePending = false
+    self._pruneCursorKey = nil
+  end
+
+  self._pruneScannedLastFrame = scanned
+  self._pruneRemovedLastFrame = removed
+  return scanned, removed
 end
 
 function ChunkRenderer:_computeDirtyDistance(cx, cy, cz)
@@ -160,6 +331,7 @@ end
 function ChunkRenderer:_pushDirtyEntry(entry)
   local dist = self:_computeDirtyDistance(entry.cx, entry.cy, entry.cz)
   entry.dist = dist
+  entry.priorityVersion = self._priorityVersion
 
   local bucket = self._dirtyBuckets[dist]
   if not bucket then
@@ -177,6 +349,21 @@ function ChunkRenderer:_pushDirtyEntry(entry)
   if dist > self._dirtyMaxDist then
     self._dirtyMaxDist = dist
   end
+end
+
+function ChunkRenderer:_requeueDirtyEntry(entry)
+  if not entry or not entry.key then
+    return false
+  end
+
+  if self._dirtyEntries[entry.key] then
+    return false
+  end
+
+  self._dirtyEntries[entry.key] = entry
+  self._dirtyCount = self._dirtyCount + 1
+  self:_pushDirtyEntry(entry)
+  return true
 end
 
 function ChunkRenderer:_findNextDirtyBucket(startDist)
@@ -276,20 +463,29 @@ function ChunkRenderer:_rebucketDirtyEntries()
   end
 end
 
-function ChunkRenderer:_queueDirtyKeys(dirtyKeys, count)
+function ChunkRenderer:_queueDirtyKeys(dirtyKeys, count, forceRebuild)
   count = count or #dirtyKeys
+  local queued = 0
   for i = 1, count do
     local key = dirtyKeys[i]
     if not self._dirtyEntries[key] then
-      local cx, cy, cz = parseKey(key)
-      if cx and cy and cz then
-        local entry = { key = key, cx = cx, cy = cy, cz = cz, dist = 0 }
-        self._dirtyEntries[key] = entry
-        self._dirtyCount = self._dirtyCount + 1
-        self:_pushDirtyEntry(entry)
+      if forceRebuild or not self._chunkMeshes[key] then
+        local cx, cy, cz = parseKey(key)
+        if cx and cy and cz then
+          local entry = { key = key, cx = cx, cy = cy, cz = cz, dist = 0 }
+          self._dirtyEntries[key] = entry
+          self._dirtyCount = self._dirtyCount + 1
+          self:_pushDirtyEntry(entry)
+          queued = queued + 1
+        end
       end
     end
   end
+  return queued
+end
+
+function ChunkRenderer:enqueueMissingKeys(chunkKeys, count)
+  return self:_queueDirtyKeys(chunkKeys, count, false)
 end
 
 function ChunkRenderer:_shouldDrawFace(block, neighbor)
@@ -484,10 +680,16 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
     emitQuad(out, x1, y0, z, x0, y0, z, x0, y1, z, x1, y1, z, 0, 0, 1, r, g, b, a)
   end
 
-  local mask = {}
+  local mask = self._greedyMask
   local maskSize = cs * cs
-  for i = 1, maskSize do
-    mask[i] = 0
+  if #mask < maskSize then
+    for i = #mask + 1, maskSize do
+      mask[i] = 0
+    end
+  elseif #mask > maskSize then
+    for i = maskSize + 1, #mask do
+      mask[i] = nil
+    end
   end
 
   for direction = DIR_NEG_X, DIR_POS_Z do
@@ -576,6 +778,10 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
 end
 
 function ChunkRenderer:_rebuildChunk(cx, cy, cz)
+  if self.world.prepareChunk then
+    self.world:prepareChunk(cx, cy, cz)
+  end
+
   local cs = self.chunkSize
   local originX, originY, originZ, verticesOpaque, verticesAlpha
 
@@ -585,7 +791,8 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
     originX, originY, originZ, verticesOpaque, verticesAlpha = self:_buildChunkNaive(cx, cy, cz)
   end
 
-  local entry = self._chunkMeshes[cx .. ',' .. cy .. ',' .. cz] or {}
+  local key = cx .. ',' .. cy .. ',' .. cz
+  local entry = self._chunkMeshes[key] or {}
 
   if #verticesOpaque > 0 then
     entry.opaque = lovr.graphics.newMesh(VERTEX_FORMAT, verticesOpaque, 'cpu')
@@ -613,13 +820,48 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
   entry.centerZ = centerZ
   entry.radius = math.sqrt(3) * (cs * 0.5) + 0.05
   entry.radiusHorizontal = math.sqrt(2) * (cs * 0.5) + 0.05
+  entry.cx = cx
+  entry.cy = cy
+  entry.cz = cz
 
-  self._chunkMeshes[cx .. ',' .. cy .. ',' .. cz] = entry
+  self._chunkMeshes[key] = entry
 end
 
-function ChunkRenderer:rebuildDirty(maxPerFrame)
-  maxPerFrame = maxPerFrame or self._rebuildConfig.maxPerFrame or 4
+function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
+  local hasTimer = lovr.timer and lovr.timer.getTime
+  local rebuildStartTime = 0
+  if hasTimer then
+    rebuildStartTime = lovr.timer.getTime()
+  end
+
+  local hardCap = tonumber(maxPerFrame)
+  if hardCap ~= nil then
+    hardCap = math.floor(hardCap)
+    if hardCap < 0 then
+      hardCap = 0
+    end
+  else
+    hardCap = tonumber(self._rebuildConfig.maxPerFrame)
+    if hardCap and hardCap > 0 then
+      hardCap = math.floor(hardCap)
+    else
+      hardCap = math.huge
+    end
+  end
+
+  local maxMillis = tonumber(maxMillisPerFrame)
+  if maxMillis == nil then
+    maxMillis = tonumber(self._rebuildConfig.maxMillisPerFrame)
+  end
+  local useTimeBudget = maxMillis and maxMillis > 0 and hasTimer
+  self._rebuildBudgetMsLastFrame = (maxMillis and maxMillis > 0) and maxMillis or 0
+  local startTime = 0
+  if useTimeBudget then
+    startTime = lovr.timer.getTime()
+  end
+
   self._rebuildsLastFrame = 0
+  self:_pruneChunkMeshesStep(self._pruneMaxChecksPerFrame, self._pruneMaxMillisPerFrame)
 
   local dirtyCount = 0
   local dirtyKeys = self._dirtyScratch
@@ -630,25 +872,61 @@ function ChunkRenderer:rebuildDirty(maxPerFrame)
     dirtyCount = #dirtyKeys
   end
 
+  local queued = 0
   if dirtyCount > 0 then
-    self:_queueDirtyKeys(dirtyKeys, dirtyCount)
+    queued = self:_queueDirtyKeys(dirtyKeys, dirtyCount, true)
   end
+  self._dirtyDrainedLastFrame = dirtyCount
+  self._dirtyQueuedLastFrame = queued
 
   if self._dirtyCount <= 0 then
+    if hasTimer then
+      self._rebuildMsLastFrame = (lovr.timer.getTime() - rebuildStartTime) * 1000
+    else
+      self._rebuildMsLastFrame = 0
+    end
     return 0
   end
 
   local rebuilt = 0
-  while rebuilt < maxPerFrame do
+  local staleRequeued = 0
+  local staleRequeueCap = self._staleRequeueCap or 0
+  while rebuilt < hardCap do
+    if useTimeBudget and rebuilt > 0 then
+      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+      if elapsedMs >= maxMillis then
+        break
+      end
+    end
+
     local entry = self:_popDirtyEntry()
     if not entry then
       break
     end
-    self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
-    rebuilt = rebuilt + 1
+
+    local stalePriority = self._usePriorityRebuild
+      and self._hasPriorityChunk
+      and entry.priorityVersion ~= self._priorityVersion
+
+    if stalePriority and staleRequeued < staleRequeueCap then
+      if self:_requeueDirtyEntry(entry) then
+        staleRequeued = staleRequeued + 1
+      else
+        self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
+        rebuilt = rebuilt + 1
+      end
+    else
+      self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
+      rebuilt = rebuilt + 1
+    end
   end
 
   self._rebuildsLastFrame = rebuilt
+  if hasTimer then
+    self._rebuildMsLastFrame = (lovr.timer.getTime() - rebuildStartTime) * 1000
+  else
+    self._rebuildMsLastFrame = 0
+  end
   return rebuilt
 end
 

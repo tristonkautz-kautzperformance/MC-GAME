@@ -1,8 +1,9 @@
-local Chunk = require 'src.world.Chunk'
-
 local ChunkWorld = {}
 ChunkWorld.__index = ChunkWorld
+
 local EMPTY_DIRTY_KEYS = {}
+local RNG_MOD = 2147483648
+local COLUMN_SEED_MOD = 2147483647
 
 local function clampInt(v, a, b)
   if v < a then return a end
@@ -14,9 +15,24 @@ local function makeRng(seed)
   -- Deterministic LCG RNG (avoids depending on global math.randomseed state).
   local state = seed or 1
   return function()
-    state = (1103515245 * state + 12345) % 2147483648
-    return state / 2147483648
+    state = (1103515245 * state + 12345) % RNG_MOD
+    return state / RNG_MOD
   end
+end
+
+local function mixColumnSeed(worldSeed, cx, cz)
+  local seed = math.floor(tonumber(worldSeed) or 1)
+  local state = seed % COLUMN_SEED_MOD
+  if state < 0 then
+    state = state + COLUMN_SEED_MOD
+  end
+
+  -- Stable integer hash from world seed + chunk column.
+  state = (state + cx * 73856093 + cz * 19349663) % COLUMN_SEED_MOD
+  if state == 0 then
+    state = 1
+  end
+  return state
 end
 
 function ChunkWorld.new(constants)
@@ -32,22 +48,23 @@ function ChunkWorld.new(constants)
   self.chunksY = constants.WORLD_CHUNKS_Y
   self.chunksZ = constants.WORLD_CHUNKS_Z
 
-  self._chunks = {}
   self._dirty = {}
-  self._trackEdits = true
-  self._editOriginal = {}
-  self._editValues = {}
+  self._editChunks = {}
+  self._editChunkCounts = {}
+  self._featureChunks = {}
+  self._featureColumnsPrepared = {}
   self._editCount = 0
 
-  for cy = 1, self.chunksY do
-    self._chunks[cy] = {}
-    for cz = 1, self.chunksZ do
-      self._chunks[cy][cz] = {}
-      for cx = 1, self.chunksX do
-        self._chunks[cy][cz][cx] = Chunk.new(self.chunkSize)
-      end
-    end
-  end
+  self._genGrassY = 2
+  self._genStoneTop = 1
+  self._genDirtTop = 1
+  self._treeTrunkMin = 3
+  self._treeTrunkMax = 5
+  self._treeLeafPad = 2
+  self._activeMinChunkY = 1
+  self._activeMaxChunkY = self.chunksY
+
+  self:_computeGenerationThresholds()
 
   return self
 end
@@ -68,27 +85,36 @@ function ChunkWorld:_toChunkCoords(x, y, z)
   return cx, cy, cz, lx, ly, lz
 end
 
-function ChunkWorld:getChunk(cx, cy, cz)
-  if cx < 1 or cx > self.chunksX or cy < 1 or cy > self.chunksY or cz < 1 or cz > self.chunksZ then
-    return nil
-  end
-  return self._chunks[cy][cz][cx]
+function ChunkWorld:_chunkKey(cx, cy, cz)
+  return cx + (cz - 1) * self.chunksX + (cy - 1) * self.chunksX * self.chunksZ
+end
+
+function ChunkWorld:_decodeChunkKey(chunkKey)
+  local chunksPerLayer = self.chunksX * self.chunksZ
+  local zeroBased = chunkKey - 1
+  local cy = math.floor(zeroBased / chunksPerLayer) + 1
+  local rem = zeroBased % chunksPerLayer
+  local cz = math.floor(rem / self.chunksX) + 1
+  local cx = (rem % self.chunksX) + 1
+  return cx, cy, cz
+end
+
+function ChunkWorld:_localIndex(lx, ly, lz)
+  local cs = self.chunkSize
+  return (ly - 1) * cs * cs + (lz - 1) * cs + lx
+end
+
+function ChunkWorld:_columnKey(cx, cz)
+  return cx + (cz - 1) * self.chunksX
 end
 
 function ChunkWorld:_markDirty(cx, cy, cz)
-  local chunk = self:getChunk(cx, cy, cz)
-  if not chunk then
+  if cx < 1 or cx > self.chunksX or cy < 1 or cy > self.chunksY or cz < 1 or cz > self.chunksZ then
     return
   end
 
-  chunk.dirty = true
   local key = cx .. ',' .. cy .. ',' .. cz
   self._dirty[key] = true
-end
-
-function ChunkWorld:_markDirtyAtWorld(x, y, z)
-  local cx, cy, cz = self:_toChunkCoords(x, y, z)
-  self:_markDirty(cx, cy, cz)
 end
 
 function ChunkWorld:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
@@ -101,14 +127,189 @@ function ChunkWorld:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
   if lz == cs then self:_markDirty(cx, cy, cz + 1) end
 end
 
+function ChunkWorld:_computeGenerationThresholds()
+  local bedrockY = 1
+  local gen = self.constants.GEN or {}
+  local bedrockDepth = tonumber(gen.bedrockDepth) or 6
+  if bedrockDepth < 1 then
+    bedrockDepth = 1
+  end
+
+  local grassY = bedrockY + math.floor(bedrockDepth + 0.5)
+  if self.sizeY <= bedrockY then
+    grassY = bedrockY
+  else
+    grassY = clampInt(grassY, bedrockY + 1, self.sizeY)
+  end
+
+  local subsurfaceLayers = math.max(0, grassY - (bedrockY + 1))
+  local dirtFraction = tonumber(gen.dirtFraction) or (2 / 3)
+  if dirtFraction < 0 then dirtFraction = 0 end
+  if dirtFraction > 1 then dirtFraction = 1 end
+
+  local dirtLayers = math.floor(subsurfaceLayers * dirtFraction + 0.5)
+  dirtLayers = clampInt(dirtLayers, 0, subsurfaceLayers)
+  local stoneLayers = subsurfaceLayers - dirtLayers
+
+  local stoneTop = bedrockY
+  if grassY > bedrockY then
+    stoneTop = clampInt(bedrockY + stoneLayers, bedrockY, grassY - 1)
+  end
+
+  local trunkMin = math.floor(tonumber(gen.treeTrunkMin) or 3)
+  if trunkMin < 1 then
+    trunkMin = 1
+  end
+  local trunkMax = math.floor(tonumber(gen.treeTrunkMax) or 5)
+  if trunkMax < trunkMin then
+    trunkMax = trunkMin
+  end
+  local leafPad = math.floor(tonumber(gen.treeLeafPad) or 2)
+  if leafPad < 0 then
+    leafPad = 0
+  end
+
+  self._genGrassY = grassY
+  self._genStoneTop = stoneTop
+  self._genDirtTop = math.max(bedrockY, grassY - 1)
+  self._treeTrunkMin = trunkMin
+  self._treeTrunkMax = trunkMax
+  self._treeLeafPad = leafPad
+  self.groundY = grassY
+
+  local maxFeatureY = grassY
+  local treeDensity = tonumber(self.constants.TREE_DENSITY) or 0
+  local treeRootY = grassY + 1
+  if treeDensity > 0 and treeRootY <= self.sizeY then
+    local treeTopY = treeRootY + trunkMax + leafPad
+    local hardTop = self.sizeY - 2
+    if hardTop < 1 then
+      hardTop = self.sizeY
+    end
+    if treeTopY > hardTop then
+      treeTopY = hardTop
+    end
+    if treeTopY > maxFeatureY then
+      maxFeatureY = treeTopY
+    end
+  end
+
+  maxFeatureY = clampInt(maxFeatureY, 1, self.sizeY)
+  self._activeMinChunkY = 1
+  self._activeMaxChunkY = clampInt(math.floor((maxFeatureY - 1) / self.chunkSize) + 1, 1, self.chunksY)
+end
+
+function ChunkWorld:getActiveChunkYRange()
+  local minCy = self._activeMinChunkY or 1
+  local maxCy = self._activeMaxChunkY or self.chunksY
+  minCy = clampInt(minCy, 1, self.chunksY)
+  maxCy = clampInt(maxCy, 1, self.chunksY)
+  if minCy > maxCy then
+    minCy, maxCy = maxCy, minCy
+  end
+  return minCy, maxCy
+end
+
+function ChunkWorld:_normalizeChunkYRange(minCy, maxCy)
+  local minY = clampInt(math.floor(tonumber(minCy) or 1), 1, self.chunksY)
+  local maxY = clampInt(math.floor(tonumber(maxCy) or self.chunksY), 1, self.chunksY)
+  if minY > maxY then
+    minY, maxY = maxY, minY
+  end
+  return minY, maxY
+end
+
+function ChunkWorld:_getBaseBlock(x, y, z)
+  local blockIds = self.constants.BLOCK
+  if not self:isInside(x, y, z) then
+    return blockIds.AIR
+  end
+
+  if y == 1 then
+    return blockIds.BEDROCK
+  end
+  if y <= self._genStoneTop then
+    return blockIds.STONE
+  end
+  if y <= self._genDirtTop then
+    return blockIds.DIRT
+  end
+  if y == self._genGrassY then
+    return blockIds.GRASS
+  end
+
+  return blockIds.AIR
+end
+
+function ChunkWorld:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
+  local featureChunk = self._featureChunks[chunkKey]
+  if featureChunk then
+    local featureValue = featureChunk[localIndex]
+    if featureValue ~= nil then
+      return featureValue
+    end
+  end
+  return self:_getBaseBlock(x, y, z)
+end
+
+function ChunkWorld:_getBaseWithFeatures(x, y, z)
+  if not self:isInside(x, y, z) then
+    return self.constants.BLOCK.AIR
+  end
+
+  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local localIndex = self:_localIndex(lx, ly, lz)
+  return self:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
+end
+
+function ChunkWorld:_setFeatureBlock(x, y, z, block)
+  if block == self.constants.BLOCK.AIR then
+    return
+  end
+  if not self:isInside(x, y, z) then
+    return
+  end
+
+  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local localIndex = self:_localIndex(lx, ly, lz)
+
+  local featureChunk = self._featureChunks[chunkKey]
+  if not featureChunk then
+    featureChunk = {}
+    self._featureChunks[chunkKey] = featureChunk
+  end
+
+  featureChunk[localIndex] = block
+end
+
 function ChunkWorld:get(x, y, z)
   if not self:isInside(x, y, z) then
     return self.constants.BLOCK.AIR
   end
 
   local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
-  local chunk = self:getChunk(cx, cy, cz)
-  return chunk and chunk:getLocal(lx, ly, lz) or self.constants.BLOCK.AIR
+  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local localIndex = self:_localIndex(lx, ly, lz)
+
+  local editChunk = self._editChunks[chunkKey]
+  if editChunk then
+    local editValue = editChunk[localIndex]
+    if editValue ~= nil then
+      return editValue
+    end
+  end
+
+  local featureChunk = self._featureChunks[chunkKey]
+  if featureChunk then
+    local featureValue = featureChunk[localIndex]
+    if featureValue ~= nil then
+      return featureValue
+    end
+  end
+
+  return self:_getBaseBlock(x, y, z)
 end
 
 function ChunkWorld:set(x, y, z, value)
@@ -116,41 +317,51 @@ function ChunkWorld:set(x, y, z, value)
     return false
   end
 
-  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
-  local chunk = self:getChunk(cx, cy, cz)
-  if not chunk then
-    return false
+  if value == nil then
+    value = self.constants.BLOCK.AIR
   end
 
-  local oldValue = chunk:getLocal(lx, ly, lz)
+  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+  self:prepareChunk(cx, cy, cz)
+
+  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local localIndex = self:_localIndex(lx, ly, lz)
+
+  local oldValue = self:get(x, y, z)
   if oldValue == value then
     return true
   end
 
-  if self._trackEdits then
-    local editKey = x .. ',' .. y .. ',' .. z
-    if self._editOriginal[editKey] == nil then
-      self._editOriginal[editKey] = oldValue
-    end
-  end
+  local baseValue = self:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
+  local editChunk = self._editChunks[chunkKey]
+  local previousEdit = editChunk and editChunk[localIndex] or nil
 
-  chunk:setLocal(lx, ly, lz, value)
+  if value == baseValue then
+    if previousEdit ~= nil then
+      editChunk[localIndex] = nil
+      self._editCount = self._editCount - 1
 
-  if self._trackEdits then
-    local editKey = x .. ',' .. y .. ',' .. z
-    local originalValue = self._editOriginal[editKey]
-    if value == originalValue then
-      if self._editValues[editKey] ~= nil then
-        self._editValues[editKey] = nil
-        self._editCount = self._editCount - 1
+      local remaining = (self._editChunkCounts[chunkKey] or 1) - 1
+      if remaining <= 0 then
+        self._editChunkCounts[chunkKey] = nil
+        self._editChunks[chunkKey] = nil
+      else
+        self._editChunkCounts[chunkKey] = remaining
       end
-      self._editOriginal[editKey] = nil
-    else
-      if self._editValues[editKey] == nil then
-        self._editCount = self._editCount + 1
-      end
-      self._editValues[editKey] = value
     end
+  else
+    if not editChunk then
+      editChunk = {}
+      self._editChunks[chunkKey] = editChunk
+      self._editChunkCounts[chunkKey] = 0
+    end
+
+    if previousEdit == nil then
+      self._editCount = self._editCount + 1
+      self._editChunkCounts[chunkKey] = (self._editChunkCounts[chunkKey] or 0) + 1
+    end
+
+    editChunk[localIndex] = value
   end
 
   self:_markDirty(cx, cy, cz)
@@ -226,114 +437,239 @@ function ChunkWorld:drainDirtyChunkKeys(out)
   return count
 end
 
-function ChunkWorld:generate()
-  local rng = makeRng(self.constants.WORLD_SEED or 1)
-  local cs = self.chunkSize
-  local sizeX = self.sizeX
-  local sizeY = self.sizeY
-  local sizeZ = self.sizeZ
-  local blockIds = self.constants.BLOCK
+function ChunkWorld:markDirtyRadius(centerCx, centerCz, radiusChunks)
+  if self.chunksX <= 0 or self.chunksY <= 0 or self.chunksZ <= 0 then
+    return
+  end
 
-  -- Flat world: bedrock base + stone + dirt + grass (tunable strata thickness).
-  local bedrockY = 1
-  local gen = self.constants.GEN or {}
-  local bedrockDepth = tonumber(gen.bedrockDepth) or 6
-  if bedrockDepth < 1 then bedrockDepth = 1 end
+  local cx = clampInt(math.floor(tonumber(centerCx) or 1), 1, self.chunksX)
+  local cz = clampInt(math.floor(tonumber(centerCz) or 1), 1, self.chunksZ)
+  local radius = math.floor(tonumber(radiusChunks) or 0)
+  if radius < 0 then
+    radius = 0
+  end
 
-  local grassY = bedrockY + math.floor(bedrockDepth + 0.5)
-  grassY = clampInt(grassY, bedrockY + 1, sizeY)
-  self.groundY = grassY
+  local minX = clampInt(cx - radius, 1, self.chunksX)
+  local maxX = clampInt(cx + radius, 1, self.chunksX)
+  local minZ = clampInt(cz - radius, 1, self.chunksZ)
+  local maxZ = clampInt(cz + radius, 1, self.chunksZ)
 
-  local subsurfaceLayers = math.max(0, grassY - (bedrockY + 1))
-  local dirtFraction = tonumber(gen.dirtFraction) or (2 / 3)
-  if dirtFraction < 0 then dirtFraction = 0 end
-  if dirtFraction > 1 then dirtFraction = 1 end
+  for markCz = minZ, maxZ do
+    for markCx = minX, maxX do
+      for markCy = 1, self.chunksY do
+        self:_markDirty(markCx, markCy, markCz)
+      end
+    end
+  end
+end
 
-  local dirtLayers = math.floor(subsurfaceLayers * dirtFraction + 0.5)
-  dirtLayers = clampInt(dirtLayers, 0, subsurfaceLayers)
-  local stoneLayers = subsurfaceLayers - dirtLayers
+function ChunkWorld:enqueueChunkSquare(centerCx, centerCz, radiusChunks, minCy, maxCy, outKeys)
+  if not outKeys then
+    return 0
+  end
+  if self.chunksX <= 0 or self.chunksY <= 0 or self.chunksZ <= 0 then
+    return 0
+  end
 
-  local stoneTop = clampInt(bedrockY + stoneLayers, bedrockY, grassY - 1)
-  local dirtTop = grassY - 1
-  local AIR = blockIds.AIR
-  local BEDROCK = blockIds.BEDROCK
-  local STONE = blockIds.STONE
-  local DIRT = blockIds.DIRT
-  local GRASS = blockIds.GRASS
+  local cx = clampInt(math.floor(tonumber(centerCx) or 1), 1, self.chunksX)
+  local cz = clampInt(math.floor(tonumber(centerCz) or 1), 1, self.chunksZ)
+  local radius = math.floor(tonumber(radiusChunks) or 0)
+  if radius < 0 then
+    radius = 0
+  end
 
-  self._trackEdits = false
-  self._dirty = {}
+  local lowCy, highCy = self:_normalizeChunkYRange(minCy, maxCy)
+  local minX = clampInt(cx - radius, 1, self.chunksX)
+  local maxX = clampInt(cx + radius, 1, self.chunksX)
+  local minZ = clampInt(cz - radius, 1, self.chunksZ)
+  local maxZ = clampInt(cz + radius, 1, self.chunksZ)
 
-  -- Base terrain fill: write directly into chunk storage (avoid per-voxel set/dirty bookkeeping).
-  for cy = 1, self.chunksY do
-    local originY = (cy - 1) * cs
-    for cz = 1, self.chunksZ do
-      local originZ = (cz - 1) * cs
-      for cx = 1, self.chunksX do
-        local originX = (cx - 1) * cs
-        local chunk = self._chunks[cy][cz][cx]
-        chunk.blocks = {}
-        chunk.dirty = false
+  local count = 0
+  for queueCz = minZ, maxZ do
+    for queueCx = minX, maxX do
+      for queueCy = lowCy, highCy do
+        count = count + 1
+        outKeys[count] = queueCx .. ',' .. queueCy .. ',' .. queueCz
+      end
+    end
+  end
 
-        for ly = 1, cs do
-          local wy = originY + ly
-          if wy > sizeY then break end
+  return count
+end
 
-          local block = AIR
-          if wy == bedrockY then
-            block = BEDROCK
-          elseif wy <= stoneTop then
-            block = STONE
-          elseif wy <= dirtTop then
-            block = DIRT
-          elseif wy == grassY then
-            block = GRASS
+function ChunkWorld:enqueueRingDelta(oldCx, oldCz, newCx, newCz, radiusChunks, minCy, maxCy, outKeys)
+  if not outKeys then
+    return 0
+  end
+  if self.chunksX <= 0 or self.chunksY <= 0 or self.chunksZ <= 0 then
+    return 0
+  end
+
+  local fromCx = clampInt(math.floor(tonumber(oldCx) or 1), 1, self.chunksX)
+  local fromCz = clampInt(math.floor(tonumber(oldCz) or 1), 1, self.chunksZ)
+  local toCx = clampInt(math.floor(tonumber(newCx) or 1), 1, self.chunksX)
+  local toCz = clampInt(math.floor(tonumber(newCz) or 1), 1, self.chunksZ)
+
+  local dx = toCx - fromCx
+  local dz = toCz - fromCz
+  if dx == 0 and dz == 0 then
+    return 0
+  end
+  if math.abs(dx) > 1 or math.abs(dz) > 1 then
+    return -1
+  end
+
+  local radius = math.floor(tonumber(radiusChunks) or 0)
+  if radius < 0 then
+    radius = 0
+  end
+  local lowCy, highCy = self:_normalizeChunkYRange(minCy, maxCy)
+  local minX = clampInt(toCx - radius, 1, self.chunksX)
+  local maxX = clampInt(toCx + radius, 1, self.chunksX)
+  local minZ = clampInt(toCz - radius, 1, self.chunksZ)
+  local maxZ = clampInt(toCz + radius, 1, self.chunksZ)
+
+  local count = 0
+  local xColumn = nil
+
+  if dx ~= 0 then
+    xColumn = toCx + (dx > 0 and radius or -radius)
+    if xColumn >= 1 and xColumn <= self.chunksX then
+      for queueCz = minZ, maxZ do
+        for queueCy = lowCy, highCy do
+          count = count + 1
+          outKeys[count] = xColumn .. ',' .. queueCy .. ',' .. queueCz
+        end
+      end
+    else
+      xColumn = nil
+    end
+  end
+
+  if dz ~= 0 then
+    local zRow = toCz + (dz > 0 and radius or -radius)
+    if zRow >= 1 and zRow <= self.chunksZ then
+      for queueCx = minX, maxX do
+        if not xColumn or queueCx ~= xColumn then
+          for queueCy = lowCy, highCy do
+            count = count + 1
+            outKeys[count] = queueCx .. ',' .. queueCy .. ',' .. zRow
           end
+        end
+      end
+    end
+  end
 
-          if block ~= AIR then
-            local yBase = (ly - 1) * cs * cs
-            for lz = 1, cs do
-              local wz = originZ + lz
-              if wz > sizeZ then break end
-              local zBase = yBase + (lz - 1) * cs
-              for lx = 1, cs do
-                local wx = originX + lx
-                if wx > sizeX then break end
-                chunk.blocks[zBase + lx] = block
-              end
+  return count
+end
+
+function ChunkWorld:generate()
+  self:_computeGenerationThresholds()
+
+  -- O(1) reset: no eager per-voxel terrain allocation.
+  self._dirty = {}
+  self._editChunks = {}
+  self._editChunkCounts = {}
+  self._featureChunks = {}
+  self._featureColumnsPrepared = {}
+  self._editCount = 0
+end
+
+function ChunkWorld:_placeTreeFeature(x, y, z, trunkHeight)
+  local AIR = self.constants.BLOCK.AIR
+  local WOOD = self.constants.BLOCK.WOOD
+  local LEAF = self.constants.BLOCK.LEAF
+
+  local trunkTop = math.min(y + trunkHeight - 1, self.sizeY)
+  for iy = y, trunkTop do
+    self:_setFeatureBlock(x, iy, z, WOOD)
+  end
+
+  local leafStart = y + trunkHeight - 2
+  local maxY = math.min(self.sizeY - 2, y + trunkHeight + self._treeLeafPad)
+  for iy = leafStart, maxY do
+    local radius = (iy == maxY) and 1 or 2
+    for dz = -radius, radius do
+      for dx = -radius, radius do
+        local ax = x + dx
+        local az = z + dz
+        if self:isInside(ax, iy, az) then
+          local dist = math.abs(dx) + math.abs(dz)
+          if dist <= radius + 1 and self:_getBaseWithFeatures(ax, iy, az) == AIR then
+            self:_setFeatureBlock(ax, iy, az, LEAF)
+          end
+        end
+      end
+    end
+  end
+end
+
+function ChunkWorld:_prepareColumnFeatures(cx, cz)
+  local density = tonumber(self.constants.TREE_DENSITY) or 0
+  if density <= 0 then
+    return
+  end
+
+  local cs = self.chunkSize
+  local originX = (cx - 1) * cs
+  local originZ = (cz - 1) * cs
+
+  local margin = 3
+  local minLocal = margin + 1
+  local maxLocal = cs - margin
+  if minLocal > maxLocal then
+    return
+  end
+
+  local treeY = self._genGrassY + 1
+  if treeY < 1 or treeY > self.sizeY then
+    return
+  end
+
+  local treeCy = math.floor((treeY - 1) / cs) + 1
+  if treeCy < 1 or treeCy > self.chunksY then
+    return
+  end
+
+  local chunkTopY = treeCy * cs
+  local rng = makeRng(mixColumnSeed(self.constants.WORLD_SEED, cx, cz))
+  local grass = self.constants.BLOCK.GRASS
+
+  for lz = minLocal, maxLocal do
+    local wz = originZ + lz
+    if wz <= self.sizeZ then
+      for lx = minLocal, maxLocal do
+        local wx = originX + lx
+        if wx <= self.sizeX and rng() < density then
+          if self:_getBaseBlock(wx, self._genGrassY, wz) == grass then
+            local trunkRange = self._treeTrunkMax - self._treeTrunkMin + 1
+            local trunkHeight = self._treeTrunkMin + math.floor(rng() * trunkRange)
+            if trunkHeight > self._treeTrunkMax then
+              trunkHeight = self._treeTrunkMax
+            end
+            local maxY = math.min(self.sizeY - 2, treeY + trunkHeight + self._treeLeafPad)
+            if maxY <= chunkTopY then
+              self:_placeTreeFeature(wx, treeY, wz, trunkHeight)
             end
           end
         end
       end
     end
   end
+end
 
-  -- Quick tree pass.
-  local density = self.constants.TREE_DENSITY or 0
-  for z = 2, self.sizeZ - 1 do
-    for x = 2, self.sizeX - 1 do
-      if rng() < density then
-        -- Plant on grass.
-        if self:get(x, grassY, z) == self.constants.BLOCK.GRASS then
-          self:_placeTree(x, grassY + 1, z, rng)
-        end
-      end
-    end
+function ChunkWorld:prepareChunk(cx, cy, cz)
+  if cx < 1 or cx > self.chunksX or cz < 1 or cz > self.chunksZ then
+    return
   end
 
-  -- Mark everything dirty once at end (avoid rebuilding chunk-by-chunk during generation).
-  for cy = 1, self.chunksY do
-    for cz = 1, self.chunksZ do
-      for cx = 1, self.chunksX do
-        self:_markDirty(cx, cy, cz)
-      end
-    end
+  local columnKey = self:_columnKey(cx, cz)
+  if self._featureColumnsPrepared[columnKey] then
+    return
   end
 
-  self._trackEdits = true
-  self._editOriginal = {}
-  self._editValues = {}
-  self._editCount = 0
+  self._featureColumnsPrepared[columnKey] = true
+  self:_prepareColumnFeatures(cx, cz)
 end
 
 function ChunkWorld:getEditCount()
@@ -346,18 +682,35 @@ function ChunkWorld:collectEdits(out)
   end
 
   local count = 0
-  for key, block in pairs(self._editValues) do
-    local x, y, z = key:match('^(%d+),(%d+),(%d+)$')
-    if x and y and z then
+  local cs = self.chunkSize
+  local cs2 = cs * cs
+
+  for chunkKey, chunkEdits in pairs(self._editChunks) do
+    local cx, cy, cz = self:_decodeChunkKey(chunkKey)
+    local originX = (cx - 1) * cs
+    local originY = (cy - 1) * cs
+    local originZ = (cz - 1) * cs
+
+    for localIndex, blockId in pairs(chunkEdits) do
+      local zeroBased = localIndex - 1
+      local ly = math.floor(zeroBased / cs2) + 1
+      local rem = zeroBased % cs2
+      local lz = math.floor(rem / cs) + 1
+      local lx = (rem % cs) + 1
+
       count = count + 1
       local entry = out[count]
+      local worldX = originX + lx
+      local worldY = originY + ly
+      local worldZ = originZ + lz
+
       if entry then
-        entry[1] = tonumber(x)
-        entry[2] = tonumber(y)
-        entry[3] = tonumber(z)
-        entry[4] = block
+        entry[1] = worldX
+        entry[2] = worldY
+        entry[3] = worldZ
+        entry[4] = blockId
       else
-        out[count] = { tonumber(x), tonumber(y), tonumber(z), block }
+        out[count] = { worldX, worldY, worldZ, blockId }
       end
     end
   end
@@ -367,34 +720,6 @@ function ChunkWorld:collectEdits(out)
   end
 
   return count
-end
-
-function ChunkWorld:_placeTree(x, y, z, rng)
-  local trunkHeight = 3 + math.floor(rng() * 3)
-  local maxY = math.min(self.sizeY - 2, y + trunkHeight + 2)
-
-  for iy = y, math.min(y + trunkHeight - 1, self.sizeY) do
-    self:set(x, iy, z, self.constants.BLOCK.WOOD)
-  end
-
-  local leafStart = y + trunkHeight - 2
-  for iy = leafStart, maxY do
-    local radius = (iy == maxY) and 1 or 2
-    for dz = -radius, radius do
-      for dx = -radius, radius do
-        local ax = x + dx
-        local az = z + dz
-        if self:isInside(ax, iy, az) then
-          local dist = math.abs(dx) + math.abs(dz)
-          if dist <= radius + 1 then
-            if self:get(ax, iy, az) == self.constants.BLOCK.AIR then
-              self:set(ax, iy, az, self.constants.BLOCK.LEAF)
-            end
-          end
-        end
-      end
-    end
-  end
 end
 
 function ChunkWorld:raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDistance)

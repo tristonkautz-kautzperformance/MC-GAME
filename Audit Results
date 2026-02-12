@@ -2,7 +2,7 @@ Audit Results
 =============
 
 Date: 2026-02-09
-Updated: 2026-02-10
+Updated: 2026-02-12
 
 Scope
 -----
@@ -11,9 +11,18 @@ Scope
 
 Findings (ordered by severity)
 ------------------------------
-- Low/Design: Breaking a block always removes it; if inventory is full the block effectively disappears (no drop). Decide whether this is intended. See `src/interaction/Interaction.lua:21`.
-- Scaling note: Rebuild prioritization rebuckets queued dirty entries when the player changes chunk; this is O(queue) and can be noticeable if the dirty backlog becomes large. See `src/render/ChunkRenderer.lua:92` and `src/render/ChunkRenderer.lua:236`.
-- Scaling note: Alpha chunk sorting is O(n log n) in the number of visible alpha chunks; fine for now, but keep an eye on it if leaf-heavy scenes grow.
+- Perf/Scaling: Dirty-key ingestion uses string parsing (`parseKey` uses `key:match`) per queued key; fine at current volumes but avoid re-introducing 100s-1000s of keys per boundary. See `src/render/ChunkRenderer.lua:83` and `src/render/ChunkRenderer.lua:332`.
+- Perf/GC: Meshing builds allocate heavily per rebuild (vertex tables, greedy `mask` table). Ms-based budgeting limits CPU time but GC can still introduce hitches if rebuild throughput is high. See `src/render/ChunkRenderer.lua:392` and `src/render/ChunkRenderer.lua:549`.
+- Perf/Scaling: Alpha chunk sorting is O(n log n) in the number of visible alpha chunks; fine for now, but keep an eye on it if leaf-heavy scenes grow. See `src/render/ChunkRenderer.lua:864`.
+- Perf/Correctness: Streaming/meshing depends on missing-mesh enqueue + edit-driven dirties; if any system introduces non-edit block changes without dirtying, it can create "stale mesh" risks. (Currently edits and boundary-neighbor updates do dirty correctly via `ChunkWorld:set()`.)
+
+Focused Mini-Audit Notes (Renderer Scheduling)
+----------------------------------------------
+- Current behavior is correct for V1: movement enqueues only missing meshes; edits drive real dirties; rebuild is time-budgeted.
+- Chunk-crossing maintenance spikes have been removed:
+  - O(queue) dirty rebucketing is now avoided under backlog via lazy stale requeue + small-backlog rebucket threshold.
+  - O(meshCache) mesh pruning is now incremental/amortized with per-frame caps instead of scanning the full cache on each crossing.
+- HUD now separates streaming enqueue, dirty intake, rebuild ms vs budget, and prune work, so tuning is data-driven.
 
 Resolved
 --------
@@ -31,3 +40,15 @@ Resolved
   - Cached draw vectors use persistent `lovr.math.newVec3` to avoid "temporary vector from a previous frame" crashes. See `src/render/ChunkRenderer.lua:718`.
 - HUD GC smoothing:
   - Reuses scratch vectors/line buffers and caches concatenated HUD text, rebuilding at a fixed interval. See `src/ui/HUD.lua:4`.
+- Inventory-full break safety:
+  - Breaking a block no longer removes it if the inventory cannot accept the item. See `src/interaction/Interaction.lua:32` and `src/inventory.lua:90`.
+- Streaming dirty-queue spikes on movement addressed:
+  - Movement no longer reseeds an entire radius volume as "dirty" on chunk crossings.
+  - Newly-visible chunks enqueue only when their mesh is missing (ring-delta streaming), and meshing is paced by a ms budget. See `src/game/GameState.lua:596`, `src/world/ChunkWorld.lua:500`, `src/render/ChunkRenderer.lua:353`, `src/render/ChunkRenderer.lua:690`.
+- Debug validation metric added:
+  - HUD shows `Stream: Enqueued N` for ~0.5s after chunk crossings. See `src/ui/HUD.lua:66`.
+- Chunk-crossing scheduling spikes addressed:
+  - Avoids O(queue) dirty rebucketing spikes using lazy stale entry requeue and a full-rebucket threshold for small backlogs.
+  - Avoids O(meshCache) mesh pruning spikes by amortizing pruning across frames with `next(...)` iteration and per-frame caps.
+- HUD rebuild/prune diagnostics added:
+  - Shows rebuild ms vs budget, dirty intake drained vs queued, and per-frame prune work + pending status.

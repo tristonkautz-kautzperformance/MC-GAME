@@ -1,7 +1,7 @@
 local Constants = {}
 
-Constants.WORLD_SIZE_X = 256
-Constants.WORLD_SIZE_Z = 256
+Constants.WORLD_SIZE_X = 1280
+Constants.WORLD_SIZE_Z = 1280
 Constants.WORLD_SIZE_Y = 64
 Constants.CHUNK_SIZE = 16
 Constants.CHUNK_VOLUME = Constants.CHUNK_SIZE * Constants.CHUNK_SIZE * Constants.CHUNK_SIZE
@@ -17,7 +17,10 @@ Constants.TREE_DENSITY = 0.0175
 -- For example, bedrockDepth=15 means grass at y=16 with bedrock at y=1.
 Constants.GEN = {
   bedrockDepth = 15,
-  dirtFraction = 2 / 3
+  dirtFraction = 2 / 3,
+  treeTrunkMin = 3,
+  treeTrunkMax = 5,
+  treeLeafPad = 2
 }
 
 Constants.DAY_LENGTH_SECONDS = 300
@@ -31,7 +34,8 @@ Constants.CULL = {
   fovDegrees = 110,
   fovPaddingDegrees = 8,
   horizontalOnly = true,
-  alwaysVisiblePaddingChunks = 1
+  alwaysVisiblePaddingChunks = 1,
+  meshCachePaddingChunks = 2
 }
 
 Constants.MESH = {
@@ -39,16 +43,26 @@ Constants.MESH = {
 }
 
 Constants.REBUILD = {
-  maxPerFrame = 3,
+  maxPerFrame = 24,
+  maxMillisPerFrame = 2.5,
   -- Prevents a huge startup hitch when the world has many chunks.
   initialBurstMax = 700,
+  initialBurstMaxMillis = 12.0,
   prioritize = true,
-  prioritizeHorizontalOnly = true
+  prioritizeHorizontalOnly = true,
+  -- Only perform full O(queue) rebucket when backlog is small.
+  rebucketFullThreshold = 128,
+  -- Max stale entries requeued per rebuild call before forcing progress.
+  staleRequeueCap = 32,
+  -- Incremental mesh-cache pruning budget to avoid chunk-crossing spikes.
+  pruneMaxChecksPerFrame = 128,
+  pruneMaxMillisPerFrame = 0.25
 }
 
 Constants.PERF = {
   showHud = true,
-  hudUpdateInterval = 0.10
+  hudUpdateInterval = 0.10,
+  enqueuedShowSeconds = 0.5
 }
 
 Constants.SAVE = {

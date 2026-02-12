@@ -63,6 +63,34 @@ function HUD:_rebuildHudText(state)
       state.rebuilds or 0,
       state.dirtyQueue or 0
     )
+    local rebuildBudgetMs = tonumber(state.rebuildBudgetMs) or 0
+    local rebuildBudgetText = 'off'
+    if rebuildBudgetMs > 0 then
+      rebuildBudgetText = string.format('%.2f', rebuildBudgetMs)
+    end
+    count = count + 1
+    lines[count] = string.format(
+      'Rebuild: %.2f / %s ms',
+      tonumber(state.rebuildMs) or 0,
+      rebuildBudgetText
+    )
+    count = count + 1
+    lines[count] = string.format(
+      'DirtyIn: %d  Queued: %d',
+      math.floor(tonumber(state.dirtyDrained) or 0),
+      math.floor(tonumber(state.dirtyQueued) or 0)
+    )
+    count = count + 1
+    lines[count] = string.format(
+      'Prune: scanned %d  removed %d  pending %s',
+      math.floor(tonumber(state.pruneScanned) or 0),
+      math.floor(tonumber(state.pruneRemoved) or 0),
+      state.prunePending and 'yes' or 'no'
+    )
+    if (state.enqueuedTimer or 0) > 0 then
+      count = count + 1
+      lines[count] = string.format('Stream: Enqueued %d', state.enqueuedCount or 0)
+    end
   end
 
   count = count + 1

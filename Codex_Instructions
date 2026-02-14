@@ -1,157 +1,273 @@
 Codex Instructions (Codex 5.3)
 ==============================
 
-Status (2026-02-12)
+Status (2026-02-13)
 ------------------
-Current state:
-- Streaming is ring-delta (newly-visible chunks enqueue only when mesh is missing).
-- Dirty rebuild scheduling is amortized/lazy (no O(queue) rebucket spikes under backlog).
-- Rebuild is ms-budgeted.
-- HUD diagnostics exist for:
-  - streaming enqueue count (`Stream: Enqueued N`)
-  - dirty intake vs queued (`DirtyIn` / `Queued`)
-  - rebuild ms spent vs budget (`Rebuild: <ms> / <budget> ms`)
+Baseline already in place (do not redo):
+- Chunked finite world (`ChunkWorld`) with procedural base + sparse overrides (edits + features).
+- Chunk renderer (`ChunkRenderer`) builds per-chunk meshes (opaque + alpha) and draws:
+  - Greedy meshing (default) with persistent 2D mask reuse.
+  - Halo-based sampling (`ChunkWorld:fillBlockHalo`) in meshing inner loops.
+  - Vertex pooling for rebuild paths (reduced GC churn after warm-up).
+  - Dirty rebuild queue prioritized + ms-budgeted.
+  - Incremental mesh-cache pruning is amortized (no O(meshCache) on crossings).
+  - Chunk culling is radius + optional FOV (conservative).
+  - Alpha chunks sort back-to-front.
 
-On desktop hardware it now plays smoothly and typically averages ~90-100 FPS.
+New task: GPU + Draw Path Optimizations
+--------------------------------------
+Goal
+- Improve runtime performance (GPU + CPU) by implementing the following in a safe, incremental way:
+  1) Enable GPU back-face culling for opaque meshes.
+  2) Draw opaque chunks front-to-back (keep alpha back-to-front).
+  3) Reduce per-quad vertex bandwidth using indexed quads (4 verts + 6 indices).
+  4) Offload chunk meshing to `lovr.thread` workers (data build in thread, Mesh creation on main).
+  5) (Long-term) Reduce draw calls with "region meshes" (batch chunks).
 
-Remaining potential spike from the audit:
-- `ChunkRenderer:_pruneChunkMeshes()` is O(meshCache) and is called on priority chunk changes.
-  - Even if it is not currently noticeable, this is the last obvious one-frame O(n) maintenance path tied to chunk crossings.
+Do NOT change (hard constraints)
+-------------------------------
+- Pointer lock, input, menu behavior.
+- Save format / save system.
+- World bounds rules (finite world), bedrock unbreakable.
+- Block IDs, colors, and opaque/alpha semantics (leaves remain translucent).
+- Chunk dirtying correctness (including neighbor dirtying at boundaries).
+- Existing rebuild scheduling/budgeting and mesh-cache pruning approach (extend if needed; don't delete).
 
-Update (2026-02-12)
-------------------
-Implemented:
-- Incremental mesh-cache pruning with per-frame caps (removes O(meshCache) crossing spikes).
-- Prune diagnostics in HUD (`Prune: scanned ... removed ... pending ...`).
-- New config knobs in `Constants.REBUILD`:
-  - `pruneMaxChecksPerFrame`
-  - `pruneMaxMillisPerFrame`
-
-Goal ("Clear Done Line")
------------------------
-Remove any one-frame O(meshCache) maintenance work on chunk crossings while preserving:
-- Stable, bounded mesh cache size while traveling.
-- Existing renderer + streaming architecture (no major rewrite).
-- Pointer lock/input behavior unchanged.
-
-Non-Goals
+Non-goals
 ---------
-- Infinite world
-- New worldgen systems/biomes/caves
-- Multiplayer
-- Input/control changes
-- Major renderer redesign
+- Infinite world or major worldgen changes.
+- GPU occlusion queries, MultiDrawIndirect, persistent mapped buffers (not directly exposed in LOVR 0.18).
+- Major shader/material redesign.
 
-Key Constraints
----------------
-- Do not regress pointer lock:
-  - Click captures mouse.
-  - Tab toggles lock.
-  - Esc unlocks first, then existing menu behavior.
-- Keep hot loops allocation-light:
-  - Avoid creating new tables/strings per-frame in prune/rebuild loops.
+Implementation Order (do in this order)
+--------------------------------------
+1) Opaque back-face culling (quick win, correctness-sensitive).
+2) Opaque front-to-back ordering (quick win, low risk).
+3) Indexed quads (medium effort, interacts with winding/culling).
+4) Threaded meshing (bigger refactor; keep fallbacks).
+5) Region meshes (optional, only if draw-call submission becomes the bottleneck).
 
-Implementation Tasks (Do Together)
-----------------------------------
-
-1) Amortize Mesh Cache Pruning (Incremental Pass)
--------------------------------------------------
-Files: src/render/ChunkRenderer.lua, src/constants.lua
+1) Enable back-face culling for opaque meshes
+--------------------------------------------
+Files: `src/render/ChunkRenderer.lua`, `src/constants.lua`
 
 Problem
-- `ChunkRenderer:setPriorityOriginWorld` currently calls `_pruneChunkMeshes()` directly.
-- `_pruneChunkMeshes()` scans the entire mesh cache table with `pairs(...)` and can hitch on chunk crossings when the cache is large.
+- `ChunkRenderer:draw` currently uses `pass:setCullMode('none')` for everything.
+- Disabling culling increases overdraw and can hurt fillrate in dense scenes.
 
-Fix
-Convert pruning into an incremental pass spread across frames using a safe cursor.
+Tasks
+A) Add render toggles in constants (for easy A/B testing)
+- Add a new table in `src/constants.lua`:
+  - `Constants.RENDER = { cullOpaque = true, cullAlpha = false }`
+- Default behavior:
+  - Opaque: cull back faces.
+  - Alpha/leaves: keep culling disabled (double-sided), unless you intentionally want leaf faces culled.
 
-A) Add prune state to ChunkRenderer
-- `self._prunePending` (bool)
-- `self._pruneCursorKey` (table key or nil)
-- `self._pruneKeepRadius` (int)
+B) Verify and fix triangle winding if needed
+- With culling enabled, incorrectly-wound faces will disappear.
+- Test both meshing paths:
+  - `ChunkRenderer:_buildChunkNaive`
+  - `ChunkRenderer:_buildChunkGreedy`
+- If any face direction vanishes, fix the vertex order passed into `emitQuad(...)` for that direction so the outward side is the front face.
+  - Note: culling uses winding, not `VertexNormal`.
 
-Optional per-frame diagnostics (for HUD verification):
-- `self._pruneScannedLastFrame` (int)
-- `self._pruneRemovedLastFrame` (int)
+C) Implement culling in `ChunkRenderer:draw`
+- Keep the existing `pass:push('state')` / `pass:pop('state')`.
+- Structure draw as two phases with different cull modes:
+  1) Set cull mode for opaque (recommended: `back`) and draw opaque.
+  2) Set cull mode for alpha (recommended: `none`) and draw alpha.
 
-B) On priority chunk change, schedule pruning (do not prune immediately)
-In `ChunkRenderer:setPriorityOriginWorld(...)`:
-- Update priority chunk coords as usual.
-- Do NOT scan `_chunkMeshes` in this function.
-- Compute and cache `keepRadius = drawRadius + alwaysVisiblePadding + meshCachePadding` (same logic as current prune).
-- Set:
-  - `self._prunePending = true`
-  - `self._pruneCursorKey = nil` (restart pass)
-  - `self._pruneKeepRadius = keepRadius`
+Acceptance checks
+- No missing cube faces in any direction.
+- Leaves still render correctly (no holes unless `cullAlpha` is enabled).
+- Noticeable improvement in fillrate-limited situations (dense view, lots of occluded geometry).
 
-C) Add a bounded prune step that runs each frame
-Add `ChunkRenderer:_pruneChunkMeshesStep(maxChecks, maxMillis)`:
-- If `_prunePending` is false, return quickly.
-- Iterate incrementally using `next(self._chunkMeshes, cursorKey)`.
-- Keep iteration safe while deleting:
-  - For each `key, entry`, compute `afterKey, afterEntry = next(self._chunkMeshes, key)` BEFORE any deletion.
-  - Decide whether to delete `self._chunkMeshes[key] = nil` based on distance.
-  - Advance using `key, entry = afterKey, afterEntry` so you never call `next` with a removed key.
-  - Track a `lastKeptKey` so the saved cursor is always a key that still exists (or nil).
-- Stop when:
-  - scanned >= `maxChecks`, OR
-  - time >= `maxMillis` (if timer is available), OR
-  - end-of-table (then clear `_prunePending` and reset cursor).
+2) Opaque front-to-back ordering (keep alpha back-to-front)
+-----------------------------------------------------------
+Files: `src/render/ChunkRenderer.lua`
 
-D) Where to call the prune step
-Run the prune step once per frame.
-Recommended: call it inside `ChunkRenderer:rebuildDirty(...)` (it already runs in the update loop).
-Pruning should have its own small budget so it does not steal rebuild budget unpredictably.
+Problem
+- Opaque chunks are drawn in `pairs(self._chunkMeshes)` iteration order (effectively random).
+- Front-to-back ordering helps early-z and reduces overdraw.
 
-E) No extra allocations
-- Do not allocate a `remove = {}` list each prune step.
-- Prefer cached `entry.cx/entry.cz` (entries built by `_rebuildChunk` should already have these).
-  - If missing, `parseKey(key)` once and cache back onto `entry` so it becomes a one-time cost.
+Tasks
+A) Add reusable scratch arrays (avoid per-frame allocations)
+- Add on `ChunkRenderer`:
+  - `self._opaqueScratch = {}`
+  - `self._opaqueScratchCount = 0`
+- Reuse/trim like the existing alpha scratch (`self._alphaScratch`).
 
-F) Add config knobs (defaults)
-In `src/constants.lua`, add under `Constants.REBUILD`:
-- `pruneMaxChecksPerFrame = 128`
-- `pruneMaxMillisPerFrame = 0.25`
-These defaults are intentionally small: eliminate spikes, not finish pruning instantly.
+B) Gather visible opaque meshes first, then sort, then draw
+- Replace immediate `pass:draw(entry.opaque, ...)` with:
+  - If visible and has `entry.opaque`, push into `_opaqueScratch`.
+  - Compute `entry._opaqueDistSq` (distance^2 from camera to `entry.center*`).
+- Sort `_opaqueScratch` ascending by `entry._opaqueDistSq`.
+- Draw opaque meshes in sorted order.
 
-2) Optional: HUD Prune Diagnostics (Verification)
--------------------------------------------------
-Files: src/render/ChunkRenderer.lua, src/game/GameState.lua, src/ui/HUD.lua
+C) Keep alpha behavior intact
+- Continue gathering alpha entries and sorting back-to-front by `entry._alphaDistSq`.
+- Do not attempt interleaving opaque + alpha (opaque must stay first).
+
+Performance constraints
+- Avoid hot-loop allocations:
+  - No new per-chunk tables/tuples for sorting keys.
+  - Use count indexing (`count = count + 1; scratch[count] = entry`).
+
+Acceptance checks
+- Visual output unchanged (aside from reduced overdraw).
+- No new hitching from the per-frame sort at current chunk counts.
+
+3) Indexed quads (4 verts + 6 indices per face)
+-----------------------------------------------
+Files: `src/render/ChunkRenderer.lua`, `src/constants.lua`
+
+Problem
+- `emitQuad` currently emits 6 vertices per face (two triangles), duplicating 2 vertices per quad.
+- This increases vertex bandwidth and rebuild-time work.
+
+Approach
+- Emit 4 vertices per quad and append 6 indices.
+- Keep opaque + alpha separated.
+
+Tasks
+A) Add config toggle
+- Add in `Constants.MESH`:
+  - `indexed = false` (default off until validated).
+
+B) Add pooled index arrays
+- Add on `ChunkRenderer`:
+  - `self._indexPoolOpaque = {}`
+  - `self._indexPoolAlpha = {}`
+  - `self._indexCountOpaque = 0`
+  - `self._indexCountAlpha = 0`
+- Trim index pools after rebuilds like vertex pools (keep arrays contiguous).
+
+C) Replace quad emission with an indexed version
+- Implement `emitQuadIndexed(...)` that:
+  - Writes 4 vertices to the appropriate vertex pool.
+  - Writes 6 indices referencing those 4 vertices (1-based indices).
+  - Uses the correct winding for your chosen cull mode.
+- Update both build paths (`_buildChunkNaive`, `_buildChunkGreedy`) to use it when `Constants.MESH.indexed` is enabled.
+- Keep the current non-indexed path as a fallback until this is fully validated.
+
+D) Create meshes with indices
+- After building a chunk:
+  - Create Mesh from vertices as today.
+  - Call `mesh:setIndices(indexTable)` for opaque/alpha meshes.
+- Ensure indices are cleared when indexed mode is off (or construct without indices).
+
+Acceptance checks
+- Identical visuals to non-indexed mode (with and without culling enabled).
+- Vertex count per chunk decreases by ~33% vs prior emission.
+- No regression in rebuild ms or GC behavior.
+
+4) Offload meshing to `lovr.thread` workers
+------------------------------------------
+Files: new `src/render/MeshWorker.lua`, new `src/render/mesher_thread.lua`,
+and edits in `src/render/ChunkRenderer.lua` (and possibly `src/game/GameState.lua` wiring).
 
 Goal
-Make it easy to confirm pruning is incremental and bounded.
+- Move expensive meshing work off the main thread.
+- Keep all graphics object creation on the main thread:
+  - `lovr.graphics.newMesh`
+  - `Mesh:setIndices`
 
-Implementation
-- Track `pruneScanned` and `pruneRemoved` each frame on the renderer (plus whether prune is pending).
-- Expose them to the HUD alongside existing renderer stats.
-- Add a perf HUD line (only when perf HUD is on), e.g.:
-  - `Prune: scanned <n>  removed <m>  pending <yes/no>`
+Thread constraints (LOVR)
+- Threads cannot use `lovr.graphics` (no creating Mesh/Texture/Model objects).
+- Threads communicate via `Channel` objects (`lovr.thread.getChannel`).
+
+Design (two-phase pipeline)
+A) Main thread responsibilities
+- For each chunk rebuild request:
+  1) Ensure chunk is prepared (`world:prepareChunk(cx, cy, cz)`).
+  2) Fill a halo buffer (`world:fillBlockHalo(cx, cy, cz, halo)`).
+  3) Enqueue a meshing job to a worker with:
+     - chunk coords + key
+     - a monotonic `version`/`jobId` (for stale-result rejection)
+     - meshing mode (greedy/naive, indexed on/off)
+     - halo data (table or Blob)
+     - a compact block-info table (opaque + alpha + color/alpha needed by the mesher)
+- Each frame, within a small time budget:
+  - Pop completed results and apply to `self._chunkMeshes[key]` by creating/updating Mesh objects.
+
+B) Worker thread responsibilities
+- Pop job messages from a job Channel.
+- Build vertex + index data using the same meshing rules as the main-thread path.
+- Push results back to the main thread.
+- Do not reference any main-thread world tables directly.
+
+Data format (recommended staged rollout)
+- Phase 1 (simpler, possibly slower): send/receive Lua tables.
+  - Job: halo table + compact blockInfo.
+  - Result: vertex tables + index tables (opaque + alpha) + counts.
+- Phase 2 (preferred): send/receive `Blob`s.
+  - Pack halo as U8 Blob (`(cs + 2)^3` bytes).
+  - Pack vertices as F32 Blob (or FFI write), with a fixed vertex stride matching `VERTEX_FORMAT`.
+  - Pack indices as U16/U32 Blob.
+  - Main thread creates Mesh from vertex Blob and calls `mesh:setIndices(indexBlob, 'u16'/'u32')`.
+
+Concurrency controls (avoid memory blowups)
+- Add a new constants table, e.g.:
+  - `Constants.THREAD_MESH = { enabled = false, maxInFlight = 2, maxApplyMillis = 1.0 }`
+- Keep a small in-flight cap.
+- When over cap, fall back to synchronous rebuild or defer jobs.
+
+Stale result rejection (must-have)
+- Track a `buildVersion` per chunk key.
+- Increment it when queueing a new job for that chunk.
+- Results include the version; discard results that don't match the latest version.
+
+Fallback (must-have)
+- If thread module is disabled, worker isn't started, or worker errors:
+  - Use the existing synchronous `_rebuildChunk` path for correctness.
+
+Acceptance checks
+- Chunk rebuilds no longer cause visible hitches while moving/streaming.
+- Dirty queue still drains correctly; no cracks after edits.
+- Worker failure cannot soft-lock the game (fallback works).
+
+5) Long-term: Region meshes (batch chunks to reduce draw calls)
+--------------------------------------------------------------
+Only attempt if:
+- You plan to significantly increase `Constants.CULL.drawRadiusChunks`, OR
+- Profiling indicates draw submission is the bottleneck (too many Mesh draws per frame).
+
+Approach
+- Group chunks into fixed regions (e.g., 2x2x1 chunks).
+- Build one region mesh per region (opaque + alpha).
+- Any dirty chunk triggers a rebuild of its region mesh.
+
+Tradeoffs
+- Pros: fewer draw calls, less per-frame sort work.
+- Cons: larger rebuild blast radius and more complex dirty propagation.
+
+Acceptance checks
+- No seams/cracks at region boundaries.
+- Rebuild cost remains bounded (no massive spikes).
 
 Manual Test Checklist
 ---------------------
-1) Stand still:
-- `Dirty` reaches 0 and stays stable.
-- `Prune` should go idle (pending false) quickly.
+1) Stand still after load:
+- Dirty queue drains to 0; no flicker/popping.
 
-2) Walk in a single direction for 2+ minutes:
-- No chunk-crossing hitch spikes from pruning.
-- Mesh cache remains bounded (no unbounded growth).
+2) Walk in one direction for 2+ minutes:
+- No new hitch spikes from rebuilds.
+- Mesh cache remains bounded (existing prune system unchanged).
 
-3) Stress:
-- Increase `Constants.CULL.drawRadiusChunks` and `Constants.CULL.meshCachePaddingChunks`.
-- Ensure crossing remains smooth and prune stats show bounded per-frame work.
+3) Edits at chunk boundaries:
+- Break/place blocks on a chunk edge; both adjacent chunks rebuild correctly (no cracks).
 
-4) Visual correctness:
-- No near-field chunks disappear unexpectedly.
-- Only far cached meshes get pruned.
+4) Leaves/translucency:
+- Leaves still render as alpha with acceptable sorting.
 
-5) Input/menu/save:
-- Pointer lock + menu behavior unchanged.
-- Save/load unaffected.
+5) Toggle matrix (A/B)
+- Opaque culling on/off.
+- Indexed quads on/off.
+- Threaded meshing on/off.
 
-Acceptance Criteria
+Notes for changelog
 -------------------
-- `ChunkRenderer:setPriorityOriginWorld` performs no full mesh-cache scan on chunk crossings.
-- Pruning work is amortized and bounded per frame (checks/ms caps), eliminating O(meshCache) spikes.
-- Mesh cache still converges to the keep radius while traveling (bounded memory).
-- Optional: HUD verifies prune work and pending state.
+- After implementing any step above, add a DEVLOG entry describing:
+  - What shipped and what toggles were added.
+  - Any visible correctness risks (winding/culling) and how they were validated.
+  - Any measurable perf improvement (optional).

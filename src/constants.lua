@@ -39,7 +39,21 @@ Constants.CULL = {
 }
 
 Constants.MESH = {
-  greedy = true
+  greedy = true,
+  indexed = false
+}
+
+Constants.RENDER = {
+  cullOpaque = true,
+  cullAlpha = false
+}
+
+Constants.THREAD_MESH = {
+  enabled = true,
+  haloBlob = true,
+  resultBlob = true,
+  maxInFlight = 2,
+  maxApplyMillis = 1.0
 }
 
 Constants.REBUILD = {

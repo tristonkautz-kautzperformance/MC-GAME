@@ -275,6 +275,9 @@ function GameState:_teardownSession()
   self.interaction = nil
   self.hud = nil
   self.sky = nil
+  if self.renderer and self.renderer.shutdown then
+    self.renderer:shutdown()
+  end
   self.renderer = nil
   self._autosaveTimer = 0
   self._chunkDirtyRadius = 0

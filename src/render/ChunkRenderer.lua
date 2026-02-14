@@ -1,25 +1,68 @@
 local ChunkRenderer = {}
 ChunkRenderer.__index = ChunkRenderer
 
+local MeshWorker = require 'src.render.MeshWorker'
+
 local VERTEX_FORMAT = {
   { 'VertexPosition', 'vec3' },
   { 'VertexNormal', 'vec3' },
   { 'VertexColor', 'vec4' }
 }
 
-local function addVertex(list, x, y, z, nx, ny, nz, r, g, b, a)
-  list[#list + 1] = { x, y, z, nx, ny, nz, r, g, b, a }
+local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a)
+  count = count + 1
+  local vertex = pool[count]
+  if not vertex then
+    vertex = {}
+    pool[count] = vertex
+  end
+
+  vertex[1] = x
+  vertex[2] = y
+  vertex[3] = z
+  vertex[4] = nx
+  vertex[5] = ny
+  vertex[6] = nz
+  vertex[7] = r
+  vertex[8] = g
+  vertex[9] = b
+  vertex[10] = a
+  return count
 end
 
-local function emitQuad(list, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+local function emitQuad(pool, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
   -- Two triangles (a,b,c) + (a,c,d).
-  addVertex(list, ax, ay, az, nx, ny, nz, r, g, b, a)
-  addVertex(list, bx, by, bz, nx, ny, nz, r, g, b, a)
-  addVertex(list, cx, cy, cz, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, bx, by, bz, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a)
 
-  addVertex(list, ax, ay, az, nx, ny, nz, r, g, b, a)
-  addVertex(list, cx, cy, cz, nx, ny, nz, r, g, b, a)
-  addVertex(list, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  return count
+end
+
+local function emitQuadIndexed(vertexPool, vertexCount, indexPool, indexCount,
+  ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  local base = vertexCount + 1
+  vertexCount = writeVertex(vertexPool, vertexCount, ax, ay, az, nx, ny, nz, r, g, b, a)
+  vertexCount = writeVertex(vertexPool, vertexCount, bx, by, bz, nx, ny, nz, r, g, b, a)
+  vertexCount = writeVertex(vertexPool, vertexCount, cx, cy, cz, nx, ny, nz, r, g, b, a)
+  vertexCount = writeVertex(vertexPool, vertexCount, dx, dy, dz, nx, ny, nz, r, g, b, a)
+
+  indexCount = indexCount + 1
+  indexPool[indexCount] = base
+  indexCount = indexCount + 1
+  indexPool[indexCount] = base + 1
+  indexCount = indexCount + 1
+  indexPool[indexCount] = base + 2
+  indexCount = indexCount + 1
+  indexPool[indexCount] = base
+  indexCount = indexCount + 1
+  indexPool[indexCount] = base + 2
+  indexCount = indexCount + 1
+  indexPool[indexCount] = base + 3
+  return vertexCount, indexCount
 end
 
 local DIR_NEG_X = 1
@@ -28,6 +71,14 @@ local DIR_NEG_Y = 3
 local DIR_POS_Y = 4
 local DIR_NEG_Z = 5
 local DIR_POS_Z = 6
+local HALO_BLOB_PACK_CHUNK = 256
+local tableUnpack = (table and table.unpack) or unpack
+
+local function isBlobData(value)
+  return type(value) == 'userdata'
+    and type(value.getSize) == 'function'
+    and type(value.getString) == 'function'
+end
 
 function ChunkRenderer.new(constants, world)
   local self = setmetatable({}, ChunkRenderer)
@@ -78,14 +129,62 @@ function ChunkRenderer.new(constants, world)
   self._pruneKeepRadius = 0
   self._visibleCount = 0
   self._useGreedyMeshing = not (constants.MESH and constants.MESH.greedy == false)
+  self._useIndexedMeshing = constants.MESH and constants.MESH.indexed == true
   self._greedyMask = {}
   local greedyMaskSize = self.chunkSize * self.chunkSize
   for i = 1, greedyMaskSize do
     self._greedyMask[i] = 0
   end
+  self._blockHalo = {}
+  self._vertexPoolOpaque = {}
+  self._vertexPoolAlpha = {}
+  self._indexPoolOpaque = {}
+  self._indexPoolAlpha = {}
+  self._vertexCountOpaque = 0
+  self._vertexCountAlpha = 0
+  self._indexCountOpaque = 0
+  self._indexCountAlpha = 0
   self._drawForward = lovr.math.newVec3(0, 0, -1)
+  self._opaqueScratch = {}
+  self._opaqueScratchCount = 0
   self._alphaScratch = {}
   self._alphaScratchCount = 0
+
+  local renderConfig = constants.RENDER or {}
+  self._cullOpaque = renderConfig.cullOpaque ~= false
+  self._cullAlpha = renderConfig.cullAlpha == true
+
+  local threadConfig = constants.THREAD_MESH or {}
+  self._threadEnabled = threadConfig.enabled == true
+  self._threadHaloBlob = threadConfig.haloBlob ~= false
+  self._threadResultBlob = threadConfig.resultBlob ~= false
+  self._threadMaxInFlight = math.floor(tonumber(threadConfig.maxInFlight) or 2)
+  if self._threadMaxInFlight < 1 then
+    self._threadMaxInFlight = 1
+  end
+  self._threadMaxApplyMillis = tonumber(threadConfig.maxApplyMillis) or 1.0
+  if self._threadMaxApplyMillis < 0 then
+    self._threadMaxApplyMillis = 0
+  end
+  self._meshWorker = nil
+  self._meshWorkerFailed = false
+  self._meshWorkerError = nil
+  self._chunkBuildVersion = {}
+  self._threadInFlightByKey = {}
+  self._threadInFlightHaloByKey = {}
+  self._threadInFlightCount = 0
+  self._threadHaloTablePool = {}
+  self._threadHaloTablePoolCount = 0
+  self._threadHaloPackBytes = {}
+  self._threadHaloPackParts = {}
+  self._threadBlockInfo = self:_buildThreadBlockInfo()
+  if not (lovr.data and lovr.data.newBlob) then
+    self._threadHaloBlob = false
+    self._threadResultBlob = false
+  end
+  if self._threadEnabled then
+    self:_initMeshWorker()
+  end
 
   return self
 end
@@ -117,6 +216,437 @@ function ChunkRenderer:getMeshingModeLabel()
   return 'Naive'
 end
 
+function ChunkRenderer:_buildThreadBlockInfo()
+  local src = self.constants.BLOCK_INFO or {}
+  local out = {}
+  for blockId, info in pairs(src) do
+    local color = info.color or {}
+    out[blockId] = {
+      solid = info.solid and true or false,
+      opaque = info.opaque and true or false,
+      alpha = info.alpha or 1,
+      color = { color[1] or 1, color[2] or 0, color[3] or 1 }
+    }
+  end
+  return out
+end
+
+function ChunkRenderer:_acquireThreadHaloTable()
+  local count = self._threadHaloTablePoolCount or 0
+  if count > 0 then
+    local pool = self._threadHaloTablePool
+    local halo = pool[count]
+    pool[count] = nil
+    self._threadHaloTablePoolCount = count - 1
+    return halo
+  end
+  return {}
+end
+
+function ChunkRenderer:_releaseThreadHaloTable(halo)
+  if not halo then
+    return
+  end
+
+  local pool = self._threadHaloTablePool
+  local count = (self._threadHaloTablePoolCount or 0) + 1
+  pool[count] = halo
+
+  local maxPool = self._threadMaxInFlight + 2
+  if count > maxPool then
+    for i = maxPool + 1, count do
+      pool[i] = nil
+    end
+    count = maxPool
+  end
+
+  self._threadHaloTablePoolCount = count
+end
+
+function ChunkRenderer:_releaseInFlightHaloForKey(key)
+  local inFlightHaloByKey = self._threadInFlightHaloByKey
+  local halo = inFlightHaloByKey and inFlightHaloByKey[key]
+  if halo then
+    inFlightHaloByKey[key] = nil
+    self:_releaseThreadHaloTable(halo)
+  end
+end
+
+function ChunkRenderer:_releaseAllInFlightHalos()
+  local inFlightHaloByKey = self._threadInFlightHaloByKey
+  if not inFlightHaloByKey then
+    return
+  end
+
+  for key, halo in pairs(inFlightHaloByKey) do
+    inFlightHaloByKey[key] = nil
+    self:_releaseThreadHaloTable(halo)
+  end
+end
+
+function ChunkRenderer:_packHaloBlob(halo)
+  if not self._threadHaloBlob then
+    return nil
+  end
+  if not tableUnpack then
+    return nil
+  end
+
+  local data = lovr.data
+  if not data or not data.newBlob then
+    return nil
+  end
+
+  local bytes = self._threadHaloPackBytes
+  local parts = self._threadHaloPackParts
+  local byteCount = 0
+  local partCount = 0
+
+  for i = 1, #halo do
+    byteCount = byteCount + 1
+    bytes[byteCount] = halo[i] or 0
+
+    if byteCount >= HALO_BLOB_PACK_CHUNK then
+      partCount = partCount + 1
+      parts[partCount] = string.char(tableUnpack(bytes, 1, byteCount))
+      byteCount = 0
+    end
+  end
+
+  if byteCount > 0 then
+    partCount = partCount + 1
+    parts[partCount] = string.char(tableUnpack(bytes, 1, byteCount))
+  end
+
+  if partCount == 0 then
+    return nil
+  end
+
+  local packed
+  if partCount == 1 then
+    packed = parts[1]
+  else
+    packed = table.concat(parts, '', 1, partCount)
+  end
+
+  for i = partCount + 1, #parts do
+    parts[i] = nil
+  end
+
+  local ok, blob = pcall(data.newBlob, packed, 'thread_halo')
+  if ok and blob then
+    return blob
+  end
+
+  ok, blob = pcall(data.newBlob, packed)
+  if ok and blob then
+    return blob
+  end
+
+  return nil
+end
+
+function ChunkRenderer:_initMeshWorker()
+  local worker, err = MeshWorker.new('src/render/mesher_thread.lua')
+  if not worker then
+    self._meshWorker = nil
+    self._meshWorkerFailed = true
+    self._meshWorkerError = tostring(err or 'failed_to_start')
+    return false
+  end
+
+  self._meshWorker = worker
+  self._meshWorkerFailed = false
+  self._meshWorkerError = nil
+  return true
+end
+
+function ChunkRenderer:_disableMeshWorker(reason)
+  if reason ~= nil then
+    self._meshWorkerError = tostring(reason)
+  end
+
+  if self._meshWorker then
+    self._meshWorker:shutdown()
+    self._meshWorker = nil
+  end
+
+  self._threadEnabled = false
+  self._meshWorkerFailed = true
+  self:_releaseAllInFlightHalos()
+  self._threadInFlightByKey = {}
+  self._threadInFlightHaloByKey = {}
+  self._threadInFlightCount = 0
+  self._threadHaloTablePool = {}
+  self._threadHaloTablePoolCount = 0
+end
+
+function ChunkRenderer:_isMeshWorkerReady()
+  if not self._threadEnabled then
+    return false
+  end
+  if self._meshWorkerFailed then
+    return false
+  end
+  local worker = self._meshWorker
+  if not worker then
+    return false
+  end
+  if not worker:isAlive() then
+    self:_disableMeshWorker(worker:getError() or 'worker_stopped')
+    return false
+  end
+  return true
+end
+
+function ChunkRenderer:_nextBuildVersion(key)
+  local nextVersion = (self._chunkBuildVersion[key] or 0) + 1
+  self._chunkBuildVersion[key] = nextVersion
+  return nextVersion
+end
+
+function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
+  verticesOpaque, opaqueCount,
+  verticesAlpha, alphaCount,
+  indicesOpaque, indexCountOpaque, indexTypeOpaque,
+  indicesAlpha, indexCountAlpha, indexTypeAlpha,
+  indexedMode)
+  local cs = self.chunkSize
+  local entry = self._chunkMeshes[key] or {}
+
+  local function createMesh(vertexData, vertexCount, indexData, indexCount, indexType)
+    if vertexCount <= 0 then
+      return nil, nil
+    end
+    if not vertexData then
+      return nil, 'missing_vertex_data'
+    end
+
+    local okMesh, meshOrErr = pcall(lovr.graphics.newMesh, VERTEX_FORMAT, vertexData, 'cpu')
+    if not okMesh then
+      return nil, meshOrErr
+    end
+
+    local mesh = meshOrErr
+    mesh:setDrawMode('triangles')
+
+    if indexedMode and indexCount > 0 then
+      if not indexData then
+        return nil, 'missing_index_data'
+      end
+
+      local okIndex, indexErr
+      if isBlobData(indexData) then
+        okIndex, indexErr = pcall(function()
+          mesh:setIndices(indexData, indexType or 'u32')
+        end)
+      else
+        okIndex, indexErr = pcall(function()
+          mesh:setIndices(indexData)
+        end)
+      end
+
+      if not okIndex then
+        return nil, indexErr
+      end
+    end
+
+    return mesh, nil
+  end
+
+  local opaqueMesh, errOpaque = createMesh(verticesOpaque, opaqueCount, indicesOpaque, indexCountOpaque, indexTypeOpaque)
+  if errOpaque then
+    return false, errOpaque
+  end
+  if opaqueMesh then
+    entry.opaque = opaqueMesh
+  else
+    entry.opaque = nil
+  end
+
+  local alphaMesh, errAlpha = createMesh(verticesAlpha, alphaCount, indicesAlpha, indexCountAlpha, indexTypeAlpha)
+  if errAlpha then
+    return false, errAlpha
+  end
+  if alphaMesh then
+    entry.alpha = alphaMesh
+  else
+    entry.alpha = nil
+  end
+
+  local originX = (cx - 1) * cs
+  local originY = (cy - 1) * cs
+  local originZ = (cz - 1) * cs
+  entry.originX = originX
+  entry.originY = originY
+  entry.originZ = originZ
+
+  local centerX = originX + cs * 0.5
+  local centerY = originY + cs * 0.5
+  local centerZ = originZ + cs * 0.5
+  entry.centerX = centerX
+  entry.centerY = centerY
+  entry.centerZ = centerZ
+  entry.radius = math.sqrt(3) * (cs * 0.5) + 0.05
+  entry.radiusHorizontal = math.sqrt(2) * (cs * 0.5) + 0.05
+  entry.cx = cx
+  entry.cy = cy
+  entry.cz = cz
+
+  self._chunkMeshes[key] = entry
+  return true
+end
+
+function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
+  if not self:_isMeshWorkerReady() then
+    return false
+  end
+  if self._threadInFlightCount >= self._threadMaxInFlight then
+    return false
+  end
+  if self._threadInFlightByKey[key] then
+    return false
+  end
+  if not self.world.fillBlockHalo then
+    return false
+  end
+
+  if self.world.prepareChunk then
+    self.world:prepareChunk(cx, cy, cz)
+  end
+
+  local halo = self:_acquireThreadHaloTable()
+  self.world:fillBlockHalo(cx, cy, cz, halo)
+  local haloBlob = self:_packHaloBlob(halo)
+  local version = self:_nextBuildVersion(key)
+  local job = {
+    type = 'build',
+    key = key,
+    cx = cx,
+    cy = cy,
+    cz = cz,
+    version = version,
+    chunkSize = self.chunkSize,
+    haloCount = #halo,
+    blockInfo = self._threadBlockInfo,
+    airBlock = self.constants.BLOCK.AIR,
+    useGreedy = self._useGreedyMeshing,
+    indexed = self._useIndexedMeshing,
+    resultBlob = self._threadResultBlob
+  }
+  local usesHaloTablePayload = false
+  if haloBlob then
+    job.haloBlob = haloBlob
+  else
+    job.halo = halo
+    usesHaloTablePayload = true
+  end
+
+  local ok, err = self._meshWorker:push(job)
+  if not ok then
+    self:_releaseThreadHaloTable(halo)
+    self:_disableMeshWorker(err)
+    return false
+  end
+
+  if usesHaloTablePayload then
+    self._threadInFlightHaloByKey[key] = halo
+  else
+    self:_releaseThreadHaloTable(halo)
+  end
+
+  self._threadInFlightByKey[key] = version
+  self._threadInFlightCount = self._threadInFlightCount + 1
+  return true
+end
+
+function ChunkRenderer:_applyThreadedResults(maxMillis)
+  if not self:_isMeshWorkerReady() then
+    return 0
+  end
+
+  local hasTimer = lovr.timer and lovr.timer.getTime
+  local useTimeBudget = hasTimer and maxMillis and maxMillis > 0
+  local startTime = 0
+  if useTimeBudget then
+    startTime = lovr.timer.getTime()
+  end
+
+  local applied = 0
+  while true do
+    if useTimeBudget and applied > 0 then
+      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+      if elapsedMs >= maxMillis then
+        break
+      end
+    end
+
+    local result = self._meshWorker:pop()
+    if not result then
+      break
+    end
+
+    if result.type == 'error' then
+      self:_disableMeshWorker(result.error or 'mesh_worker_error')
+      break
+    end
+
+    if result.type == 'result' and result.key then
+      local key = result.key
+      local inFlightVersion = self._threadInFlightByKey[key]
+      if inFlightVersion and inFlightVersion == result.version then
+        self._threadInFlightByKey[key] = nil
+        self:_releaseInFlightHaloForKey(key)
+        if self._threadInFlightCount > 0 then
+          self._threadInFlightCount = self._threadInFlightCount - 1
+        end
+      end
+
+      local latestVersion = self._chunkBuildVersion[key]
+      if latestVersion and result.version == latestVersion then
+        local okApply, applyErr = self:_setChunkMeshEntry(
+          key,
+          result.cx,
+          result.cy,
+          result.cz,
+          result.verticesOpaqueBlob or result.verticesOpaque,
+          result.opaqueCount or 0,
+          result.verticesAlphaBlob or result.verticesAlpha,
+          result.alphaCount or 0,
+          result.indicesOpaqueBlob or result.indicesOpaque,
+          result.indexOpaqueCount or 0,
+          result.indicesOpaqueType,
+          result.indicesAlphaBlob or result.indicesAlpha,
+          result.indexAlphaCount or 0,
+          result.indicesAlphaType,
+          result.indexed == true
+        )
+        if not okApply then
+          self:_disableMeshWorker(applyErr or 'mesh_apply_failed')
+          self:_rebuildChunk(result.cx, result.cy, result.cz)
+          break
+        end
+        applied = applied + 1
+      end
+    end
+  end
+
+  return applied
+end
+
+function ChunkRenderer:shutdown()
+  if self._meshWorker then
+    self._meshWorker:shutdown()
+    self._meshWorker = nil
+  end
+  self:_releaseAllInFlightHalos()
+  self._threadInFlightByKey = {}
+  self._threadInFlightHaloByKey = {}
+  self._threadInFlightCount = 0
+  self._threadHaloTablePool = {}
+  self._threadHaloTablePoolCount = 0
+end
+
 local function parseKey(key)
   local cx, cy, cz = key:match('^(%d+),(%d+),(%d+)$')
   return tonumber(cx), tonumber(cy), tonumber(cz)
@@ -138,6 +668,10 @@ end
 
 local function alphaSortBackToFront(a, b)
   return a._alphaDistSq > b._alphaDistSq
+end
+
+local function opaqueSortFrontToBack(a, b)
+  return a._opaqueDistSq < b._opaqueDistSq
 end
 
 function ChunkRenderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
@@ -518,79 +1052,148 @@ function ChunkRenderer:_buildChunkNaive(cx, cy, cz)
   local cs = self.chunkSize
   local world = self.world
   local blockInfo = constants.BLOCK_INFO
+  local useIndexed = self._useIndexedMeshing
 
   local originX = (cx - 1) * cs
   local originY = (cy - 1) * cs
   local originZ = (cz - 1) * cs
 
-  local verticesOpaque = {}
-  local verticesAlpha = {}
+  local verticesOpaque = self._vertexPoolOpaque
+  local verticesAlpha = self._vertexPoolAlpha
+  local indicesOpaque = self._indexPoolOpaque
+  local indicesAlpha = self._indexPoolAlpha
+  local opaqueCount = 0
+  local alphaCount = 0
+  local indexOpaqueCount = 0
+  local indexAlphaCount = 0
 
-  local function getBlock(wx, wy, wz)
-    return world:get(wx, wy, wz)
-  end
+  local halo = self._blockHalo
+  world:fillBlockHalo(cx, cy, cz, halo)
+  local haloSize = cs + 2
+  local strideZ = haloSize
+  local strideY = haloSize * haloSize
 
   for ly = 1, cs do
-    local wy = originY + ly
-    if wy > world.sizeY then break end
-    for lz = 1, cs do
-      local wz = originZ + lz
-      if wz > world.sizeZ then break end
-      for lx = 1, cs do
-        local wx = originX + lx
-        if wx > world.sizeX then break end
+    local y0 = ly - 1
+    local y1 = ly
+    local hyOffset = ly * strideY + 1
 
-        local block = getBlock(wx, wy, wz)
+    for lz = 1, cs do
+      local z0 = lz - 1
+      local z1 = lz
+      local hzOffset = hyOffset + lz * strideZ
+
+      for lx = 1, cs do
+        local x0 = lx - 1
+        local x1 = lx
+        local index = hzOffset + lx
+
+        local block = halo[index]
         if not isAir(constants, block) then
           local info = blockInfo[block]
           local r = info and info.color[1] or 1
           local g = info and info.color[2] or 0
           local b = info and info.color[3] or 1
           local a = info and (info.alpha or 1) or 1
-          local out = (info and info.opaque) and verticesOpaque or verticesAlpha
+          local isOpaqueBlock = info and info.opaque or false
+          local out = isOpaqueBlock and verticesOpaque or verticesAlpha
+          local outIndices = isOpaqueBlock and indicesOpaque or indicesAlpha
+          local count = isOpaqueBlock and opaqueCount or alphaCount
+          local indexCount = isOpaqueBlock and indexOpaqueCount or indexAlphaCount
 
-          local x0 = lx - 1
-          local x1 = lx
-          local y0 = ly - 1
-          local y1 = ly
-          local z0 = lz - 1
-          local z1 = lz
-
-          local ok = self:_shouldDrawFace(block, getBlock(wx - 1, wy, wz))
+          local ok = self:_shouldDrawFace(block, halo[index - 1])
           if ok then
-            emitQuad(out, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, a)
+            if useIndexed then
+              count, indexCount = emitQuadIndexed(
+                out, count, outIndices, indexCount,
+                x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0,
+                -1, 0, 0, r, g, b, a
+              )
+            else
+              count = emitQuad(out, count, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, a)
+            end
           end
 
-          ok = self:_shouldDrawFace(block, getBlock(wx + 1, wy, wz))
+          ok = self:_shouldDrawFace(block, halo[index + 1])
           if ok then
-            emitQuad(out, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, a)
+            if useIndexed then
+              count, indexCount = emitQuadIndexed(
+                out, count, outIndices, indexCount,
+                x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1,
+                1, 0, 0, r, g, b, a
+              )
+            else
+              count = emitQuad(out, count, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, a)
+            end
           end
 
-          ok = self:_shouldDrawFace(block, getBlock(wx, wy - 1, wz))
+          ok = self:_shouldDrawFace(block, halo[index - strideY])
           if ok then
-            emitQuad(out, x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0, 0, -1, 0, r, g, b, a)
+            if useIndexed then
+              count, indexCount = emitQuadIndexed(
+                out, count, outIndices, indexCount,
+                x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1,
+                0, -1, 0, r, g, b, a
+              )
+            else
+              count = emitQuad(out, count, x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b, a)
+            end
           end
 
-          ok = self:_shouldDrawFace(block, getBlock(wx, wy + 1, wz))
+          ok = self:_shouldDrawFace(block, halo[index + strideY])
           if ok then
-            emitQuad(out, x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1, 0, 1, 0, r, g, b, a)
+            if useIndexed then
+              count, indexCount = emitQuadIndexed(
+                out, count, outIndices, indexCount,
+                x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0,
+                0, 1, 0, r, g, b, a
+              )
+            else
+              count = emitQuad(out, count, x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b, a)
+            end
           end
 
-          ok = self:_shouldDrawFace(block, getBlock(wx, wy, wz - 1))
+          ok = self:_shouldDrawFace(block, halo[index - strideZ])
           if ok then
-            emitQuad(out, x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0, 0, 0, -1, r, g, b, a)
+            if useIndexed then
+              count, indexCount = emitQuadIndexed(
+                out, count, outIndices, indexCount,
+                x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0,
+                0, 0, -1, r, g, b, a
+              )
+            else
+              count = emitQuad(out, count, x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, r, g, b, a)
+            end
           end
 
-          ok = self:_shouldDrawFace(block, getBlock(wx, wy, wz + 1))
+          ok = self:_shouldDrawFace(block, halo[index + strideZ])
           if ok then
-            emitQuad(out, x1, y0, z1, x0, y0, z1, x0, y1, z1, x1, y1, z1, 0, 0, 1, r, g, b, a)
+            if useIndexed then
+              count, indexCount = emitQuadIndexed(
+                out, count, outIndices, indexCount,
+                x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1,
+                0, 0, 1, r, g, b, a
+              )
+            else
+              count = emitQuad(out, count, x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, r, g, b, a)
+            end
+          end
+
+          if isOpaqueBlock then
+            opaqueCount = count
+            indexOpaqueCount = indexCount
+          else
+            alphaCount = count
+            indexAlphaCount = indexCount
           end
         end
       end
     end
   end
 
-  return originX, originY, originZ, verticesOpaque, verticesAlpha
+  return originX, originY, originZ,
+    verticesOpaque, verticesAlpha, opaqueCount, alphaCount,
+    indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount
 end
 
 function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
@@ -598,17 +1201,26 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
   local cs = self.chunkSize
   local world = self.world
   local blockInfo = constants.BLOCK_INFO
+  local useIndexed = self._useIndexedMeshing
 
   local originX = (cx - 1) * cs
   local originY = (cy - 1) * cs
   local originZ = (cz - 1) * cs
 
-  local verticesOpaque = {}
-  local verticesAlpha = {}
+  local verticesOpaque = self._vertexPoolOpaque
+  local verticesAlpha = self._vertexPoolAlpha
+  local indicesOpaque = self._indexPoolOpaque
+  local indicesAlpha = self._indexPoolAlpha
+  local opaqueCount = 0
+  local alphaCount = 0
+  local indexOpaqueCount = 0
+  local indexAlphaCount = 0
 
-  local function getBlock(wx, wy, wz)
-    return world:get(wx, wy, wz)
-  end
+  local halo = self._blockHalo
+  world:fillBlockHalo(cx, cy, cz, halo)
+  local haloSize = cs + 2
+  local strideZ = haloSize
+  local strideY = haloSize * haloSize
 
   local function emitRect(direction, slice, u, v, width, height, block)
     local info = blockInfo[block]
@@ -616,7 +1228,11 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       return
     end
 
-    local out = info.opaque and verticesOpaque or verticesAlpha
+    local isOpaqueBlock = info.opaque and true or false
+    local out = isOpaqueBlock and verticesOpaque or verticesAlpha
+    local outIndices = isOpaqueBlock and indicesOpaque or indicesAlpha
+    local count = isOpaqueBlock and opaqueCount or alphaCount
+    local indexCount = isOpaqueBlock and indexOpaqueCount or indexAlphaCount
     local r = info.color[1]
     local g = info.color[2]
     local b = info.color[3]
@@ -628,56 +1244,75 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local y1 = y0 + height
       local z0 = u - 1
       local z1 = z0 + width
-      emitQuad(out, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a)
-      return
-    end
-
-    if direction == DIR_POS_X then
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a)
+      else
+        count = emitQuad(out, count, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a)
+      end
+    elseif direction == DIR_POS_X then
       local x = slice
       local y0 = v - 1
       local y1 = y0 + height
       local z0 = u - 1
       local z1 = z0 + width
-      emitQuad(out, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a)
-      return
-    end
-
-    if direction == DIR_NEG_Y then
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a)
+      else
+        count = emitQuad(out, count, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a)
+      end
+    elseif direction == DIR_NEG_Y then
       local y = slice - 1
       local x0 = u - 1
       local x1 = x0 + width
       local z0 = v - 1
       local z1 = z0 + height
-      emitQuad(out, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, -1, 0, r, g, b, a)
-      return
-    end
-
-    if direction == DIR_POS_Y then
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a)
+      else
+        count = emitQuad(out, count, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a)
+      end
+    elseif direction == DIR_POS_Y then
       local y = slice
       local x0 = u - 1
       local x1 = x0 + width
       local z0 = v - 1
       local z1 = z0 + height
-      emitQuad(out, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, 1, 0, r, g, b, a)
-      return
-    end
-
-    if direction == DIR_NEG_Z then
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a)
+      else
+        count = emitQuad(out, count, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a)
+      end
+    elseif direction == DIR_NEG_Z then
       local z = slice - 1
       local x0 = u - 1
       local x1 = x0 + width
       local y0 = v - 1
       local y1 = y0 + height
-      emitQuad(out, x0, y0, z, x1, y0, z, x1, y1, z, x0, y1, z, 0, 0, -1, r, g, b, a)
-      return
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a)
+      else
+        count = emitQuad(out, count, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a)
+      end
+    else
+      local z = slice
+      local x0 = u - 1
+      local x1 = x0 + width
+      local y0 = v - 1
+      local y1 = y0 + height
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a)
+      else
+        count = emitQuad(out, count, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a)
+      end
     end
 
-    local z = slice
-    local x0 = u - 1
-    local x1 = x0 + width
-    local y0 = v - 1
-    local y1 = y0 + height
-    emitQuad(out, x1, y0, z, x0, y0, z, x0, y1, z, x1, y1, z, 0, 0, 1, r, g, b, a)
+    if isOpaqueBlock then
+      opaqueCount = count
+      indexOpaqueCount = indexCount
+    else
+      alphaCount = count
+      indexAlphaCount = indexCount
+    end
   end
 
   local mask = self._greedyMask
@@ -700,6 +1335,7 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
     if direction == DIR_POS_Y then ny = 1 end
     if direction == DIR_NEG_Z then nz = -1 end
     if direction == DIR_POS_Z then nz = 1 end
+    local neighborOffset = nx + nz * strideZ + ny * strideY
 
     for slice = 1, cs do
       for i = 1, maskSize do
@@ -708,21 +1344,18 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
 
       for v = 1, cs do
         for u = 1, cs do
-          local lx, ly, lz
+          local hx, hy, hz
           if direction == DIR_NEG_X or direction == DIR_POS_X then
-            lx, ly, lz = slice, v, u
+            hx, hy, hz = slice, v, u
           elseif direction == DIR_NEG_Y or direction == DIR_POS_Y then
-            lx, ly, lz = u, slice, v
+            hx, hy, hz = u, slice, v
           else
-            lx, ly, lz = u, v, slice
+            hx, hy, hz = u, v, slice
           end
 
-          local wx = originX + lx
-          local wy = originY + ly
-          local wz = originZ + lz
-
-          local block = getBlock(wx, wy, wz)
-          local neighbor = getBlock(wx + nx, wy + ny, wz + nz)
+          local index = hy * strideY + hz * strideZ + hx + 1
+          local block = halo[index]
+          local neighbor = halo[index + neighborOffset]
           local shouldDraw = self:_shouldDrawFace(block, neighbor)
           if shouldDraw then
             mask[(v - 1) * cs + u] = block
@@ -774,57 +1407,101 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
     end
   end
 
-  return originX, originY, originZ, verticesOpaque, verticesAlpha
+  return originX, originY, originZ,
+    verticesOpaque, verticesAlpha, opaqueCount, alphaCount,
+    indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount
 end
 
 function ChunkRenderer:_rebuildChunk(cx, cy, cz)
+  local key = cx .. ',' .. cy .. ',' .. cz
+  -- Any synchronous rebuild supersedes older in-flight thread results.
+  self:_nextBuildVersion(key)
+
   if self.world.prepareChunk then
     self.world:prepareChunk(cx, cy, cz)
   end
 
-  local cs = self.chunkSize
-  local originX, originY, originZ, verticesOpaque, verticesAlpha
+  local oldOpaqueCount = #self._vertexPoolOpaque
+  local oldAlphaCount = #self._vertexPoolAlpha
+  local oldOpaqueIndexCount = #self._indexPoolOpaque
+  local oldAlphaIndexCount = #self._indexPoolAlpha
+  local ignoredOriginX, ignoredOriginY, ignoredOriginZ
+  local verticesOpaque, verticesAlpha, opaqueCount, alphaCount
+  local indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount
 
   if self._useGreedyMeshing then
-    originX, originY, originZ, verticesOpaque, verticesAlpha = self:_buildChunkGreedy(cx, cy, cz)
+    ignoredOriginX, ignoredOriginY, ignoredOriginZ, verticesOpaque, verticesAlpha, opaqueCount, alphaCount, indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount = self:_buildChunkGreedy(cx, cy, cz)
   else
-    originX, originY, originZ, verticesOpaque, verticesAlpha = self:_buildChunkNaive(cx, cy, cz)
+    ignoredOriginX, ignoredOriginY, ignoredOriginZ, verticesOpaque, verticesAlpha, opaqueCount, alphaCount, indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount = self:_buildChunkNaive(cx, cy, cz)
   end
 
-  local key = cx .. ',' .. cy .. ',' .. cz
-  local entry = self._chunkMeshes[key] or {}
-
-  if #verticesOpaque > 0 then
-    entry.opaque = lovr.graphics.newMesh(VERTEX_FORMAT, verticesOpaque, 'cpu')
-    entry.opaque:setDrawMode('triangles')
-  else
-    entry.opaque = nil
+  if opaqueCount < oldOpaqueCount then
+    for i = opaqueCount + 1, oldOpaqueCount do
+      verticesOpaque[i] = nil
+    end
   end
 
-  if #verticesAlpha > 0 then
-    entry.alpha = lovr.graphics.newMesh(VERTEX_FORMAT, verticesAlpha, 'cpu')
-    entry.alpha:setDrawMode('triangles')
-  else
-    entry.alpha = nil
+  if alphaCount < oldAlphaCount then
+    for i = alphaCount + 1, oldAlphaCount do
+      verticesAlpha[i] = nil
+    end
   end
 
-  entry.originX = originX
-  entry.originY = originY
-  entry.originZ = originZ
+  self._vertexCountOpaque = opaqueCount
+  self._vertexCountAlpha = alphaCount
 
-  local centerX = originX + cs * 0.5
-  local centerY = originY + cs * 0.5
-  local centerZ = originZ + cs * 0.5
-  entry.centerX = centerX
-  entry.centerY = centerY
-  entry.centerZ = centerZ
-  entry.radius = math.sqrt(3) * (cs * 0.5) + 0.05
-  entry.radiusHorizontal = math.sqrt(2) * (cs * 0.5) + 0.05
-  entry.cx = cx
-  entry.cy = cy
-  entry.cz = cz
+  if self._useIndexedMeshing then
+    if indexOpaqueCount < oldOpaqueIndexCount then
+      for i = indexOpaqueCount + 1, oldOpaqueIndexCount do
+        indicesOpaque[i] = nil
+      end
+    end
+    if indexAlphaCount < oldAlphaIndexCount then
+      for i = indexAlphaCount + 1, oldAlphaIndexCount do
+        indicesAlpha[i] = nil
+      end
+    end
+    self._indexCountOpaque = indexOpaqueCount
+    self._indexCountAlpha = indexAlphaCount
+  else
+    self._indexCountOpaque = 0
+    self._indexCountAlpha = 0
+    if oldOpaqueIndexCount > 0 then
+      for i = 1, oldOpaqueIndexCount do
+        self._indexPoolOpaque[i] = nil
+      end
+    end
+    if oldAlphaIndexCount > 0 then
+      for i = 1, oldAlphaIndexCount do
+        self._indexPoolAlpha[i] = nil
+      end
+    end
+    indicesOpaque = nil
+    indicesAlpha = nil
+    indexOpaqueCount = 0
+    indexAlphaCount = 0
+  end
 
-  self._chunkMeshes[key] = entry
+  local okApply, applyErr = self:_setChunkMeshEntry(
+    key,
+    cx,
+    cy,
+    cz,
+    verticesOpaque,
+    opaqueCount,
+    verticesAlpha,
+    alphaCount,
+    indicesOpaque or {},
+    indexOpaqueCount or 0,
+    nil,
+    indicesAlpha or {},
+    indexAlphaCount or 0,
+    nil,
+    self._useIndexedMeshing
+  )
+  if not okApply then
+    error(tostring(applyErr or 'mesh_apply_failed'))
+  end
 end
 
 function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
@@ -861,6 +1538,7 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
   end
 
   self._rebuildsLastFrame = 0
+  self:_applyThreadedResults(self._threadMaxApplyMillis)
   self:_pruneChunkMeshesStep(self._pruneMaxChecksPerFrame, self._pruneMaxMillisPerFrame)
 
   local dirtyCount = 0
@@ -880,6 +1558,7 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
   self._dirtyQueuedLastFrame = queued
 
   if self._dirtyCount <= 0 then
+    self:_applyThreadedResults(self._threadMaxApplyMillis)
     if hasTimer then
       self._rebuildMsLastFrame = (lovr.timer.getTime() - rebuildStartTime) * 1000
     else
@@ -891,6 +1570,14 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
   local rebuilt = 0
   local staleRequeued = 0
   local staleRequeueCap = self._staleRequeueCap or 0
+  local function processRebuildEntry(chunkEntry)
+    local queuedThreaded = self:_queueThreadedRebuild(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz, chunkEntry.key)
+    if not queuedThreaded then
+      self:_rebuildChunk(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz)
+    end
+    rebuilt = rebuilt + 1
+  end
+
   while rebuilt < hardCap do
     if useTimeBudget and rebuilt > 0 then
       local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
@@ -912,15 +1599,14 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
       if self:_requeueDirtyEntry(entry) then
         staleRequeued = staleRequeued + 1
       else
-        self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
-        rebuilt = rebuilt + 1
+        processRebuildEntry(entry)
       end
     else
-      self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
-      rebuilt = rebuilt + 1
+      processRebuildEntry(entry)
     end
   end
 
+  self:_applyThreadedResults(self._threadMaxApplyMillis)
   self._rebuildsLastFrame = rebuilt
   if hasTimer then
     self._rebuildMsLastFrame = (lovr.timer.getTime() - rebuildStartTime) * 1000
@@ -1005,42 +1691,66 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
   self._visibleCount = 0
 
   pass:push('state')
-  pass:setCullMode('none')
 
+  local opaqueScratch = self._opaqueScratch
+  local prevOpaqueCount = self._opaqueScratchCount or 0
+  local opaqueCount = 0
   local alphaScratch = self._alphaScratch
   local prevAlphaCount = self._alphaScratchCount or 0
   local alphaCount = 0
 
-  -- Opaque first (gathers alpha to draw after).
+  -- Gather visible opaque + alpha entries in one pass.
   for _, entry in pairs(self._chunkMeshes) do
     if entry.opaque or entry.alpha then
       if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward.x, forward.y, forward.z) then
         self._visibleCount = self._visibleCount + 1
+
+        local dx = entry.centerX - cameraX
+        local dy = entry.centerY - cameraY
+        local dz = entry.centerZ - cameraZ
+        local distSq = dx * dx + dy * dy + dz * dz
+
         if entry.opaque then
-          pass:draw(entry.opaque, entry.originX, entry.originY, entry.originZ)
+          opaqueCount = opaqueCount + 1
+          opaqueScratch[opaqueCount] = entry
+          entry._opaqueDistSq = distSq
         end
         if entry.alpha then
           alphaCount = alphaCount + 1
           alphaScratch[alphaCount] = entry
-          local dx = entry.centerX - cameraX
-          local dy = entry.centerY - cameraY
-          local dz = entry.centerZ - cameraZ
-          entry._alphaDistSq = dx * dx + dy * dy + dz * dz
+          entry._alphaDistSq = distSq
         end
       end
     end
   end
+
+  for i = opaqueCount + 1, prevOpaqueCount do
+    opaqueScratch[i] = nil
+  end
+  self._opaqueScratchCount = opaqueCount
 
   for i = alphaCount + 1, prevAlphaCount do
     alphaScratch[i] = nil
   end
   self._alphaScratchCount = alphaCount
 
-  -- Alpha after opaque, sorted back-to-front to reduce blending artifacts.
+  if opaqueCount > 1 then
+    table.sort(opaqueScratch, opaqueSortFrontToBack)
+  end
+
+  pass:setCullMode(self._cullOpaque and 'back' or 'none')
+  for i = 1, opaqueCount do
+    local entry = opaqueScratch[i]
+    if entry and entry.opaque then
+      pass:draw(entry.opaque, entry.originX, entry.originY, entry.originZ)
+    end
+  end
+
   if alphaCount > 1 then
     table.sort(alphaScratch, alphaSortBackToFront)
   end
 
+  pass:setCullMode(self._cullAlpha and 'back' or 'none')
   for i = 1, alphaCount do
     local entry = alphaScratch[i]
     if entry and entry.alpha then

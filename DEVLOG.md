@@ -1,5 +1,90 @@
 # Dev Log
 
+## 2026-02-14
+
+### Codex Task Spec Refresh
+- Replaced `Codex_Instructions` with a new renderer performance roadmap: opaque back-face culling, opaque front-to-back ordering, indexed quads, threaded meshing, and optional region-mesh batching.
+
+### Renderer Draw + Meshing Pipeline Updates
+- Added rollout toggles in `src/constants.lua`:
+  - `Constants.RENDER = { cullOpaque = true, cullAlpha = false }`
+  - `Constants.MESH.indexed = false` (default-off indexed quad path)
+  - `Constants.THREAD_MESH = { enabled = false, maxInFlight = 2, maxApplyMillis = 1.0 }`
+- Updated `src/render/ChunkRenderer.lua` draw path:
+  - opaque meshes now draw front-to-back (distance-sorted) with reusable `_opaqueScratch`
+  - alpha meshes remain back-to-front with existing `_alphaScratch`
+  - two-pass cull state: opaque uses back-face culling by default, alpha stays unculled by default
+- Corrected face winding for +/-Y and +/-Z in both naive and greedy mesh builders so back-face culling keeps outward faces visible.
+- Added optional indexed quad emission (4 vertices + 6 indices) for both naive and greedy build paths:
+  - added pooled index buffers (`_indexPoolOpaque`, `_indexPoolAlpha`) with trailing trim
+  - when indexed mode is enabled, chunk meshes call `mesh:setIndices(...)`
+- Added threaded meshing pipeline with safe fallback:
+  - new `src/render/MeshWorker.lua` thread/channel wrapper
+  - new `src/render/mesher_thread.lua` worker mesher (table payload phase)
+  - main thread now supports versioned meshing jobs, stale-result rejection, in-flight caps, and bounded per-frame apply budget
+  - all graphics object creation (`newMesh`, `setIndices`) remains on the main thread
+  - if worker startup/runtime fails, renderer falls back to synchronous rebuild path
+- Added renderer worker cleanup on session teardown (`GameState:_teardownSession` calls `renderer:shutdown()` when available).
+- Correctness risk notes:
+  - culling correctness is sensitive to winding; winding was aligned explicitly per face direction for both sync and worker meshing paths.
+  - runtime visual/perf verification is still required with the A/B toggle matrix (culling/indexed/threaded on/off).
+
+### Thread Payload Optimization (Phase A)
+- Added threaded halo payload toggle in `Constants.THREAD_MESH`:
+  - `haloBlob = true` (uses Blob halo payload when available, falls back to table payload automatically).
+- Updated `ChunkRenderer` threaded enqueue path to attempt Blob packing for halo data:
+  - packs `(chunkSize + 2)^3` halo block IDs into a byte string in bounded chunks and builds a `Blob` via `lovr.data.newBlob(...)`.
+  - sends `job.haloBlob` when packing succeeds; otherwise keeps existing `job.halo` table payload.
+- Updated worker (`src/render/mesher_thread.lua`) to accept both payload formats:
+  - decodes `job.haloBlob` via `Blob:getString(...)` into a reusable scratch table.
+  - falls back to `job.halo` when blob decode is unavailable.
+- Safety behavior:
+  - if blob decode fails and no table fallback exists, worker returns an explicit error (`missing_halo_payload`) and renderer falls back to synchronous rebuild (existing worker-failure fallback path).
+
+### Thread Payload Optimization (Phase B)
+- Added threaded result payload toggle in `Constants.THREAD_MESH`:
+  - `resultBlob = true` (worker attempts Blob result payloads for vertices/indices; falls back to table result payloads if packing is unavailable).
+- Updated worker result packaging (`src/render/mesher_thread.lua`):
+  - when enabled and supported (`ffi` + `lovr.data.newBlob`), packs vertex data into float blobs and index data into `u16`/`u32` blobs.
+  - index blob packing converts renderer 1-based indices to raw 0-based index values for Blob index buffers.
+  - emits index element type metadata (`indicesOpaqueType` / `indicesAlphaType`) so main-thread `mesh:setIndices(blob, type)` uses the correct integer width.
+- Updated renderer threaded apply path (`src/render/ChunkRenderer.lua`) to consume blob or table result payloads:
+  - accepts blob vertex payloads in `lovr.graphics.newMesh(...)`.
+  - accepts blob index payloads via `mesh:setIndices(blob, indexType)`.
+  - preserves fallback behavior: if blob mesh/index apply fails on the main thread, renderer disables worker threading and rebuilds synchronously for correctness.
+
+### Thread Payload Optimization (Phase C)
+- Promoted threaded meshing defaults in `Constants.THREAD_MESH`:
+  - `enabled = true` (with `haloBlob = true` and `resultBlob = true` retained).
+- Added main-thread halo table pooling in `src/render/ChunkRenderer.lua`:
+  - reusable halo table pool (`_threadHaloTablePool`) with acquire/release helpers.
+  - threaded enqueue now reuses halo tables instead of allocating a fresh Lua table per queued build.
+  - table-payload fallback now keeps halo tables in-flight until the matching worker result arrives before returning them to the pool.
+- Added worker-side pack buffer reuse in `src/render/mesher_thread.lua`:
+  - persistent FFI buffers for vertex pack (`float`) and index pack (`u16` / `u32`) paths, grown-on-demand and reused across jobs.
+  - reused greedy meshing mask scratch table (`greedyMaskScratch`) to avoid per-job mask table allocation.
+- Net effect:
+  - reduced transient allocation churn during threaded streaming/rebuild bursts while preserving existing fallback behavior.
+
+### Phase C Hotfix
+- Fixed Lua unpack compatibility in `src/render/ChunkRenderer.lua` halo blob packing:
+  - replaced direct `table.unpack(...)` calls with a LuaJIT-safe fallback (`table.unpack or unpack`).
+  - if no unpack function is available, halo blob packing now safely skips and falls back to table payloads (no startup crash).
+- Fixed worker bootstrap compatibility in `src/render/mesher_thread.lua`:
+  - worker no longer assumes global `lovr` exists in thread context.
+  - thread/data APIs are resolved via `rawget(_G, 'lovr')` with `require('lovr.thread')` / `require('lovr.data')` fallback.
+  - worker bootstrap now exits cleanly if thread channels are unavailable (avoids fatal top-level thread errors and preserves main-thread fallback behavior).
+  - worker job receive path now supports runtimes without `Channel:demand()` by falling back to `Channel:pop()` polling with a tiny sleep.
+
+## 2026-02-13
+
+### Meshing Hot-Path Optimizations
+- Added `ChunkWorld:_getByChunkKey(chunkKey, localIndex, x, y, z)` to mirror `get(...)` lookup semantics (bounds, edits, features, base) without chunk-coordinate floor/mod work.
+- Added `ChunkWorld:fillBlockHalo(cx, cy, cz, out)` to fill a reusable `(chunkSize + 2)^3` halo buffer (x-fast indexing) for meshing neighbor reads, with out-of-world/out-of-range samples forced to AIR.
+- Refactored `ChunkRenderer:_buildChunkNaive(...)` and `ChunkRenderer:_buildChunkGreedy(...)` to read block + neighbor IDs from the halo cache, removing `world:get(...)` calls from meshing inner loops.
+- Reworked vertex emission in `ChunkRenderer` to pooled table writes (`_vertexPoolOpaque` / `_vertexPoolAlpha`) with per-rebuild count tracking and trailing-slot trim, eliminating per-vertex table allocation churn after pool warm-up.
+- Kept existing feature-prep behavior (`prepareChunk` for the target chunk column only), which remains correct with current tree edge margins.
+
 ## 2026-02-12
 
 ### Streaming + Frame-Pacing Fixes

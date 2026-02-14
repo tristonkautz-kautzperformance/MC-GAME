@@ -252,6 +252,30 @@ function ChunkWorld:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
   return self:_getBaseBlock(x, y, z)
 end
 
+function ChunkWorld:_getByChunkKey(chunkKey, localIndex, x, y, z)
+  if not self:isInside(x, y, z) then
+    return self.constants.BLOCK.AIR
+  end
+
+  local editChunk = self._editChunks[chunkKey]
+  if editChunk then
+    local editValue = editChunk[localIndex]
+    if editValue ~= nil then
+      return editValue
+    end
+  end
+
+  local featureChunk = self._featureChunks[chunkKey]
+  if featureChunk then
+    local featureValue = featureChunk[localIndex]
+    if featureValue ~= nil then
+      return featureValue
+    end
+  end
+
+  return self:_getBaseBlock(x, y, z)
+end
+
 function ChunkWorld:_getBaseWithFeatures(x, y, z)
   if not self:isInside(x, y, z) then
     return self.constants.BLOCK.AIR
@@ -292,24 +316,103 @@ function ChunkWorld:get(x, y, z)
   local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
   local chunkKey = self:_chunkKey(cx, cy, cz)
   local localIndex = self:_localIndex(lx, ly, lz)
+  return self:_getByChunkKey(chunkKey, localIndex, x, y, z)
+end
 
-  local editChunk = self._editChunks[chunkKey]
-  if editChunk then
-    local editValue = editChunk[localIndex]
-    if editValue ~= nil then
-      return editValue
+function ChunkWorld:fillBlockHalo(cx, cy, cz, out)
+  if not out then
+    return nil
+  end
+
+  local AIR = self.constants.BLOCK.AIR
+  local cs = self.chunkSize
+  local cs2 = cs * cs
+  local haloSize = cs + 2
+  local strideZ = haloSize
+  local strideY = haloSize * haloSize
+
+  local sizeX = self.sizeX
+  local sizeY = self.sizeY
+  local sizeZ = self.sizeZ
+  local chunksX = self.chunksX
+  local chunksY = self.chunksY
+  local chunksZ = self.chunksZ
+  local chunksPerLayer = chunksX * chunksZ
+
+  local baseOriginX = (cx - 1) * cs
+  local baseOriginY = (cy - 1) * cs
+  local baseOriginZ = (cz - 1) * cs
+
+  for hy = 0, cs + 1 do
+    local scy, sly
+    if hy == 0 then
+      scy = cy - 1
+      sly = cs
+    elseif hy == cs + 1 then
+      scy = cy + 1
+      sly = 1
+    else
+      scy = cy
+      sly = hy
+    end
+
+    local wy = baseOriginY + hy
+    local syBase = (hy * strideY) + 1
+
+    for hz = 0, cs + 1 do
+      local scz, slz
+      if hz == 0 then
+        scz = cz - 1
+        slz = cs
+      elseif hz == cs + 1 then
+        scz = cz + 1
+        slz = 1
+      else
+        scz = cz
+        slz = hz
+      end
+
+      local wz = baseOriginZ + hz
+      local szBase = syBase + (hz * strideZ)
+
+      for hx = 0, cs + 1 do
+        local scx, slx
+        if hx == 0 then
+          scx = cx - 1
+          slx = cs
+        elseif hx == cs + 1 then
+          scx = cx + 1
+          slx = 1
+        else
+          scx = cx
+          slx = hx
+        end
+
+        local wx = baseOriginX + hx
+        local index = szBase + hx
+
+        if wx < 1 or wx > sizeX
+          or wy < 1 or wy > sizeY
+          or wz < 1 or wz > sizeZ
+          or scx < 1 or scx > chunksX
+          or scy < 1 or scy > chunksY
+          or scz < 1 or scz > chunksZ then
+          out[index] = AIR
+        else
+          local chunkKey = scx + (scz - 1) * chunksX + (scy - 1) * chunksPerLayer
+          local localIndex = (sly - 1) * cs2 + (slz - 1) * cs + slx
+          out[index] = self:_getByChunkKey(chunkKey, localIndex, wx, wy, wz)
+        end
+      end
     end
   end
 
-  local featureChunk = self._featureChunks[chunkKey]
-  if featureChunk then
-    local featureValue = featureChunk[localIndex]
-    if featureValue ~= nil then
-      return featureValue
-    end
+  local required = haloSize * haloSize * haloSize
+  for i = required + 1, #out do
+    out[i] = nil
   end
 
-  return self:_getBaseBlock(x, y, z)
+  return out
 end
 
 function ChunkWorld:set(x, y, z, value)

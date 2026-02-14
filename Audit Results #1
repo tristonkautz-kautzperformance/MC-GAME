@@ -11,20 +11,18 @@ Scope
 
 Findings (ordered by severity)
 ------------------------------
-- Perf/Scaling: Dirty-key ingestion uses string parsing (`parseKey` uses `key:match`) per queued key. Fine at current volumes, but avoid re-introducing 100s-1000s of keys per boundary. See `src/render/ChunkRenderer.lua:650` and `src/render/ChunkRenderer.lua:1000`.
-  - Note: `ChunkWorld` already has a numeric chunk key encoding (`ChunkWorld:_chunkKey`, `ChunkWorld:_decodeChunkKey`), but dirty keys are still comma-strings (see `src/world/ChunkWorld.lua:88` and `src/world/ChunkWorld.lua:111`). Unifying renderer+world dirties on numeric chunk keys would remove parse cost and reduce string churn.
 - Perf/GC: Meshing still allocates heavily per rebuild (vertex/index buffers and greedy `mask`/scratch). Threaded meshing reduces main-thread spikes, but worker-side GC and result-application cost can still hitch if rebuild throughput is high. See `src/render/ChunkRenderer.lua:500`, `src/render/ChunkRenderer.lua:563`, and `src/render/mesher_thread.lua`.
 - Perf/Scaling: Alpha chunk sorting is O(n log n) in the number of visible alpha chunks; fine for now, but keep an eye on it if leaf-heavy scenes grow. See `src/render/ChunkRenderer.lua:1749`.
 - Perf/Correctness: Streaming/meshing depends on missing-mesh enqueue + edit-driven dirties; if any system introduces non-edit block changes without dirtying, it can create "stale mesh" risks. (Currently edits and boundary-neighbor updates do dirty correctly via `ChunkWorld:set()` / `ChunkWorld:_markNeighborsIfBoundary`.)
 
 Recommended Next Steps
 ----------------------
-- Unify chunk identifiers end-to-end (prefer numeric chunk keys):
-  - Change dirty queues and renderer mesh caches to use `ChunkWorld:_chunkKey()` / `_decodeChunkKey()` instead of comma-strings to remove `parseKey` and reduce per-frame string churn.
 - Keep threaded meshing on the "blob path":
   - If any platforms/drivers force the table fallback frequently, consider tightening/adjusting blob packing so worker->main transfers stay low-GC.
 - Only optimize alpha sorting if it shows up in profiling:
   - Common follow-ups are approximate distance buckets, partial sorting, or skipping sorts when alphaCount is small/stable.
+- (Optional guard) Catch chunk-key type regressions early:
+  - If you ever see chunk holes again, first suspect a producer reintroducing string keys; consider adding assertions/logging when `type(key) ~= 'number'` in enqueue/dirty ingestion paths.
 
 Focused Mini-Audit Notes (Renderer Scheduling)
 ----------------------------------------------
@@ -50,6 +48,9 @@ Resolved
 - Removed idle per-frame dirty-key list allocations:
   - Added `ChunkWorld:drainDirtyChunkKeys(out)` and a shared-empty fast path in `ChunkWorld:getDirtyChunkKeys()`. See `src/world/ChunkWorld.lua:504` and `src/world/ChunkWorld.lua:517`.
   - Renderer now drains into a reusable scratch array and queues using an explicit count. See `src/render/ChunkRenderer.lua:1544`.
+- Chunk identifiers unified (numeric keys end-to-end):
+  - World dirty keys and streaming enqueue lists are numeric chunk keys (no `"cx,cy,cz"` strings). See `src/world/ChunkWorld.lua:119` and `src/world/ChunkWorld.lua:577`.
+  - Renderer consumes numeric keys and decodes coords via `world:decodeChunkKey(...)` (no `parseKey` string parsing). See `src/render/ChunkRenderer.lua:988`.
 - Renderer draw-path polish:
   - Single visibility pass over chunk meshes instead of iterating the table twice.
   - Alpha chunk meshes are drawn back-to-front to reduce blending artifacts.

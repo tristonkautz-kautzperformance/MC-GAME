@@ -1,0 +1,70 @@
+Audit Results
+=============
+
+Date: 2026-02-14
+
+Scope
+-----
+- Project-wide pass over gameplay loop, renderer/meshing, world/storage, save/load, input/UI, docs/repo hygiene.
+- Focus: correctness/crash risks, perf/GC traps, scaling constraints, and "gotchas" for future changes.
+
+High-Level Notes (what's working well)
+-------------------------------------
+- Core loop separation is clean: `GameState` orchestrates, subsystems stay focused (`World`, `Player`, `ChunkRenderer`, `HUD`, `SaveSystem`, `MainMenu`).
+- Renderer scheduling is already in a good place for V1:
+  - Budgeted rebuild + incremental pruning + priority chunk + threaded meshing with versioning/fallback.
+- World storage is performant for V1: procedural base + sparse edit/feature overlays (no eager per-voxel base allocation).
+- Save format is defensive (versioned magic, compatibility checks, corruption handling, metadata peek).
+
+Findings (ordered by severity)
+------------------------------
+- Correctness/Crash-risk + Perf/GC: `GameState:draw` uses a temporary vec3 each frame:
+  - `pass:setViewPose(1, lovr.math.vec3(cameraX, cameraY, cameraZ), cameraOrientation)` at `src/game/GameState.lua:702`.
+  - This creates per-frame allocations and may reintroduce "temporary vector from a previous frame" hazards (you already fixed a similar issue in the renderer by using persistent `lovr.math.newVec3` objects).
+  - Recommendation: keep a persistent camera position vec3 on `GameState` and `:set(...)` it each frame.
+
+- Perf/GC: `Player:getCameraOrientation()` allocates quats every call:
+  - `lovr.math.newQuat(self.yaw, ...)` and `lovr.math.newQuat(self.pitch, ...)` at `src/player.lua:57`.
+  - Called every frame from `GameState:draw`, this is avoidable allocation churn and can contribute to GC spikes during heavy meshing/rebuild periods.
+  - Recommendation: reuse quats (store on the player) and update them in-place each frame.
+
+- Packaging/Robustness: fullscreen persistence assumes "project root is writable" and "CWD == project root":
+  - `io.open('.fullscreen', ...)` in `conf.lua:4` and `src/game/GameState.lua:20`/`:31`.
+  - This can fail (or write to an unexpected location) if launching the game from a different working directory, or in a packaged/distributed build where the source directory is read-only.
+  - Also, `.fullscreen` is not currently in `.gitignore`, so it can become local untracked noise.
+  - Recommendation: decide whether fullscreen state should be purely local-dev (then gitignore it) or stored in a guaranteed-writable location.
+
+- Docs mismatch (small, but confusing): `AGENTS.md` conflicts with actual controls:
+  - `AGENTS.md:25` says: "Esc unlocks first; if already unlocked, quits."
+  - Actual behavior matches `README.md:42`: Esc unlocks if captured; otherwise opens the pause menu (from which you can quit).
+  - Recommendation: update `AGENTS.md` wording to match current behavior to avoid accidental "spec drift".
+
+- Third-party compliance/hygiene: vendored `lovr-mouse.lua` has no license/attribution in-repo:
+  - `AGENTS.md` and `README.md` correctly note it is vendored, but the file itself does not include a license header and the repo does not include a corresponding license notice.
+  - Recommendation: add the upstream license text somewhere in-repo (or document the exact upstream commit/tag + license) to stay compliant.
+
+- Load/Save scaling: large edit counts will hitch on load/apply:
+  - `SaveSystem:load` builds a full `lines` table, parses into an `edits` table, then `SaveSystem:apply` calls `world:set` per edit (`src/save/SaveSystem.lua:656`).
+  - For big saves, this is O(edits) with extra overhead from repeated dirty marking + base lookups; it also inflates the dirty queue before the first frame.
+  - Recommendation: consider a "bulk apply" path that writes directly into `_editChunks` (or batches dirty marking per-chunk) to keep load times predictable.
+
+Lower Priority / Cleanup
+------------------------
+- Minor naming mismatch: save file is `saves/world_v1.txt` but current saves write V2 magic (`MC_SAVE_V2`) (`src/save/SaveSystem.lua:4` / `:369`).
+  - Not a functional problem, but it's a future footgun for debugging/support.
+
+- Dead/unused code:
+  - `src/world/Chunk.lua` appears unused (no `require` sites).
+  - `Input.wantQuit` / `Input:consumeQuit` exist but nothing ever sets `wantQuit` (`src/input/Input.lua:20`, `:174`).
+  - Recommendation: remove or wire these up to avoid confusion.
+
+- Repo hygiene:
+  - Nested `.git` in `git_test/` and the backup `.git_incomplete_backup_2026-02-10/` are correctly ignored, but they still add clutter and can confuse tooling.
+
+Recommended Next Steps
+----------------------
+- Fix per-frame allocations in the camera/view path (`GameState` vec3 + `Player` quats) to keep GC smooth during rebuild spikes.
+- Decide on a distribution-friendly fullscreen persistence strategy (or explicitly treat `.fullscreen` as a local-dev artifact and ignore it).
+- Bring `AGENTS.md` control wording back in sync with current behavior.
+- Add third-party license/attribution for `lovr-mouse.lua`.
+- If you expect large builds/edits: add a bulk edit-apply path for save loading to avoid long startup hitches.

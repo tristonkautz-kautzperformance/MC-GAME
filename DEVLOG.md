@@ -3,7 +3,23 @@
 ## 2026-02-14
 
 ### Codex Task Spec Refresh
-- Replaced `Codex_Instructions` with a new renderer performance roadmap: opaque back-face culling, opaque front-to-back ordering, indexed quads, threaded meshing, and optional region-mesh batching.
+- Replaced `Codex_Instructions` with a numeric chunk-key migration plan: remove comma-string chunk IDs and use numeric chunk keys end-to-end across world dirtying, streaming enqueue, renderer queues/cache, and threaded meshing key flow.
+
+### Numeric Chunk Key Migration
+- Added public chunk-key helpers in `src/world/ChunkWorld.lua`:
+  - `ChunkWorld:chunkKey(cx, cy, cz)`
+  - `ChunkWorld:decodeChunkKey(chunkKey)`
+- Switched world dirty tracking to numeric keys:
+  - `_markDirty(...)` now writes `self._dirty[chunkKey] = true` using `_chunkKey`.
+  - `drainDirtyChunkKeys(...)` now emits numeric chunk keys.
+- Switched streaming enqueue outputs to numeric keys:
+  - `enqueueChunkSquare(...)` and `enqueueRingDelta(...)` now fill `outKeys` with `_chunkKey(...)` integers.
+- Switched renderer key handling to numeric chunk keys:
+  - removed string parsing helper (`parseKey`) and all `key:match` chunk-key parsing.
+  - `_queueDirtyKeys(...)` now decodes coordinates via `world:decodeChunkKey(key)`.
+  - `_rebuildChunk(...)` now keys build versions via `world:chunkKey(cx, cy, cz)`.
+  - prune path no longer tries to recover missing coords by parsing string keys.
+- Verified there are no remaining renderer/world chunk-key string concatenation/parsing paths (`.. ',' ..`, `parseKey`, `key:match`) in `src/world/ChunkWorld.lua` and `src/render/ChunkRenderer.lua`.
 
 ### Renderer Draw + Meshing Pipeline Updates
 - Added rollout toggles in `src/constants.lua`:

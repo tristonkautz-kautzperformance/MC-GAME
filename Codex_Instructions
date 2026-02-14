@@ -1,273 +1,228 @@
 Codex Instructions (Codex 5.3)
 ==============================
 
-Status (2026-02-13)
+Status (2026-02-14)
 ------------------
 Baseline already in place (do not redo):
 - Chunked finite world (`ChunkWorld`) with procedural base + sparse overrides (edits + features).
 - Chunk renderer (`ChunkRenderer`) builds per-chunk meshes (opaque + alpha) and draws:
-  - Greedy meshing (default) with persistent 2D mask reuse.
-  - Halo-based sampling (`ChunkWorld:fillBlockHalo`) in meshing inner loops.
-  - Vertex pooling for rebuild paths (reduced GC churn after warm-up).
-  - Dirty rebuild queue prioritized + ms-budgeted.
-  - Incremental mesh-cache pruning is amortized (no O(meshCache) on crossings).
-  - Chunk culling is radius + optional FOV (conservative).
-  - Alpha chunks sort back-to-front.
+  - Priority dirty queue + ms-budgeted rebuild.
+  - Incremental mesh-cache pruning amortized.
+  - Opaque front-to-back sorting + alpha back-to-front sorting.
+  - Indexed meshing support and threaded meshing worker pipeline.
 
-New task: GPU + Draw Path Optimizations
---------------------------------------
+New task: Numeric Chunk Keys End-to-End (Remove "cx,cy,cz" strings)
+------------------------------------------------------------------
+
 Goal
-- Improve runtime performance (GPU + CPU) by implementing the following in a safe, incremental way:
-  1) Enable GPU back-face culling for opaque meshes.
-  2) Draw opaque chunks front-to-back (keep alpha back-to-front).
-  3) Reduce per-quad vertex bandwidth using indexed quads (4 verts + 6 indices).
-  4) Offload chunk meshing to `lovr.thread` workers (data build in thread, Mesh creation on main).
-  5) (Long-term) Reduce draw calls with "region meshes" (batch chunks).
+----
+Eliminate comma-string chunk identifiers (e.g. "12,3,9") from hot paths by using the existing numeric chunk key encoding already present in `ChunkWorld`:
+- Use numeric chunk keys for:
+  - World dirty tracking (`ChunkWorld._dirty`)
+  - Streaming enqueue lists (`enqueueChunkSquare`, `enqueueRingDelta`)
+  - Renderer mesh cache keys (`ChunkRenderer._chunkMeshes`)
+  - Renderer dirty queue keys (`ChunkRenderer._dirtyEntries`)
+  - Threaded meshing job/result keys (pass numeric key through unchanged)
 
-Do NOT change (hard constraints)
+This should:
+- Remove `parseKey` string parsing and `key:match`/`tonumber` churn from the renderer.
+- Reduce per-frame string allocation/churn from dirty and streaming lists.
+- Preserve all gameplay behavior and mesh correctness.
+
+Hard constraints (do NOT change)
 -------------------------------
 - Pointer lock, input, menu behavior.
-- Save format / save system.
+- Save format / save system and on-disk representation.
 - World bounds rules (finite world), bedrock unbreakable.
 - Block IDs, colors, and opaque/alpha semantics (leaves remain translucent).
 - Chunk dirtying correctness (including neighbor dirtying at boundaries).
-- Existing rebuild scheduling/budgeting and mesh-cache pruning approach (extend if needed; don't delete).
+- Existing rebuild scheduling/budgeting, incremental pruning, and threaded meshing fallback behavior.
 
 Non-goals
 ---------
-- Infinite world or major worldgen changes.
-- GPU occlusion queries, MultiDrawIndirect, persistent mapped buffers (not directly exposed in LOVR 0.18).
-- Major shader/material redesign.
+- Worldgen changes, chunk size changes, or new rendering features.
+- "Big" performance refactors (mask reuse, blob formats, etc.) beyond what is required to switch keys.
 
-Implementation Order (do in this order)
+Key definition (source of truth)
+-------------------------------
+`ChunkWorld` already defines a stable numeric encoding:
+- `ChunkWorld:_chunkKey(cx, cy, cz)` -> integer in `[1, chunksX * chunksY * chunksZ]`
+- `ChunkWorld:_decodeChunkKey(chunkKey)` -> `cx, cy, cz`
+
+Use these formulas consistently. Do NOT invent a second encoding.
+
+Important: Lua numbers are doubles; ensure the maximum possible key remains < 2^53. With the current finite world sizes, this is safely true.
+
+Implementation plan (do in this order)
 --------------------------------------
-1) Opaque back-face culling (quick win, correctness-sensitive).
-2) Opaque front-to-back ordering (quick win, low risk).
-3) Indexed quads (medium effort, interacts with winding/culling).
-4) Threaded meshing (bigger refactor; keep fallbacks).
-5) Region meshes (optional, only if draw-call submission becomes the bottleneck).
 
-1) Enable back-face culling for opaque meshes
---------------------------------------------
-Files: `src/render/ChunkRenderer.lua`, `src/constants.lua`
-
-Problem
-- `ChunkRenderer:draw` currently uses `pass:setCullMode('none')` for everything.
-- Disabling culling increases overdraw and can hurt fillrate in dense scenes.
+1) Add public chunk-key helpers to `ChunkWorld` (renderer should not call underscore methods)
+Files: `src/world/ChunkWorld.lua`
 
 Tasks
-A) Add render toggles in constants (for easy A/B testing)
-- Add a new table in `src/constants.lua`:
-  - `Constants.RENDER = { cullOpaque = true, cullAlpha = false }`
-- Default behavior:
-  - Opaque: cull back faces.
-  - Alpha/leaves: keep culling disabled (double-sided), unless you intentionally want leaf faces culled.
-
-B) Verify and fix triangle winding if needed
-- With culling enabled, incorrectly-wound faces will disappear.
-- Test both meshing paths:
-  - `ChunkRenderer:_buildChunkNaive`
-  - `ChunkRenderer:_buildChunkGreedy`
-- If any face direction vanishes, fix the vertex order passed into `emitQuad(...)` for that direction so the outward side is the front face.
-  - Note: culling uses winding, not `VertexNormal`.
-
-C) Implement culling in `ChunkRenderer:draw`
-- Keep the existing `pass:push('state')` / `pass:pop('state')`.
-- Structure draw as two phases with different cull modes:
-  1) Set cull mode for opaque (recommended: `back`) and draw opaque.
-  2) Set cull mode for alpha (recommended: `none`) and draw alpha.
+- Add two public wrappers:
+  - `function ChunkWorld:chunkKey(cx, cy, cz)` -> returns `self:_chunkKey(cx, cy, cz)`
+  - `function ChunkWorld:decodeChunkKey(chunkKey)` -> returns `self:_decodeChunkKey(chunkKey)`
+- Keep `_chunkKey` and `_decodeChunkKey` as the canonical internal implementations.
 
 Acceptance checks
-- No missing cube faces in any direction.
-- Leaves still render correctly (no holes unless `cullAlpha` is enabled).
-- Noticeable improvement in fillrate-limited situations (dense view, lots of occluded geometry).
+- No behavior change yet; just new functions.
 
-2) Opaque front-to-back ordering (keep alpha back-to-front)
------------------------------------------------------------
+2) Convert dirty tracking to numeric keys
+Files: `src/world/ChunkWorld.lua`
+
+Current
+- `_markDirty(cx, cy, cz)` builds a comma string and stores `self._dirty[key] = true`.
+- `drainDirtyChunkKeys(out)` copies those strings into `out`.
+
+Tasks
+- Update `_markDirty(cx, cy, cz)` to compute numeric key:
+  - `local chunkKey = self:_chunkKey(cx, cy, cz)`
+  - `self._dirty[chunkKey] = true`
+- Keep bounds checks exactly as-is.
+- Ensure every code path that marks dirty still marks the same chunks:
+  - `ChunkWorld:set(...)` (and any edit APIs it calls)
+  - Neighbor boundary dirtying via `_markNeighborsIfBoundary`
+  - `markDirtyRadius(...)`
+- Update `getDirtyChunkKeys()` and `drainDirtyChunkKeys(out)` so:
+  - `out[i]` are numeric keys (integers), not strings.
+  - Clearing behavior remains identical (reuse `out`, trim extra entries, reset `_dirty`).
+  - Fast path `EMPTY_DIRTY_KEYS` remains valid.
+
+Acceptance checks
+- Moving and editing blocks still triggers visible chunk rebuilds (no stale meshes).
+- No runtime errors due to assuming dirty keys are strings.
+
+3) Convert streaming enqueue lists to numeric keys
+Files: `src/world/ChunkWorld.lua`
+
+Current
+- `enqueueChunkSquare(...)` and `enqueueRingDelta(...)` fill `outKeys` with strings like "cx,cy,cz".
+
+Tasks
+- Change both functions to fill numeric keys instead:
+  - `outKeys[count] = self:_chunkKey(queueCx, queueCy, queueCz)`
+- Keep:
+  - clamping/normalization behavior,
+  - return values and special `-1` case in `enqueueRingDelta`,
+  - `outKeys` reuse pattern (caller passes scratch).
+
+Acceptance checks
+- Initial seeding (`GameState` startup) still enqueues chunks and produces initial meshes.
+- Chunk crossing still enqueues the correct "ring delta" and doesn''t reseed the full square unless `-1` fallback triggers.
+
+4) Convert `ChunkRenderer` to numeric keys (remove `parseKey`)
 Files: `src/render/ChunkRenderer.lua`
 
-Problem
-- Opaque chunks are drawn in `pairs(self._chunkMeshes)` iteration order (effectively random).
-- Front-to-back ordering helps early-z and reduces overdraw.
+Current
+- Renderer uses comma-string keys for:
+  - `_chunkMeshes` (mesh cache)
+  - `_dirtyEntries` (dirty queue map)
+  - missing-mesh enqueue lists
+- It parses strings via `parseKey(key)` using `key:match(...)`.
 
 Tasks
-A) Add reusable scratch arrays (avoid per-frame allocations)
-- Add on `ChunkRenderer`:
-  - `self._opaqueScratch = {}`
-  - `self._opaqueScratchCount = 0`
-- Reuse/trim like the existing alpha scratch (`self._alphaScratch`).
++A) Key type change
++- Treat `key` everywhere as numeric `chunkKey`.
++- Update:
++  - `self._chunkMeshes[key]` tables
++  - `self._dirtyEntries[key]` tables
++  - `_chunkBuildVersion[key]`, `_threadInFlightByKey[key]`, `_threadInFlightHaloByKey[key]`
++
++B) Remove string parsing
++- Delete `parseKey` and any `key:match` usage.
++- Update `_queueDirtyKeys(dirtyKeys, count, forceRebuild)`:
++  - For each `chunkKey`, decode coords using the world:
++    - `local cx, cy, cz = self.world:decodeChunkKey(chunkKey)`
++  - Create dirty entries with:
++    - `{ key = chunkKey, cx = cx, cy = cy, cz = cz, dist = 0 }`
++  - Keep existing logic:
++    - skip if already dirty,
++    - only queue missing meshes when `forceRebuild` is false,
++    - increment `_dirtyCount`, `_dirtyEntries`, and push into buckets.
++- Update pruning `_pruneChunkMeshesStep(...)`:
++  - Remove the "parse key" fallback branch entirely.
++  - It should always trust `entry.cx/cy/cz` (they are written in `_setChunkMeshEntry`).
++
++C) Ensure `_setChunkMeshEntry` stays the authoritative place that stamps coords
++- It already receives `cx, cy, cz` and assigns `entry.cx/cy/cz`.
++- Ensure callers always pass correct coords (threaded results already include coords).
++
++Acceptance checks
++- `rg` shows no remaining `parseKey`, `key:match`, or `tonumber(cx)` used for chunk key parsing.
++- Gameplay:
++  - Move across chunk boundaries: no "holes" or stuck stale meshes.
++  - Break/place blocks on chunk boundaries: both the edited chunk and neighbor chunk rebuild.
++- Threaded meshing:
++  - Still applies results to the correct chunk entry keyed by numeric `chunkKey`.
 
-B) Gather visible opaque meshes first, then sort, then draw
-- Replace immediate `pass:draw(entry.opaque, ...)` with:
-  - If visible and has `entry.opaque`, push into `_opaqueScratch`.
-  - Compute `entry._opaqueDistSq` (distance^2 from camera to `entry.center*`).
-- Sort `_opaqueScratch` ascending by `entry._opaqueDistSq`.
-- Draw opaque meshes in sorted order.
+5) Update `GameState` streaming seed/enqueue to treat keys as numeric
+Files: `src/game/GameState.lua`
 
-C) Keep alpha behavior intact
-- Continue gathering alpha entries and sorting back-to-front by `entry._alphaDistSq`.
-- Do not attempt interleaving opaque + alpha (opaque must stay first).
-
-Performance constraints
-- Avoid hot-loop allocations:
-  - No new per-chunk tables/tuples for sorting keys.
-  - Use count indexing (`count = count + 1; scratch[count] = entry`).
-
-Acceptance checks
-- Visual output unchanged (aside from reduced overdraw).
-- No new hitching from the per-frame sort at current chunk counts.
-
-3) Indexed quads (4 verts + 6 indices per face)
------------------------------------------------
-Files: `src/render/ChunkRenderer.lua`, `src/constants.lua`
-
-Problem
-- `emitQuad` currently emits 6 vertices per face (two triangles), duplicating 2 vertices per quad.
-- This increases vertex bandwidth and rebuild-time work.
-
-Approach
-- Emit 4 vertices per quad and append 6 indices.
-- Keep opaque + alpha separated.
+Current
+- Uses `self._enqueueScratch` filled by `world:enqueueChunkSquare` / `world:enqueueRingDelta`,
+  then passes to `renderer:enqueueMissingKeys(keys, count)`.
 
 Tasks
-A) Add config toggle
-- Add in `Constants.MESH`:
-  - `indexed = false` (default off until validated).
-
-B) Add pooled index arrays
-- Add on `ChunkRenderer`:
-  - `self._indexPoolOpaque = {}`
-  - `self._indexPoolAlpha = {}`
-  - `self._indexCountOpaque = 0`
-  - `self._indexCountAlpha = 0`
-- Trim index pools after rebuilds like vertex pools (keep arrays contiguous).
-
-C) Replace quad emission with an indexed version
-- Implement `emitQuadIndexed(...)` that:
-  - Writes 4 vertices to the appropriate vertex pool.
-  - Writes 6 indices referencing those 4 vertices (1-based indices).
-  - Uses the correct winding for your chosen cull mode.
-- Update both build paths (`_buildChunkNaive`, `_buildChunkGreedy`) to use it when `Constants.MESH.indexed` is enabled.
-- Keep the current non-indexed path as a fallback until this is fully validated.
-
-D) Create meshes with indices
-- After building a chunk:
-  - Create Mesh from vertices as today.
-  - Call `mesh:setIndices(indexTable)` for opaque/alpha meshes.
-- Ensure indices are cleared when indexed mode is off (or construct without indices).
+- No API changes required if you updated the world + renderer as above.
+- Just ensure all code assumes keys are opaque identifiers (numbers) and never concatenates or parses them.
 
 Acceptance checks
-- Identical visuals to non-indexed mode (with and without culling enabled).
-- Vertex count per chunk decreases by ~33% vs prior emission.
-- No regression in rebuild ms or GC behavior.
+- Startup seeding still queues and builds initial chunk meshes.
+- Chunk crossing still queues and meshes newly-visible chunks (ring delta works).
 
-4) Offload meshing to `lovr.thread` workers
-------------------------------------------
-Files: new `src/render/MeshWorker.lua`, new `src/render/mesher_thread.lua`,
-and edits in `src/render/ChunkRenderer.lua` (and possibly `src/game/GameState.lua` wiring).
+6) Worker thread compatibility check (threaded meshing)
+Files: `src/render/mesher_thread.lua`, `src/render/ChunkRenderer.lua`
 
-Goal
-- Move expensive meshing work off the main thread.
-- Keep all graphics object creation on the main thread:
-  - `lovr.graphics.newMesh`
-  - `Mesh:setIndices`
-
-Thread constraints (LOVR)
-- Threads cannot use `lovr.graphics` (no creating Mesh/Texture/Model objects).
-- Threads communicate via `Channel` objects (`lovr.thread.getChannel`).
-
-Design (two-phase pipeline)
-A) Main thread responsibilities
-- For each chunk rebuild request:
-  1) Ensure chunk is prepared (`world:prepareChunk(cx, cy, cz)`).
-  2) Fill a halo buffer (`world:fillBlockHalo(cx, cy, cz, halo)`).
-  3) Enqueue a meshing job to a worker with:
-     - chunk coords + key
-     - a monotonic `version`/`jobId` (for stale-result rejection)
-     - meshing mode (greedy/naive, indexed on/off)
-     - halo data (table or Blob)
-     - a compact block-info table (opaque + alpha + color/alpha needed by the mesher)
-- Each frame, within a small time budget:
-  - Pop completed results and apply to `self._chunkMeshes[key]` by creating/updating Mesh objects.
-
-B) Worker thread responsibilities
-- Pop job messages from a job Channel.
-- Build vertex + index data using the same meshing rules as the main-thread path.
-- Push results back to the main thread.
-- Do not reference any main-thread world tables directly.
-
-Data format (recommended staged rollout)
-- Phase 1 (simpler, possibly slower): send/receive Lua tables.
-  - Job: halo table + compact blockInfo.
-  - Result: vertex tables + index tables (opaque + alpha) + counts.
-- Phase 2 (preferred): send/receive `Blob`s.
-  - Pack halo as U8 Blob (`(cs + 2)^3` bytes).
-  - Pack vertices as F32 Blob (or FFI write), with a fixed vertex stride matching `VERTEX_FORMAT`.
-  - Pack indices as U16/U32 Blob.
-  - Main thread creates Mesh from vertex Blob and calls `mesh:setIndices(indexBlob, 'u16'/'u32')`.
-
-Concurrency controls (avoid memory blowups)
-- Add a new constants table, e.g.:
-  - `Constants.THREAD_MESH = { enabled = false, maxInFlight = 2, maxApplyMillis = 1.0 }`
-- Keep a small in-flight cap.
-- When over cap, fall back to synchronous rebuild or defer jobs.
-
-Stale result rejection (must-have)
-- Track a `buildVersion` per chunk key.
-- Increment it when queueing a new job for that chunk.
-- Results include the version; discard results that don't match the latest version.
-
-Fallback (must-have)
-- If thread module is disabled, worker isn't started, or worker errors:
-  - Use the existing synchronous `_rebuildChunk` path for correctness.
+Tasks
+- Confirm jobs/results treat `job.key` / `result.key` as an opaque identifier:
+  - No string operations on it.
+  - It should round-trip as a number through channels.
+- Keep build-version tracking keyed by numeric key.
 
 Acceptance checks
-- Chunk rebuilds no longer cause visible hitches while moving/streaming.
-- Dirty queue still drains correctly; no cracks after edits.
-- Worker failure cannot soft-lock the game (fallback works).
+- Threaded meshing still works with no errors and no mismatched/stale application.
 
-5) Long-term: Region meshes (batch chunks to reduce draw calls)
---------------------------------------------------------------
-Only attempt if:
-- You plan to significantly increase `Constants.CULL.drawRadiusChunks`, OR
-- Profiling indicates draw submission is the bottleneck (too many Mesh draws per frame).
+7) Cleanup + verification searches (required)
+--------------------------------------------
 
-Approach
-- Group chunks into fixed regions (e.g., 2x2x1 chunks).
-- Build one region mesh per region (opaque + alpha).
-- Any dirty chunk triggers a rebuild of its region mesh.
+Searches (must be clean or intentionally justified)
+- Find remaining comma-string chunk keys:
+  - Search for patterns like:
+    - `.. "," ..` in the streaming/dirty paths
+    - `"%d+,%d+,%d+"`
+- Find key parsing remnants:
+  - `parseKey`
+  - `key:match`
+  - any chunk-key `tonumber(...)` conversions in the renderer
 
-Tradeoffs
-- Pros: fewer draw calls, less per-frame sort work.
-- Cons: larger rebuild blast radius and more complex dirty propagation.
+Suggested commands
+- `rg -n "parseKey|key:match" src`
+- `rg -n "\.\. ',' \.\." src/world/ChunkWorld.lua src/render/ChunkRenderer.lua` (string concatenation commas)
 
-Acceptance checks
-- No seams/cracks at region boundaries.
-- Rebuild cost remains bounded (no massive spikes).
+8) Manual test checklist (required)
+-----------------------------------
+Run: `lovr .`
 
-Manual Test Checklist
----------------------
-1) Stand still after load:
-- Dirty queue drains to 0; no flicker/popping.
+Checklist
+- Movement:
+  - Walk across several chunk boundaries; no visible cracks or missing chunks.
+  - Verify HUD perf numbers still update (if enabled).
+- Edits:
+  - Break and place blocks repeatedly in the same chunk.
+  - Break/place exactly on a chunk boundary (x==1 edge, x==chunkSize edge, z edge, y edge) and confirm neighbor chunk updates.
+- Pruning:
+  - Walk far enough that pruning removes old chunk meshes; verify no crashes.
+- Threaded meshing:
+  - Confirm the worker remains enabled and results apply (no fallback spam unless there is a genuine worker error).
 
-2) Walk in one direction for 2+ minutes:
-- No new hitch spikes from rebuilds.
-- Mesh cache remains bounded (existing prune system unchanged).
+Deliverables
+------------
+- All chunk "keys" flowing between world streaming/dirtying and renderer are numeric chunk keys.
+- No string parsing for chunk coords remains in `ChunkRenderer`.
+- No change to gameplay or save format; only internal key representation changes.
 
-3) Edits at chunk boundaries:
-- Break/place blocks on a chunk edge; both adjacent chunks rebuild correctly (no cracks).
-
-4) Leaves/translucency:
-- Leaves still render as alpha with acceptable sorting.
-
-5) Toggle matrix (A/B)
-- Opaque culling on/off.
-- Indexed quads on/off.
-- Threaded meshing on/off.
-
-Notes for changelog
--------------------
-- After implementing any step above, add a DEVLOG entry describing:
-  - What shipped and what toggles were added.
-  - Any visible correctness risks (winding/culling) and how they were validated.
-  - Any measurable perf improvement (optional).
+If anything goes wrong
+----------------------
+Do NOT reintroduce comma-string parsing in the renderer as a "quick fix".
+Instead, locate the last remaining producer of string keys (world enqueue/dirty paths) and convert it to numeric keys so the entire pipeline is consistent.

@@ -2,7 +2,7 @@ Audit Results
 =============
 
 Date: 2026-02-09
-Updated: 2026-02-12
+Updated: 2026-02-14
 
 Scope
 -----
@@ -11,10 +11,20 @@ Scope
 
 Findings (ordered by severity)
 ------------------------------
-- Perf/Scaling: Dirty-key ingestion uses string parsing (`parseKey` uses `key:match`) per queued key; fine at current volumes but avoid re-introducing 100s-1000s of keys per boundary. See `src/render/ChunkRenderer.lua:83` and `src/render/ChunkRenderer.lua:332`.
-- Perf/GC: Meshing builds allocate heavily per rebuild (vertex tables, greedy `mask` table). Ms-based budgeting limits CPU time but GC can still introduce hitches if rebuild throughput is high. See `src/render/ChunkRenderer.lua:392` and `src/render/ChunkRenderer.lua:549`.
-- Perf/Scaling: Alpha chunk sorting is O(n log n) in the number of visible alpha chunks; fine for now, but keep an eye on it if leaf-heavy scenes grow. See `src/render/ChunkRenderer.lua:864`.
-- Perf/Correctness: Streaming/meshing depends on missing-mesh enqueue + edit-driven dirties; if any system introduces non-edit block changes without dirtying, it can create "stale mesh" risks. (Currently edits and boundary-neighbor updates do dirty correctly via `ChunkWorld:set()`.)
+- Perf/Scaling: Dirty-key ingestion uses string parsing (`parseKey` uses `key:match`) per queued key. Fine at current volumes, but avoid re-introducing 100s-1000s of keys per boundary. See `src/render/ChunkRenderer.lua:650` and `src/render/ChunkRenderer.lua:1000`.
+  - Note: `ChunkWorld` already has a numeric chunk key encoding (`ChunkWorld:_chunkKey`, `ChunkWorld:_decodeChunkKey`), but dirty keys are still comma-strings (see `src/world/ChunkWorld.lua:88` and `src/world/ChunkWorld.lua:111`). Unifying renderer+world dirties on numeric chunk keys would remove parse cost and reduce string churn.
+- Perf/GC: Meshing still allocates heavily per rebuild (vertex/index buffers and greedy `mask`/scratch). Threaded meshing reduces main-thread spikes, but worker-side GC and result-application cost can still hitch if rebuild throughput is high. See `src/render/ChunkRenderer.lua:500`, `src/render/ChunkRenderer.lua:563`, and `src/render/mesher_thread.lua`.
+- Perf/Scaling: Alpha chunk sorting is O(n log n) in the number of visible alpha chunks; fine for now, but keep an eye on it if leaf-heavy scenes grow. See `src/render/ChunkRenderer.lua:1749`.
+- Perf/Correctness: Streaming/meshing depends on missing-mesh enqueue + edit-driven dirties; if any system introduces non-edit block changes without dirtying, it can create "stale mesh" risks. (Currently edits and boundary-neighbor updates do dirty correctly via `ChunkWorld:set()` / `ChunkWorld:_markNeighborsIfBoundary`.)
+
+Recommended Next Steps
+----------------------
+- Unify chunk identifiers end-to-end (prefer numeric chunk keys):
+  - Change dirty queues and renderer mesh caches to use `ChunkWorld:_chunkKey()` / `_decodeChunkKey()` instead of comma-strings to remove `parseKey` and reduce per-frame string churn.
+- Keep threaded meshing on the "blob path":
+  - If any platforms/drivers force the table fallback frequently, consider tightening/adjusting blob packing so worker->main transfers stay low-GC.
+- Only optimize alpha sorting if it shows up in profiling:
+  - Common follow-ups are approximate distance buckets, partial sorting, or skipping sorts when alphaCount is small/stable.
 
 Focused Mini-Audit Notes (Renderer Scheduling)
 ----------------------------------------------
@@ -23,21 +33,27 @@ Focused Mini-Audit Notes (Renderer Scheduling)
   - O(queue) dirty rebucketing is now avoided under backlog via lazy stale requeue + small-backlog rebucket threshold.
   - O(meshCache) mesh pruning is now incremental/amortized with per-frame caps instead of scanning the full cache on each crossing.
 - HUD now separates streaming enqueue, dirty intake, rebuild ms vs budget, and prune work, so tuning is data-driven.
+- Threaded meshing (2026-02-13) further reduces main-thread rebuild spikes:
+  - Dirty rebuilds enqueue a halo snapshot to a worker thread (blob-packed when available).
+  - Results are applied with a per-frame time budget, and stale results are rejected via per-chunk build versions.
+  - Worker failure disables threading and falls back to synchronous rebuilds to preserve correctness.
 
 Resolved
 --------
 - Git is now initialized correctly in this working directory:
   - Preserved the broken `.git` folder as `.git_incomplete_backup_2026-02-10/` for safety.
   - Initialized a new repository on `main`, added a `.gitignore` for local artifacts/backups, and pushed to GitHub (`tristonkautz-kautzperformance/MC-GAME`).
-- Base terrain generation no longer calls `ChunkWorld:set()` for every voxel; it writes directly into chunk storage and marks chunks dirty once at the end. See `src/world/ChunkWorld.lua:163`.
+- Base terrain generation is now procedural + cheap to reset:
+  - `ChunkWorld:generate()` is an O(1) reset (no eager per-voxel allocation).
+  - Base blocks come from `_getBaseBlock()` thresholds, with sparse feature/edit overlays. See `src/world/ChunkWorld.lua:222` and `src/world/ChunkWorld.lua:669`.
 - AIR storage bloat addressed: writing AIR clears chunk slots (`nil`) to keep chunk data sparse as blocks are broken/placed. See `src/world/Chunk.lua:21`.
 - Removed idle per-frame dirty-key list allocations:
-  - Added `ChunkWorld:drainDirtyChunkKeys(out)` and a shared-empty fast path in `ChunkWorld:getDirtyChunkKeys()`. See `src/world/ChunkWorld.lua:5`.
-  - Renderer now drains into a reusable scratch array and queues using an explicit count. See `src/render/ChunkRenderer.lua:41`.
+  - Added `ChunkWorld:drainDirtyChunkKeys(out)` and a shared-empty fast path in `ChunkWorld:getDirtyChunkKeys()`. See `src/world/ChunkWorld.lua:504` and `src/world/ChunkWorld.lua:517`.
+  - Renderer now drains into a reusable scratch array and queues using an explicit count. See `src/render/ChunkRenderer.lua:1544`.
 - Renderer draw-path polish:
   - Single visibility pass over chunk meshes instead of iterating the table twice.
   - Alpha chunk meshes are drawn back-to-front to reduce blending artifacts.
-  - Cached draw vectors use persistent `lovr.math.newVec3` to avoid "temporary vector from a previous frame" crashes. See `src/render/ChunkRenderer.lua:718`.
+  - Cached draw vectors use persistent `lovr.math.newVec3` to avoid "temporary vector from a previous frame" crashes. See `src/render/ChunkRenderer.lua:147`.
 - HUD GC smoothing:
   - Reuses scratch vectors/line buffers and caches concatenated HUD text, rebuilding at a fixed interval. See `src/ui/HUD.lua:4`.
 - Inventory-full break safety:
@@ -52,3 +68,7 @@ Resolved
   - Avoids O(meshCache) mesh pruning spikes by amortizing pruning across frames with `next(...)` iteration and per-frame caps.
 - HUD rebuild/prune diagnostics added:
   - Shows rebuild ms vs budget, dirty intake drained vs queued, and per-frame prune work + pending status.
+- Threaded meshing added:
+  - Worker thread (`src/render/mesher_thread.lua`) builds meshes off-thread, returning blob-backed vertex/index data when possible.
+  - Main thread applies results with time budgets (`_threadMaxApplyMillis`) and rejects stale results via build versioning.
+  - Robust fallback path disables the worker on error and continues with synchronous rebuilds.

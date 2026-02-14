@@ -99,6 +99,14 @@ function ChunkWorld:_decodeChunkKey(chunkKey)
   return cx, cy, cz
 end
 
+function ChunkWorld:chunkKey(cx, cy, cz)
+  return self:_chunkKey(cx, cy, cz)
+end
+
+function ChunkWorld:decodeChunkKey(chunkKey)
+  return self:_decodeChunkKey(chunkKey)
+end
+
 function ChunkWorld:_localIndex(lx, ly, lz)
   local cs = self.chunkSize
   return (ly - 1) * cs * cs + (lz - 1) * cs + lx
@@ -113,8 +121,8 @@ function ChunkWorld:_markDirty(cx, cy, cz)
     return
   end
 
-  local key = cx .. ',' .. cy .. ',' .. cz
-  self._dirty[key] = true
+  local chunkKey = self:_chunkKey(cx, cy, cz)
+  self._dirty[chunkKey] = true
 end
 
 function ChunkWorld:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
@@ -592,7 +600,7 @@ function ChunkWorld:enqueueChunkSquare(centerCx, centerCz, radiusChunks, minCy, 
     for queueCx = minX, maxX do
       for queueCy = lowCy, highCy do
         count = count + 1
-        outKeys[count] = queueCx .. ',' .. queueCy .. ',' .. queueCz
+        outKeys[count] = self:_chunkKey(queueCx, queueCy, queueCz)
       end
     end
   end
@@ -641,7 +649,7 @@ function ChunkWorld:enqueueRingDelta(oldCx, oldCz, newCx, newCz, radiusChunks, m
       for queueCz = minZ, maxZ do
         for queueCy = lowCy, highCy do
           count = count + 1
-          outKeys[count] = xColumn .. ',' .. queueCy .. ',' .. queueCz
+          outKeys[count] = self:_chunkKey(xColumn, queueCy, queueCz)
         end
       end
     else
@@ -656,7 +664,7 @@ function ChunkWorld:enqueueRingDelta(oldCx, oldCz, newCx, newCz, radiusChunks, m
         if not xColumn or queueCx ~= xColumn then
           for queueCy = lowCy, highCy do
             count = count + 1
-            outKeys[count] = queueCx .. ',' .. queueCy .. ',' .. zRow
+            outKeys[count] = self:_chunkKey(queueCx, queueCy, zRow)
           end
         end
       end

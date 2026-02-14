@@ -647,11 +647,6 @@ function ChunkRenderer:shutdown()
   self._threadHaloTablePoolCount = 0
 end
 
-local function parseKey(key)
-  local cx, cy, cz = key:match('^(%d+),(%d+),(%d+)$')
-  return tonumber(cx), tonumber(cy), tonumber(cz)
-end
-
 local function isAir(constants, block)
   return block == constants.BLOCK.AIR
 end
@@ -788,14 +783,7 @@ function ChunkRenderer:_pruneChunkMeshesStep(maxChecks, maxMillis)
 
     local keep = true
     local cx = entry.cx
-    local cy = entry.cy
     local cz = entry.cz
-    if not cx or not cz then
-      cx, cy, cz = parseKey(key)
-      entry.cx = cx
-      entry.cy = cy
-      entry.cz = cz
-    end
 
     if cx and cz then
       local dx = math.abs(cx - pcx)
@@ -1002,16 +990,14 @@ function ChunkRenderer:_queueDirtyKeys(dirtyKeys, count, forceRebuild)
   local queued = 0
   for i = 1, count do
     local key = dirtyKeys[i]
-    if not self._dirtyEntries[key] then
+    if type(key) == 'number' and not self._dirtyEntries[key] then
       if forceRebuild or not self._chunkMeshes[key] then
-        local cx, cy, cz = parseKey(key)
-        if cx and cy and cz then
-          local entry = { key = key, cx = cx, cy = cy, cz = cz, dist = 0 }
-          self._dirtyEntries[key] = entry
-          self._dirtyCount = self._dirtyCount + 1
-          self:_pushDirtyEntry(entry)
-          queued = queued + 1
-        end
+        local cx, cy, cz = self.world:decodeChunkKey(key)
+        local entry = { key = key, cx = cx, cy = cy, cz = cz, dist = 0 }
+        self._dirtyEntries[key] = entry
+        self._dirtyCount = self._dirtyCount + 1
+        self:_pushDirtyEntry(entry)
+        queued = queued + 1
       end
     end
   end
@@ -1413,7 +1399,7 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
 end
 
 function ChunkRenderer:_rebuildChunk(cx, cy, cz)
-  local key = cx .. ',' .. cy .. ',' .. cz
+  local key = self.world:chunkKey(cx, cy, cz)
   -- Any synchronous rebuild supersedes older in-flight thread results.
   self:_nextBuildVersion(key)
 

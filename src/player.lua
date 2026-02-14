@@ -32,6 +32,8 @@ function Player.new(config, x, y, z)
   self.pitch = 0
   self.velocityY = 0
   self.onGround = false
+  self._cameraYawQuat = lovr.math.newQuat(0, 0, 1, 0)
+  self._cameraPitchQuat = lovr.math.newQuat(0, 1, 0, 0)
 
   return self
 end
@@ -55,9 +57,12 @@ function Player:getCameraPosition()
 end
 
 function Player:getCameraOrientation()
-  local yaw = lovr.math.newQuat(self.yaw, 0, 1, 0)
-  local pitch = lovr.math.newQuat(self.pitch, 1, 0, 0)
-  return yaw * pitch
+  local yaw = self._cameraYawQuat
+  local pitch = self._cameraPitchQuat
+  yaw:set(self.yaw, 0, 1, 0)
+  pitch:set(self.pitch, 1, 0, 0)
+  yaw:mul(pitch)
+  return yaw
 end
 
 function Player:_collides(world)

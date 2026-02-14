@@ -22,7 +22,7 @@ This file describes the project's intent, tech stack, and engineering constraint
 - Pointer lock:
   - Click to capture mouse.
   - `Tab` toggles lock.
-  - `Esc` unlocks first; if already unlocked, quits.
+  - `Esc` unlocks mouse if locked; otherwise opens the pause menu.
 
 ## Current Code Layout
 - `main.lua`: LOVR lifecycle callback forwarding only.

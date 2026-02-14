@@ -2,6 +2,21 @@
 
 ## 2026-02-14
 
+### Audit Results #2 Follow-up
+- Removed per-frame camera/view allocations:
+  - `src/game/GameState.lua` now reuses a persistent `lovr.math.newVec3` (`self._cameraPosition`) for `pass:setViewPose(...)`.
+  - `src/player.lua` now reuses cached quaternions in `Player:getCameraOrientation()` via in-place `:set(...)` + `:mul(...)` (no `newQuat` allocations, no `yaw * pitch` temporary).
+- Added bulk save-load edit application:
+  - new `ChunkWorld:applyEditsBulk(edits, count)` writes directly to sparse edit storage while preserving AIR overrides, dirty marking, and boundary-neighbor dirty propagation.
+  - `SaveSystem:apply(...)` now prefers `world:applyEditsBulk(...)` when available, with fallback to the original per-edit `world:set(...)` path.
+- Fullscreen local-dev artifact hygiene:
+  - added `.fullscreen` to `.gitignore` so fullscreen toggle persistence does not create untracked repo noise.
+- Synced control wording in docs:
+  - updated `AGENTS.md` Escape behavior text to match runtime behavior and `README.md` (`Esc` unlocks mouse if locked, otherwise opens pause menu).
+- Added third-party attribution/compliance docs:
+  - new `THIRD_PARTY_NOTICES.md` includes upstream source URL, commit provenance, license type, and full MIT license text for vendored `lovr-mouse.lua`.
+  - `README.md` now points to `THIRD_PARTY_NOTICES.md` in the relative mouse section.
+
 ### Codex Task Spec Refresh
 - Replaced `Codex_Instructions` with a numeric chunk-key migration plan: remove comma-string chunk IDs and use numeric chunk keys end-to-end across world dirtying, streaming enqueue, renderer queues/cache, and threaded meshing key flow.
 

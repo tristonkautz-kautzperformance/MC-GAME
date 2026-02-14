@@ -10,6 +10,7 @@ Desktop.ini
 # Local agent/sandbox artifacts
 .dot_test
 __write_test_root*.txt
+.fullscreen
 
 # Previous broken git metadata (kept as backup)
 .git_incomplete_backup_*/

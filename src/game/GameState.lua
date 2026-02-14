@@ -93,6 +93,7 @@ function GameState.new(constants)
   self._enqueuedCount = 0
   self._enqueuedTimer = 0
   self._enqueuedShowSeconds = 0.5
+  self._cameraPosition = nil
 
   self.showHelp = false
   self.showPerfHud = true
@@ -699,7 +700,11 @@ function GameState:draw(pass)
     fps = lovr.timer.getFPS() or 0
   end
 
-  pass:setViewPose(1, lovr.math.vec3(cameraX, cameraY, cameraZ), cameraOrientation)
+  if not self._cameraPosition then
+    self._cameraPosition = lovr.math.newVec3(0, 0, 0)
+  end
+  self._cameraPosition:set(cameraX, cameraY, cameraZ)
+  pass:setViewPose(1, self._cameraPosition, cameraOrientation)
 
   self.sky:draw(pass)
   self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)

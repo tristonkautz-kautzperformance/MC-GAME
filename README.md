@@ -64,6 +64,7 @@ If your `lovr` executable is not on PATH, run it with the full path to your LOVR
 ### Relative mouse / pointer lock
 
 This project vendors `lovr-mouse.lua` (from the `bjornbytes/lovr-mouse` project) to enable true FPS-style relative mouse mode on LOVR 0.18.
+License and attribution details are in `THIRD_PARTY_NOTICES.md`.
 
 ### Fullscreen
 

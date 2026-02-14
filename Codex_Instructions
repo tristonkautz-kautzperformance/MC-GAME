@@ -4,225 +4,135 @@ Codex Instructions (Codex 5.3)
 Status (2026-02-14)
 ------------------
 Baseline already in place (do not redo):
-- Chunked finite world (`ChunkWorld`) with procedural base + sparse overrides (edits + features).
-- Chunk renderer (`ChunkRenderer`) builds per-chunk meshes (opaque + alpha) and draws:
-  - Priority dirty queue + ms-budgeted rebuild.
-  - Incremental mesh-cache pruning amortized.
-  - Opaque front-to-back sorting + alpha back-to-front sorting.
-  - Indexed meshing support and threaded meshing worker pipeline.
+- Numeric chunk keys end-to-end (world dirty/streaming, renderer caches/queues, threaded meshing jobs/results).
+- Threaded meshing worker pipeline with blob fast paths + versioned result rejection.
+- Finite chunked world: procedural base + sparse overrides (edits + features), bedrock unbreakable.
+- Save/load (V2 magic) for edits + player + inventory + time-of-day.
 
-New task: Numeric Chunk Keys End-to-End (Remove "cx,cy,cz" strings)
-------------------------------------------------------------------
+New task: Implement "Recommended Next Steps" from `Audit Results #2`
+-------------------------------------------------------------------
 
 Goal
 ----
-Eliminate comma-string chunk identifiers (e.g. "12,3,9") from hot paths by using the existing numeric chunk key encoding already present in `ChunkWorld`:
-- Use numeric chunk keys for:
-  - World dirty tracking (`ChunkWorld._dirty`)
-  - Streaming enqueue lists (`enqueueChunkSquare`, `enqueueRingDelta`)
-  - Renderer mesh cache keys (`ChunkRenderer._chunkMeshes`)
-  - Renderer dirty queue keys (`ChunkRenderer._dirtyEntries`)
-  - Threaded meshing job/result keys (pass numeric key through unchanged)
-
-This should:
-- Remove `parseKey` string parsing and `key:match`/`tonumber` churn from the renderer.
-- Reduce per-frame string allocation/churn from dirty and streaming lists.
-- Preserve all gameplay behavior and mesh correctness.
+Address the following without changing gameplay:
+1) Remove per-frame allocations in the camera/view path (`GameState` view vec3 + `Player` camera orientation quats).
+2) Fullscreen persistence: either make it distribution-friendly OR explicitly treat `.fullscreen` as a local-dev artifact (and ignore it).
+3) Sync `AGENTS.md` control wording with actual behavior.
+4) Add third-party license/attribution for vendored `lovr-mouse.lua`.
+5) (If large saves are expected) Add a bulk edit-apply path for save loading to avoid long startup hitches.
 
 Hard constraints (do NOT change)
 -------------------------------
-- Pointer lock, input, menu behavior.
-- Save format / save system and on-disk representation.
-- World bounds rules (finite world), bedrock unbreakable.
+- Pointer lock / relative mouse flow (`lovr-mouse.lua`) and all input + menu behavior.
+- Save format and on-disk representation. (Bulk-apply is internal only.)
+- World bounds (finite world) and bedrock unbreakable.
 - Block IDs, colors, and opaque/alpha semantics (leaves remain translucent).
-- Chunk dirtying correctness (including neighbor dirtying at boundaries).
-- Existing rebuild scheduling/budgeting, incremental pruning, and threaded meshing fallback behavior.
-
-Non-goals
----------
-- Worldgen changes, chunk size changes, or new rendering features.
-- "Big" performance refactors (mask reuse, blob formats, etc.) beyond what is required to switch keys.
-
-Key definition (source of truth)
--------------------------------
-`ChunkWorld` already defines a stable numeric encoding:
-- `ChunkWorld:_chunkKey(cx, cy, cz)` -> integer in `[1, chunksX * chunksY * chunksZ]`
-- `ChunkWorld:_decodeChunkKey(chunkKey)` -> `cx, cy, cz`
-
-Use these formulas consistently. Do NOT invent a second encoding.
-
-Important: Lua numbers are doubles; ensure the maximum possible key remains < 2^53. With the current finite world sizes, this is safely true.
+- Renderer rebuild scheduling/budgeting, incremental pruning, and threaded meshing fallback behavior.
+- Keep files ASCII when practical.
+- Update `DEVLOG.md` for meaningful changes and `README.md` for control changes.
 
 Implementation plan (do in this order)
 --------------------------------------
 
-1) Add public chunk-key helpers to `ChunkWorld` (renderer should not call underscore methods)
-Files: `src/world/ChunkWorld.lua`
+1) Fix camera/view allocations (required)
+Files: `src/game/GameState.lua`, `src/player.lua`
 
 Tasks
-- Add two public wrappers:
-  - `function ChunkWorld:chunkKey(cx, cy, cz)` -> returns `self:_chunkKey(cx, cy, cz)`
-  - `function ChunkWorld:decodeChunkKey(chunkKey)` -> returns `self:_decodeChunkKey(chunkKey)`
-- Keep `_chunkKey` and `_decodeChunkKey` as the canonical internal implementations.
+- `GameState`: stop calling `lovr.math.vec3(...)` each frame in `draw`.
+  - Store a persistent `lovr.math.newVec3` on the `GameState` instance and update it with `:set(x, y, z)` (or field writes if needed).
+  - Use it in `pass:setViewPose(...)`.
+- `Player`: rewrite `getCameraOrientation` to reuse quaternions instead of allocating each call.
+  - Use `Quat:set(angle, ax, ay, az)` and `Quat:mul(quat)` (in-place) rather than `lovr.math.newQuat(...)` and `yaw * pitch`.
+  - Return a cached `Quat` owned by the player (callers treat it as read-only within the frame).
 
 Acceptance checks
-- No behavior change yet; just new functions.
+- `rg -n "lovr\\.math\\.vec3\\(" src/game/GameState.lua` returns no results.
+- `Player:getCameraOrientation()` does not call `lovr.math.newQuat` and does not use `*` to combine quats.
+- Manual: mouse look feels identical, no camera roll, no rendering/culling regressions.
 
-2) Convert dirty tracking to numeric keys
-Files: `src/world/ChunkWorld.lua`
+2) Fullscreen persistence + git hygiene (required)
+Files: `conf.lua`, `src/game/GameState.lua`, `.gitignore`, `README.md` (only if behavior changes)
 
-Current
-- `_markDirty(cx, cy, cz)` builds a comma string and stores `self._dirty[key] = true`.
-- `drainDirtyChunkKeys(out)` copies those strings into `out`.
+Default approach (recommended unless user asks otherwise)
+- Treat `.fullscreen` as a local-dev artifact:
+  - Add `.fullscreen` to `.gitignore`.
+  - Keep current restart-based toggle behavior.
+  - Ensure failures to read/write do not crash (already mostly true; keep it that way).
 
-Tasks
-- Update `_markDirty(cx, cy, cz)` to compute numeric key:
-  - `local chunkKey = self:_chunkKey(cx, cy, cz)`
-  - `self._dirty[chunkKey] = true`
-- Keep bounds checks exactly as-is.
-- Ensure every code path that marks dirty still marks the same chunks:
-  - `ChunkWorld:set(...)` (and any edit APIs it calls)
-  - Neighbor boundary dirtying via `_markNeighborsIfBoundary`
-  - `markDirtyRadius(...)`
-- Update `getDirtyChunkKeys()` and `drainDirtyChunkKeys(out)` so:
-  - `out[i]` are numeric keys (integers), not strings.
-  - Clearing behavior remains identical (reuse `out`, trim extra entries, reset `_dirty`).
-  - Fast path `EMPTY_DIRTY_KEYS` remains valid.
+Alternative (only if requested and verified)
+- Implement a distribution-friendly preference location. Do NOT guess module availability in `conf.lua`:
+  - `conf.lua` runs before modules initialize; avoid relying on `lovr.filesystem` there unless verified in LOVR 0.18.
+  - If you change where fullscreen state is stored, update `README.md` accordingly.
 
 Acceptance checks
-- Moving and editing blocks still triggers visible chunk rebuilds (no stale meshes).
-- No runtime errors due to assuming dirty keys are strings.
+- `.fullscreen` no longer shows up as an untracked file after toggling fullscreen.
+- `F11` still toggles fullscreen and persists across restart (within the dev workflow).
 
-3) Convert streaming enqueue lists to numeric keys
-Files: `src/world/ChunkWorld.lua`
-
-Current
-- `enqueueChunkSquare(...)` and `enqueueRingDelta(...)` fill `outKeys` with strings like "cx,cy,cz".
+3) Docs sync (required)
+Files: `AGENTS.md` (and `README.md` only if controls changed)
 
 Tasks
-- Change both functions to fill numeric keys instead:
-  - `outKeys[count] = self:_chunkKey(queueCx, queueCy, queueCz)`
-- Keep:
-  - clamping/normalization behavior,
-  - return values and special `-1` case in `enqueueRingDelta`,
-  - `outKeys` reuse pattern (caller passes scratch).
+- Update `AGENTS.md` control wording for Escape to match actual behavior:
+  - Escape unlocks mouse if locked; otherwise opens the pause menu.
+- Do NOT change input behavior to match docs; docs should match behavior.
 
 Acceptance checks
-- Initial seeding (`GameState` startup) still enqueues chunks and produces initial meshes.
-- Chunk crossing still enqueues the correct "ring delta" and doesn''t reseed the full square unless `-1` fallback triggers.
+- `AGENTS.md` and `README.md` do not contradict each other about Escape behavior.
 
-4) Convert `ChunkRenderer` to numeric keys (remove `parseKey`)
-Files: `src/render/ChunkRenderer.lua`
+4) Third-party license/attribution for `lovr-mouse.lua` (required)
+Files: add `THIRD_PARTY_NOTICES.md` (or `LICENSES/lovr-mouse.txt`), optionally update `README.md`
 
-Current
-- Renderer uses comma-string keys for:
-  - `_chunkMeshes` (mesh cache)
-  - `_dirtyEntries` (dirty queue map)
-  - missing-mesh enqueue lists
-- It parses strings via `parseKey(key)` using `key:match(...)`.
+Rules
+- Do NOT invent license text. Locate the actual license from upstream (`bjornbytes/lovr-mouse`) and copy it in.
+- Record provenance: project name + upstream URL + license type + license text, and ideally a commit/tag if available.
 
-Tasks
-+A) Key type change
-+- Treat `key` everywhere as numeric `chunkKey`.
-+- Update:
-+  - `self._chunkMeshes[key]` tables
-+  - `self._dirtyEntries[key]` tables
-+  - `_chunkBuildVersion[key]`, `_threadInFlightByKey[key]`, `_threadInFlightHaloByKey[key]`
-+
-+B) Remove string parsing
-+- Delete `parseKey` and any `key:match` usage.
-+- Update `_queueDirtyKeys(dirtyKeys, count, forceRebuild)`:
-+  - For each `chunkKey`, decode coords using the world:
-+    - `local cx, cy, cz = self.world:decodeChunkKey(chunkKey)`
-+  - Create dirty entries with:
-+    - `{ key = chunkKey, cx = cx, cy = cy, cz = cz, dist = 0 }`
-+  - Keep existing logic:
-+    - skip if already dirty,
-+    - only queue missing meshes when `forceRebuild` is false,
-+    - increment `_dirtyCount`, `_dirtyEntries`, and push into buckets.
-+- Update pruning `_pruneChunkMeshesStep(...)`:
-+  - Remove the "parse key" fallback branch entirely.
-+  - It should always trust `entry.cx/cy/cz` (they are written in `_setChunkMeshEntry`).
-+
-+C) Ensure `_setChunkMeshEntry` stays the authoritative place that stamps coords
-+- It already receives `cx, cy, cz` and assigns `entry.cx/cy/cz`.
-+- Ensure callers always pass correct coords (threaded results already include coords).
-+
-+Acceptance checks
-+- `rg` shows no remaining `parseKey`, `key:match`, or `tonumber(cx)` used for chunk key parsing.
-+- Gameplay:
-+  - Move across chunk boundaries: no "holes" or stuck stale meshes.
-+  - Break/place blocks on chunk boundaries: both the edited chunk and neighbor chunk rebuild.
-+- Threaded meshing:
-+  - Still applies results to the correct chunk entry keyed by numeric `chunkKey`.
-
-5) Update `GameState` streaming seed/enqueue to treat keys as numeric
-Files: `src/game/GameState.lua`
-
-Current
-- Uses `self._enqueueScratch` filled by `world:enqueueChunkSquare` / `world:enqueueRingDelta`,
-  then passes to `renderer:enqueueMissingKeys(keys, count)`.
-
-Tasks
-- No API changes required if you updated the world + renderer as above.
-- Just ensure all code assumes keys are opaque identifiers (numbers) and never concatenates or parses them.
+If network access is unavailable
+- Ask the user to provide the license text (or allow fetching it); do not add placeholders that imply a license.
 
 Acceptance checks
-- Startup seeding still queues and builds initial chunk meshes.
-- Chunk crossing still queues and meshes newly-visible chunks (ring delta works).
+- Repo contains a third-party notice or license file that clearly covers `lovr-mouse.lua`.
 
-6) Worker thread compatibility check (threaded meshing)
-Files: `src/render/mesher_thread.lua`, `src/render/ChunkRenderer.lua`
+5) Bulk edit-apply on load (optional but recommended for large saves)
+Files: `src/save/SaveSystem.lua` and/or `src/world/ChunkWorld.lua`
 
-Tasks
-- Confirm jobs/results treat `job.key` / `result.key` as an opaque identifier:
-  - No string operations on it.
-  - It should round-trip as a number through channels.
-- Keep build-version tracking keyed by numeric key.
+Goal
+- Keep save format identical, but avoid `world:set(...)` per-edit on load.
+- Preserve correctness:
+  - AIR edits (block id 0) must remain valid overrides (do not treat as "no edit").
+  - Chunks affected by edits must be marked dirty (and neighbor chunks when an edit touches a chunk boundary) so meshes rebuild correctly.
+
+Suggested approach
+- Add a world method like `ChunkWorld:applyEditsBulk(edits, count)` that:
+  - Inserts entries into `_editChunks` / `_editChunkCounts` / `_editCount` directly.
+  - Marks dirty per affected chunk, and boundary neighbors (can batch per-chunk with boundary flags).
+- In `SaveSystem:apply`, prefer bulk apply if present; otherwise fall back to per-edit `world:set`.
 
 Acceptance checks
-- Threaded meshing still works with no errors and no mismatched/stale application.
+- Loading a save with many edits is noticeably faster and does not hitch as long.
+- Manual: break/place near chunk boundaries still causes both chunks to rebuild after load (no seams).
 
-7) Cleanup + verification searches (required)
---------------------------------------------
+Verification searches (required)
+--------------------------------
+- `rg -n "lovr\\.math\\.vec3\\(" src`
+- `rg -n "newQuat\\(" src/player.lua`
+- `rg -n \"\\.fullscreen\" .gitignore conf.lua src/game/GameState.lua README.md`
+- `rg -n \"lovr-mouse\" README.md AGENTS.md THIRD_PARTY_NOTICES.md LICENSES -S`
 
-Searches (must be clean or intentionally justified)
-- Find remaining comma-string chunk keys:
-  - Search for patterns like:
-    - `.. "," ..` in the streaming/dirty paths
-    - `"%d+,%d+,%d+"`
-- Find key parsing remnants:
-  - `parseKey`
-  - `key:match`
-  - any chunk-key `tonumber(...)` conversions in the renderer
-
-Suggested commands
-- `rg -n "parseKey|key:match" src`
-- `rg -n "\.\. ',' \.\." src/world/ChunkWorld.lua src/render/ChunkRenderer.lua` (string concatenation commas)
-
-8) Manual test checklist (required)
------------------------------------
+Manual test checklist (required)
+--------------------------------
 Run: `lovr .`
 
 Checklist
-- Movement:
-  - Walk across several chunk boundaries; no visible cracks or missing chunks.
-  - Verify HUD perf numbers still update (if enabled).
-- Edits:
-  - Break and place blocks repeatedly in the same chunk.
-  - Break/place exactly on a chunk boundary (x==1 edge, x==chunkSize edge, z edge, y edge) and confirm neighbor chunk updates.
-- Pruning:
-  - Walk far enough that pruning removes old chunk meshes; verify no crashes.
-- Threaded meshing:
-  - Confirm the worker remains enabled and results apply (no fallback spam unless there is a genuine worker error).
+- Camera: look around, move, jump; orientation is correct (yaw/pitch only).
+- Fullscreen: press `F11`, app restarts, fullscreen state persists; `.fullscreen` is not committed/untracked noise.
+- Pause/menu: Escape behavior unchanged (unlock vs pause menu) and matches docs.
+- Pointer lock: click to capture; Tab toggle; focus loss unlock still works.
+- Save/load: make a few edits, save, quit to menu, continue; world edits and inventory persist.
 
 Deliverables
 ------------
-- All chunk "keys" flowing between world streaming/dirtying and renderer are numeric chunk keys.
-- No string parsing for chunk coords remains in `ChunkRenderer`.
-- No change to gameplay or save format; only internal key representation changes.
-
-If anything goes wrong
-----------------------
-Do NOT reintroduce comma-string parsing in the renderer as a "quick fix".
-Instead, locate the last remaining producer of string keys (world enqueue/dirty paths) and convert it to numeric keys so the entire pipeline is consistent.
+- Per-frame camera allocations removed.
+- `.fullscreen` strategy clarified and repository stays clean.
+- Docs are consistent.
+- Third-party notice/license added for `lovr-mouse.lua`.
+- (Optional) Save load bulk apply implemented without format changes.

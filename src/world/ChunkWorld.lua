@@ -480,6 +480,81 @@ function ChunkWorld:set(x, y, z, value)
   return true
 end
 
+function ChunkWorld:applyEditsBulk(edits, count)
+  if not edits then
+    return false, 0
+  end
+
+  local limit = math.floor(tonumber(count) or #edits)
+  if limit <= 0 then
+    return true, 0
+  end
+
+  local applied = 0
+  local AIR = self.constants.BLOCK.AIR
+
+  for i = 1, limit do
+    local entry = edits[i]
+    if entry then
+      local x = tonumber(entry[1])
+      local y = tonumber(entry[2])
+      local z = tonumber(entry[3])
+      local value = tonumber(entry[4])
+      if value == nil then
+        value = AIR
+      end
+
+      if x and y and z and self:isInside(x, y, z) then
+        local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+        self:prepareChunk(cx, cy, cz)
+
+        local chunkKey = self:chunkKey(cx, cy, cz)
+        local localIndex = self:_localIndex(lx, ly, lz)
+        local baseValue = self:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
+        local editChunk = self._editChunks[chunkKey]
+        local previousEdit = editChunk and editChunk[localIndex] or nil
+        local oldValue = previousEdit ~= nil and previousEdit or baseValue
+
+        if oldValue ~= value then
+          if value == baseValue then
+            if previousEdit ~= nil then
+              editChunk[localIndex] = nil
+              self._editCount = self._editCount - 1
+
+              local remaining = (self._editChunkCounts[chunkKey] or 1) - 1
+              if remaining <= 0 then
+                self._editChunkCounts[chunkKey] = nil
+                self._editChunks[chunkKey] = nil
+              else
+                self._editChunkCounts[chunkKey] = remaining
+              end
+            end
+          else
+            if not editChunk then
+              editChunk = {}
+              self._editChunks[chunkKey] = editChunk
+              self._editChunkCounts[chunkKey] = 0
+            end
+
+            if previousEdit == nil then
+              self._editCount = self._editCount + 1
+              self._editChunkCounts[chunkKey] = (self._editChunkCounts[chunkKey] or 0) + 1
+            end
+
+            editChunk[localIndex] = value
+          end
+
+          self:_markDirty(cx, cy, cz)
+          self:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
+          applied = applied + 1
+        end
+      end
+    end
+  end
+
+  return true, applied
+end
+
 function ChunkWorld:isSolidAt(x, y, z)
   local block = self:get(x, y, z)
   local info = self.constants.BLOCK_INFO[block]

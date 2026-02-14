@@ -555,7 +555,18 @@ function SaveSystem:apply(world, edits, count)
     return false
   end
 
-  local limit = count or #edits
+  local limit = math.floor(tonumber(count) or #edits)
+  if limit < 0 then
+    limit = 0
+  end
+
+  if world.applyEditsBulk then
+    local ok = world:applyEditsBulk(edits, limit)
+    if ok ~= false then
+      return true
+    end
+  end
+
   for i = 1, limit do
     local entry = edits[i]
     if entry then

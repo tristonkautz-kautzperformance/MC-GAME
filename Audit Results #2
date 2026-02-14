@@ -68,3 +68,17 @@ Recommended Next Steps
 - Bring `AGENTS.md` control wording back in sync with current behavior.
 - Add third-party license/attribution for `lovr-mouse.lua`.
 - If you expect large builds/edits: add a bulk edit-apply path for save loading to avoid long startup hitches.
+
+Follow-up Status (Implemented 2026-02-14)
+----------------------------------------
+- Camera/view allocations removed:
+  - `GameState:draw` now reuses a persistent camera position vec3 (`lovr.math.newVec3`) instead of calling `lovr.math.vec3(...)` each frame.
+  - `Player:getCameraOrientation()` now reuses cached quaternions (in-place `:set(...)` + `:mul(...)`) instead of allocating new quats each call.
+- Fullscreen persistence treated as local-dev artifact:
+  - `.fullscreen` is now ignored by git to avoid untracked noise while keeping the restart-based toggle behavior.
+- Docs synced:
+  - `AGENTS.md` Escape wording updated to match actual behavior (`Esc` unlocks mouse if locked; otherwise opens pause menu).
+- Third-party compliance:
+  - Added `THIRD_PARTY_NOTICES.md` with upstream `lovr-mouse` provenance and MIT license text; README points to it.
+- Save/load scaling:
+  - Added bulk edit apply on load (`ChunkWorld:applyEditsBulk`) and `SaveSystem:apply` now prefers it (save format unchanged).

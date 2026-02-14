@@ -121,7 +121,7 @@ function ChunkWorld:_markDirty(cx, cy, cz)
     return
   end
 
-  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local chunkKey = self:chunkKey(cx, cy, cz)
   self._dirty[chunkKey] = true
 end
 
@@ -290,7 +290,7 @@ function ChunkWorld:_getBaseWithFeatures(x, y, z)
   end
 
   local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
-  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local chunkKey = self:chunkKey(cx, cy, cz)
   local localIndex = self:_localIndex(lx, ly, lz)
   return self:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
 end
@@ -304,7 +304,7 @@ function ChunkWorld:_setFeatureBlock(x, y, z, block)
   end
 
   local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
-  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local chunkKey = self:chunkKey(cx, cy, cz)
   local localIndex = self:_localIndex(lx, ly, lz)
 
   local featureChunk = self._featureChunks[chunkKey]
@@ -322,7 +322,7 @@ function ChunkWorld:get(x, y, z)
   end
 
   local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
-  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local chunkKey = self:chunkKey(cx, cy, cz)
   local localIndex = self:_localIndex(lx, ly, lz)
   return self:_getByChunkKey(chunkKey, localIndex, x, y, z)
 end
@@ -435,7 +435,7 @@ function ChunkWorld:set(x, y, z, value)
   local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
   self:prepareChunk(cx, cy, cz)
 
-  local chunkKey = self:_chunkKey(cx, cy, cz)
+  local chunkKey = self:chunkKey(cx, cy, cz)
   local localIndex = self:_localIndex(lx, ly, lz)
 
   local oldValue = self:get(x, y, z)
@@ -600,7 +600,7 @@ function ChunkWorld:enqueueChunkSquare(centerCx, centerCz, radiusChunks, minCy, 
     for queueCx = minX, maxX do
       for queueCy = lowCy, highCy do
         count = count + 1
-        outKeys[count] = self:_chunkKey(queueCx, queueCy, queueCz)
+        outKeys[count] = self:chunkKey(queueCx, queueCy, queueCz)
       end
     end
   end
@@ -649,7 +649,7 @@ function ChunkWorld:enqueueRingDelta(oldCx, oldCz, newCx, newCz, radiusChunks, m
       for queueCz = minZ, maxZ do
         for queueCy = lowCy, highCy do
           count = count + 1
-          outKeys[count] = self:_chunkKey(xColumn, queueCy, queueCz)
+          outKeys[count] = self:chunkKey(xColumn, queueCy, queueCz)
         end
       end
     else
@@ -664,7 +664,7 @@ function ChunkWorld:enqueueRingDelta(oldCx, oldCz, newCx, newCz, radiusChunks, m
         if not xColumn or queueCx ~= xColumn then
           for queueCy = lowCy, highCy do
             count = count + 1
-            outKeys[count] = self:_chunkKey(queueCx, queueCy, zRow)
+            outKeys[count] = self:chunkKey(queueCx, queueCy, zRow)
           end
         end
       end
@@ -797,7 +797,7 @@ function ChunkWorld:collectEdits(out)
   local cs2 = cs * cs
 
   for chunkKey, chunkEdits in pairs(self._editChunks) do
-    local cx, cy, cz = self:_decodeChunkKey(chunkKey)
+    local cx, cy, cz = self:decodeChunkKey(chunkKey)
     local originX = (cx - 1) * cs
     local originY = (cy - 1) * cs
     local originZ = (cz - 1) * cs
@@ -923,3 +923,4 @@ function ChunkWorld:raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDist
 end
 
 return ChunkWorld
+

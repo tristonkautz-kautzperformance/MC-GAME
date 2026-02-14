@@ -20,6 +20,9 @@
   - `_rebuildChunk(...)` now keys build versions via `world:chunkKey(cx, cy, cz)`.
   - prune path no longer tries to recover missing coords by parsing string keys.
 - Verified there are no remaining renderer/world chunk-key string concatenation/parsing paths (`.. ',' ..`, `parseKey`, `key:match`) in `src/world/ChunkWorld.lua` and `src/render/ChunkRenderer.lua`.
+- Follow-up consistency cleanup in `src/world/ChunkWorld.lua`:
+  - internal call sites now use public `chunkKey(...)` / `decodeChunkKey(...)` wrappers instead of calling `:_chunkKey(...)` / `:_decodeChunkKey(...)` directly.
+  - private underscore helpers remain as canonical internal implementations behind those wrappers.
 
 ### Renderer Draw + Meshing Pipeline Updates
 - Added rollout toggles in `src/constants.lua`:

@@ -5,7 +5,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 ## Features
 
 - Fixed voxel world size: `1280 x 1280 x 64` (`X x Z x Y`)
-- Block types: grass, dirt, stone, bedrock, wood (tree), leaf
+- Block types: grass, dirt, stone, sand, water, bedrock, wood (tree), leaf
 - First-person character controller:
   - WASD movement
   - Mouse look
@@ -18,7 +18,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
   - 8 slots
   - Number keys and mouse wheel selection
 - Day/night cycle with animated sky color and sun/moon
-- Procedural base terrain + sparse edit/feature overlays (no eager per-voxel base storage)
+- Seeded procedural terrain (height + beaches + sea level) with sparse edit/feature overlays (no eager per-voxel base storage)
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling + mesh cache pruning
 - Main menu + pause menu with keyboard navigation
 - Single-slot save/load for world block edits (diff-based)

@@ -2,6 +2,29 @@
 
 ## 2026-02-15
 
+### World Gen Refresh (Seeded Terrain + Sand/Water)
+- Replaced the flat-layer generator in `src/world/ChunkWorld.lua` with seeded height-based terrain:
+  - deterministic value-noise/fBM sampling per world column using `WORLD_SEED`.
+  - terrain now derives per-column surface height, beach classification, and subsurface depth (dirt/sand over stone).
+  - added lazy per-column terrain caching (`_terrainColumnData`) to avoid recomputing noise every voxel lookup.
+- Added sea-level water fill and beaches:
+  - base terrain now emits sand near sea level and water for air gaps below sea level.
+  - spawn now uses center-column terrain and spawns above the higher of surface/sea level.
+- Updated feature generation for variable terrain:
+  - tree placement now uses per-column terrain surface checks (grass-only, water-buffer aware), instead of fixed `grassY`.
+- Added new world blocks in `src/constants.lua`:
+  - `SAND`
+  - `WATER`
+- Added block-behavior flags to support non-collidable rendered water:
+  - water uses `collidable = false` and `render = true`.
+  - `ChunkWorld:isSolidAt(...)` now respects optional `collidable` override.
+- Updated meshing/render rules for render-vs-collision separation:
+  - `ChunkRenderer` and `mesher_thread` now honor optional `render` on block info so non-collidable blocks can still be meshed.
+  - threaded block metadata now includes a `render` field.
+- Updated starting hotbar and docs:
+  - hotbar defaults now include sand and water.
+  - `README.md` feature/block list now reflects seeded terrain + sand/water support.
+
 ### Floodfill Pass 4 (Incremental Strip Queue + Spike Guard + HUD Telemetry)
 - Added incremental strip-task processing in `src/world/lighting/FloodfillLighting.lua`:
   - chunk-crossing region delta enqueue now schedules strip rows into a bounded per-frame task queue instead of immediately iterating all strip columns at crossing time.

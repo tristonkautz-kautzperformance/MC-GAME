@@ -37,6 +37,68 @@ local function mixColumnSeed(worldSeed, cx, cz)
   return state
 end
 
+local function lerp(a, b, t)
+  return a + (b - a) * t
+end
+
+local function smoothstep(t)
+  return t * t * (3 - 2 * t)
+end
+
+local function hashToUnit(seed, x, z)
+  local n = math.sin(
+    (x + seed * 0.00131) * 127.1
+      + (z - seed * 0.00173) * 311.7
+      + seed * 91.345
+  ) * 43758.5453123
+  return n - math.floor(n)
+end
+
+local function valueNoise2D(seed, x, z, frequency)
+  local fx = x * frequency
+  local fz = z * frequency
+  local x0 = math.floor(fx)
+  local z0 = math.floor(fz)
+  local tx = smoothstep(fx - x0)
+  local tz = smoothstep(fz - z0)
+
+  local n00 = hashToUnit(seed, x0, z0)
+  local n10 = hashToUnit(seed, x0 + 1, z0)
+  local n01 = hashToUnit(seed, x0, z0 + 1)
+  local n11 = hashToUnit(seed, x0 + 1, z0 + 1)
+
+  local nx0 = lerp(n00, n10, tx)
+  local nx1 = lerp(n01, n11, tx)
+  return lerp(nx0, nx1, tz) * 2 - 1
+end
+
+local function fbm2D(seed, x, z, octaves, baseFrequency, persistence)
+  local total = 0
+  local amplitude = 1
+  local frequency = baseFrequency
+  local norm = 0
+  local octaveCount = math.max(1, math.floor(tonumber(octaves) or 1))
+  local keep = tonumber(persistence) or 0.5
+  if keep < 0 then
+    keep = 0
+  elseif keep > 1 then
+    keep = 1
+  end
+
+  for i = 1, octaveCount do
+    local octaveSeed = seed + i * 1013
+    total = total + valueNoise2D(octaveSeed, x, z, frequency) * amplitude
+    norm = norm + amplitude
+    amplitude = amplitude * keep
+    frequency = frequency * 2
+  end
+
+  if norm <= 0 then
+    return 0
+  end
+  return total / norm
+end
+
 function ChunkWorld.new(constants)
   local self = setmetatable({}, ChunkWorld)
   self.constants = constants
@@ -57,17 +119,29 @@ function ChunkWorld.new(constants)
   self._featureColumnsPrepared = {}
   self._editCount = 0
 
-  self._genGrassY = 2
-  self._genStoneTop = 1
-  self._genDirtTop = 1
+  self._genSeaLevel = 20
+  self._genBaseHeight = 22
+  self._genTerrainAmplitude = 11
+  self._genDetailFrequency = 0.018
+  self._genDetailOctaves = 4
+  self._genDetailPersistence = 0.5
+  self._genContinentFrequency = 0.0035
+  self._genContinentAmplitude = 8
+  self._genBeachBand = 2
+  self._genDirtMinDepth = 2
+  self._genDirtMaxDepth = 4
+  self._genSandMinDepth = 2
+  self._genSandMaxDepth = 4
   self._treeTrunkMin = 3
   self._treeTrunkMax = 5
   self._treeLeafPad = 2
+  self._treeWaterBuffer = 1
   self._activeMinChunkY = 1
   self._activeMaxChunkY = self.chunksY
   self._chunkVolume = self.chunkSize * self.chunkSize * self.chunkSize
   self._worldStrideZ = self.sizeX
   self._worldStrideY = self.sizeX * self.sizeZ
+  self._terrainColumnData = {}
 
   self._lighting = constants.LIGHTING or {}
   self._lightingEnabled = self._lighting.enabled ~= false
@@ -303,33 +377,20 @@ function ChunkWorld:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
 end
 
 function ChunkWorld:_computeGenerationThresholds()
-  local bedrockY = 1
   local gen = self.constants.GEN or {}
-  local bedrockDepth = tonumber(gen.bedrockDepth) or 6
-  if bedrockDepth < 1 then
-    bedrockDepth = 1
-  end
-
-  local grassY = bedrockY + math.floor(bedrockDepth + 0.5)
-  if self.sizeY <= bedrockY then
-    grassY = bedrockY
-  else
-    grassY = clampInt(grassY, bedrockY + 1, self.sizeY)
-  end
-
-  local subsurfaceLayers = math.max(0, grassY - (bedrockY + 1))
-  local dirtFraction = tonumber(gen.dirtFraction) or (2 / 3)
-  if dirtFraction < 0 then dirtFraction = 0 end
-  if dirtFraction > 1 then dirtFraction = 1 end
-
-  local dirtLayers = math.floor(subsurfaceLayers * dirtFraction + 0.5)
-  dirtLayers = clampInt(dirtLayers, 0, subsurfaceLayers)
-  local stoneLayers = subsurfaceLayers - dirtLayers
-
-  local stoneTop = bedrockY
-  if grassY > bedrockY then
-    stoneTop = clampInt(bedrockY + stoneLayers, bedrockY, grassY - 1)
-  end
+  local seaLevel = math.floor(tonumber(gen.seaLevel) or 20)
+  local baseHeight = tonumber(gen.baseHeight) or 22
+  local terrainAmplitude = tonumber(gen.terrainAmplitude) or 11
+  local detailFrequency = tonumber(gen.detailFrequency) or 0.018
+  local detailOctaves = math.floor(tonumber(gen.detailOctaves) or 4)
+  local detailPersistence = tonumber(gen.detailPersistence) or 0.5
+  local continentFrequency = tonumber(gen.continentFrequency) or 0.0035
+  local continentAmplitude = tonumber(gen.continentAmplitude) or 8
+  local beachBand = math.floor(tonumber(gen.beachBand) or 2)
+  local dirtMinDepth = math.floor(tonumber(gen.dirtMinDepth) or 2)
+  local dirtMaxDepth = math.floor(tonumber(gen.dirtMaxDepth) or 4)
+  local sandMinDepth = math.floor(tonumber(gen.sandMinDepth) or 2)
+  local sandMaxDepth = math.floor(tonumber(gen.sandMaxDepth) or 4)
 
   local trunkMin = math.floor(tonumber(gen.treeTrunkMin) or 3)
   if trunkMin < 1 then
@@ -343,30 +404,96 @@ function ChunkWorld:_computeGenerationThresholds()
   if leafPad < 0 then
     leafPad = 0
   end
+  local treeWaterBuffer = math.floor(tonumber(gen.treeWaterBuffer) or 1)
+  if treeWaterBuffer < 0 then
+    treeWaterBuffer = 0
+  end
 
-  self._genGrassY = grassY
-  self._genStoneTop = stoneTop
-  self._genDirtTop = math.max(bedrockY, grassY - 1)
+  if seaLevel < 2 then
+    seaLevel = 2
+  elseif seaLevel > self.sizeY - 1 then
+    seaLevel = self.sizeY - 1
+  end
+  if detailFrequency <= 0 then
+    detailFrequency = 0.018
+  end
+  if detailOctaves < 1 then
+    detailOctaves = 1
+  elseif detailOctaves > 6 then
+    detailOctaves = 6
+  end
+  if detailPersistence < 0 then
+    detailPersistence = 0
+  elseif detailPersistence > 1 then
+    detailPersistence = 1
+  end
+  if continentFrequency <= 0 then
+    continentFrequency = 0.0035
+  end
+  if beachBand < 0 then
+    beachBand = 0
+  end
+  if dirtMinDepth < 1 then
+    dirtMinDepth = 1
+  end
+  if dirtMaxDepth < dirtMinDepth then
+    dirtMaxDepth = dirtMinDepth
+  end
+  if sandMinDepth < 1 then
+    sandMinDepth = 1
+  end
+  if sandMaxDepth < sandMinDepth then
+    sandMaxDepth = sandMinDepth
+  end
+
+  self._genSeaLevel = seaLevel
+  self._genBaseHeight = baseHeight
+  self._genTerrainAmplitude = terrainAmplitude
+  self._genDetailFrequency = detailFrequency
+  self._genDetailOctaves = detailOctaves
+  self._genDetailPersistence = detailPersistence
+  self._genContinentFrequency = continentFrequency
+  self._genContinentAmplitude = continentAmplitude
+  self._genBeachBand = beachBand
+  self._genDirtMinDepth = dirtMinDepth
+  self._genDirtMaxDepth = dirtMaxDepth
+  self._genSandMinDepth = sandMinDepth
+  self._genSandMaxDepth = sandMaxDepth
   self._treeTrunkMin = trunkMin
   self._treeTrunkMax = trunkMax
   self._treeLeafPad = leafPad
-  self.groundY = grassY
+  self._treeWaterBuffer = treeWaterBuffer
 
-  local maxFeatureY = grassY
+  local minSurface = math.floor(baseHeight - terrainAmplitude - continentAmplitude + 0.5)
+  if minSurface < 2 then
+    minSurface = 2
+  elseif minSurface > self.sizeY - 1 then
+    minSurface = self.sizeY - 1
+  end
+  local maxSurface = math.floor(baseHeight + terrainAmplitude + continentAmplitude + 0.5)
+  if maxSurface < 2 then
+    maxSurface = 2
+  elseif maxSurface > self.sizeY - 1 then
+    maxSurface = self.sizeY - 1
+  end
+  self.groundY = clampInt(math.floor(baseHeight + 0.5), minSurface, maxSurface)
+
+  local maxFeatureY = maxSurface
   local treeDensity = tonumber(self.constants.TREE_DENSITY) or 0
-  local treeRootY = grassY + 1
+  local treeRootY = maxSurface + 1
   if treeDensity > 0 and treeRootY <= self.sizeY then
     local treeTopY = treeRootY + trunkMax + leafPad
     local hardTop = self.sizeY - 2
     if hardTop < 1 then
       hardTop = self.sizeY
     end
-    if treeTopY > hardTop then
-      treeTopY = hardTop
-    end
+    treeTopY = math.min(treeTopY, hardTop)
     if treeTopY > maxFeatureY then
       maxFeatureY = treeTopY
     end
+  end
+  if seaLevel > maxFeatureY then
+    maxFeatureY = seaLevel
   end
 
   maxFeatureY = clampInt(maxFeatureY, 1, self.sizeY)
@@ -394,23 +521,103 @@ function ChunkWorld:_normalizeChunkYRange(minCy, maxCy)
   return minY, maxY
 end
 
+function ChunkWorld:_packTerrainColumnData(surfaceY, surfaceBlock, layerDepth)
+  return surfaceY + surfaceBlock * 128 + layerDepth * 32768
+end
+
+function ChunkWorld:_unpackTerrainColumnData(packed)
+  local layerDepth = math.floor(packed / 32768)
+  local rem = packed - layerDepth * 32768
+  local surfaceBlock = math.floor(rem / 128)
+  local surfaceY = rem - surfaceBlock * 128
+  return surfaceY, surfaceBlock, layerDepth
+end
+
+function ChunkWorld:_computeTerrainColumnData(x, z)
+  local seed = math.floor(tonumber(self.constants.WORLD_SEED) or 1)
+  local detail = fbm2D(
+    seed + 17,
+    x,
+    z,
+    self._genDetailOctaves,
+    self._genDetailFrequency,
+    self._genDetailPersistence
+  )
+  local continent = fbm2D(
+    seed + 7919,
+    x,
+    z,
+    2,
+    self._genContinentFrequency,
+    0.5
+  )
+
+  local rawHeight = self._genBaseHeight
+    + detail * self._genTerrainAmplitude
+    + continent * self._genContinentAmplitude
+  local surfaceY = clampInt(math.floor(rawHeight + 0.5), 2, self.sizeY - 1)
+
+  local blocks = self.constants.BLOCK
+  local beachMax = self._genSeaLevel + self._genBeachBand
+  local isBeach = surfaceY <= beachMax
+  local surfaceBlock = isBeach and blocks.SAND or blocks.GRASS
+  local depthMin = isBeach and self._genSandMinDepth or self._genDirtMinDepth
+  local depthMax = isBeach and self._genSandMaxDepth or self._genDirtMaxDepth
+  local depthRange = depthMax - depthMin + 1
+  if depthRange < 1 then
+    depthRange = 1
+  end
+  local depthNoise = hashToUnit(seed + 33391, x, z)
+  local layerDepth = depthMin + math.floor(depthNoise * depthRange)
+  if layerDepth > depthMax then
+    layerDepth = depthMax
+  end
+  if layerDepth > surfaceY - 1 then
+    layerDepth = surfaceY - 1
+  end
+
+  return self:_packTerrainColumnData(surfaceY, surfaceBlock, layerDepth)
+end
+
+function ChunkWorld:_getTerrainColumnData(x, z)
+  local key = self:_worldColumnKey(x, z)
+  local packed = self._terrainColumnData[key]
+  if packed == nil then
+    packed = self:_computeTerrainColumnData(x, z)
+    self._terrainColumnData[key] = packed
+  end
+  return self:_unpackTerrainColumnData(packed)
+end
+
 function ChunkWorld:_getBaseBlock(x, y, z)
   local blockIds = self.constants.BLOCK
   if not self:isInside(x, y, z) then
     return blockIds.AIR
   end
 
-  if y == 1 then
+  if y <= 1 then
     return blockIds.BEDROCK
   end
-  if y <= self._genStoneTop then
+
+  local surfaceY, surfaceBlock, layerDepth = self:_getTerrainColumnData(x, z)
+  if y <= surfaceY then
+    if y == surfaceY then
+      return surfaceBlock
+    end
+
+    local layerFloor = surfaceY - layerDepth
+    if y > layerFloor then
+      if surfaceBlock == blockIds.SAND then
+        return blockIds.SAND
+      end
+      return blockIds.DIRT
+    end
+
     return blockIds.STONE
   end
-  if y <= self._genDirtTop then
-    return blockIds.DIRT
-  end
-  if y == self._genGrassY then
-    return blockIds.GRASS
+
+  if y <= self._genSeaLevel then
+    return blockIds.WATER
   end
 
   return blockIds.AIR
@@ -760,7 +967,13 @@ end
 function ChunkWorld:isSolidAt(x, y, z)
   local block = self:get(x, y, z)
   local info = self.constants.BLOCK_INFO[block]
-  return info and info.solid or false
+  if not info then
+    return false
+  end
+  if info.collidable ~= nil then
+    return info.collidable and true or false
+  end
+  return info.solid and true or false
 end
 
 function ChunkWorld:isOpaque(block)
@@ -779,10 +992,19 @@ function ChunkWorld:isPlaceable(block)
 end
 
 function ChunkWorld:getSpawnPoint()
-  -- Center-ish, a couple blocks above the ground.
+  -- Center-ish, above whichever is higher: terrain surface or sea level.
   local x = math.floor(self.sizeX / 2) + 0.5
   local z = math.floor(self.sizeZ / 2) + 0.5
-  local y = (self.groundY or 7) + 3
+  local wx = math.floor(x) + 1
+  local wz = math.floor(z) + 1
+  local surfaceY = self.groundY or 7
+  if wx >= 1 and wx <= self.sizeX and wz >= 1 and wz <= self.sizeZ then
+    surfaceY = self:_getTerrainColumnData(wx, wz)
+  end
+  local y = math.max(surfaceY, self._genSeaLevel or 0) + 3
+  if y > self.sizeY - 1 then
+    y = self.sizeY - 1
+  end
   return x, y, z
 end
 
@@ -960,6 +1182,7 @@ function ChunkWorld:generate()
   self._editChunkCounts = {}
   self._featureChunks = {}
   self._featureColumnsPrepared = {}
+  self._terrainColumnData = {}
   self._editCount = 0
   self:_resetSkyLightData()
 end
@@ -1010,19 +1233,9 @@ function ChunkWorld:_prepareColumnFeatures(cx, cz)
     return
   end
 
-  local treeY = self._genGrassY + 1
-  if treeY < 1 or treeY > self.sizeY then
-    return
-  end
-
-  local treeCy = math.floor((treeY - 1) / cs) + 1
-  if treeCy < 1 or treeCy > self.chunksY then
-    return
-  end
-
-  local chunkTopY = treeCy * cs
   local rng = makeRng(mixColumnSeed(self.constants.WORLD_SEED, cx, cz))
   local grass = self.constants.BLOCK.GRASS
+  local waterSafeMinY = (self._genSeaLevel or 0) + (self._treeWaterBuffer or 0)
 
   for lz = minLocal, maxLocal do
     local wz = originZ + lz
@@ -1030,15 +1243,21 @@ function ChunkWorld:_prepareColumnFeatures(cx, cz)
       for lx = minLocal, maxLocal do
         local wx = originX + lx
         if wx <= self.sizeX and rng() < density then
-          if self:_getBaseBlock(wx, self._genGrassY, wz) == grass then
-            local trunkRange = self._treeTrunkMax - self._treeTrunkMin + 1
-            local trunkHeight = self._treeTrunkMin + math.floor(rng() * trunkRange)
-            if trunkHeight > self._treeTrunkMax then
-              trunkHeight = self._treeTrunkMax
-            end
-            local maxY = math.min(self.sizeY - 2, treeY + trunkHeight + self._treeLeafPad)
-            if maxY <= chunkTopY then
-              self:_placeTreeFeature(wx, treeY, wz, trunkHeight)
+          local surfaceY, surfaceBlock = self:_getTerrainColumnData(wx, wz)
+          if surfaceBlock == grass and surfaceY >= waterSafeMinY then
+            local treeY = surfaceY + 1
+            if treeY >= 1 and treeY <= self.sizeY then
+              local trunkRange = self._treeTrunkMax - self._treeTrunkMin + 1
+              local trunkHeight = self._treeTrunkMin + math.floor(rng() * trunkRange)
+              if trunkHeight > self._treeTrunkMax then
+                trunkHeight = self._treeTrunkMax
+              end
+              local maxY = math.min(self.sizeY - 2, treeY + trunkHeight + self._treeLeafPad)
+              local treeCy = math.floor((treeY - 1) / cs) + 1
+              local chunkTopY = treeCy * cs
+              if maxY <= chunkTopY then
+                self:_placeTreeFeature(wx, treeY, wz, trunkHeight)
+              end
             end
           end
         end

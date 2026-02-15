@@ -139,7 +139,14 @@ local function shouldDrawFace(block, neighbor, blockInfo, airBlock)
   end
 
   local info = blockInfo[block]
-  if not info or not info.solid then
+  if not info then
+    return false
+  end
+  local render = info.render
+  if render == nil then
+    render = info.solid and true or false
+  end
+  if not render then
     return false
   end
 
@@ -417,7 +424,11 @@ local function buildChunkNaive(job)
         local block = halo[index]
         if block ~= airBlock then
           local info = blockInfo[block]
-          if info and info.solid then
+          local render = info and info.render
+          if render == nil and info then
+            render = info.solid and true or false
+          end
+          if info and render then
             local color = info.color or {}
             local r = color[1] or 1
             local g = color[2] or 0

@@ -10,17 +10,28 @@ Constants.WORLD_CHUNKS_Y = math.ceil(Constants.WORLD_SIZE_Y / Constants.CHUNK_SI
 Constants.WORLD_CHUNKS_Z = math.ceil(Constants.WORLD_SIZE_Z / Constants.CHUNK_SIZE)
 
 Constants.WORLD_SEED = 1337
-Constants.TREE_DENSITY = 0.0175
+Constants.TREE_DENSITY = 0.014
 
--- World-gen tuning (flat-world baseline).
--- `bedrockDepth`: number of blocks from the grass layer down to bedrock (y=1).
--- For example, bedrockDepth=15 means grass at y=16 with bedrock at y=1.
+-- World-gen tuning.
+-- Heights are world Y block indices in [1..WORLD_SIZE_Y].
 Constants.GEN = {
-  bedrockDepth = 15,
-  dirtFraction = 2 / 3,
+  seaLevel = 20,
+  baseHeight = 22,
+  terrainAmplitude = 11,
+  detailFrequency = 0.018,
+  detailOctaves = 4,
+  detailPersistence = 0.5,
+  continentFrequency = 0.0035,
+  continentAmplitude = 8,
+  beachBand = 2,
+  dirtMinDepth = 2,
+  dirtMaxDepth = 4,
+  sandMinDepth = 2,
+  sandMaxDepth = 4,
   treeTrunkMin = 3,
   treeTrunkMax = 5,
-  treeLeafPad = 2
+  treeLeafPad = 2,
+  treeWaterBuffer = 1
 }
 
 Constants.DAY_LENGTH_SECONDS = 300
@@ -121,7 +132,9 @@ Constants.BLOCK = {
   STONE = 3,
   BEDROCK = 4,
   WOOD = 5,
-  LEAF = 6
+  LEAF = 6,
+  SAND = 7,
+  WATER = 8
 }
 
 Constants.BLOCK_INFO = {
@@ -194,6 +207,28 @@ Constants.BLOCK_INFO = {
     breakable = true,
     placeable = true,
     alpha = .92
+  },
+  [Constants.BLOCK.SAND] = {
+    name = 'Sand',
+    color = { .82, .76, .52 },
+    solid = true,
+    opaque = true,
+    lightOpacity = 15,
+    breakable = true,
+    placeable = true,
+    alpha = 1
+  },
+  [Constants.BLOCK.WATER] = {
+    name = 'Water',
+    color = { .22, .44, .88 },
+    solid = false,
+    collidable = false,
+    render = true,
+    opaque = false,
+    lightOpacity = 1,
+    breakable = true,
+    placeable = true,
+    alpha = .74
   }
 }
 
@@ -203,6 +238,8 @@ Constants.HOTBAR_DEFAULTS = {
   Constants.BLOCK.GRASS,
   Constants.BLOCK.DIRT,
   Constants.BLOCK.STONE,
+  Constants.BLOCK.SAND,
+  Constants.BLOCK.WATER,
   Constants.BLOCK.WOOD,
   Constants.BLOCK.LEAF
 }

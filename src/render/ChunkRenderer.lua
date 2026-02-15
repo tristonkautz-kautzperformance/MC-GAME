@@ -256,8 +256,13 @@ function ChunkRenderer:_buildThreadBlockInfo()
   local out = {}
   for blockId, info in pairs(src) do
     local color = info.color or {}
+    local render = info.render
+    if render == nil then
+      render = info.solid and true or false
+    end
     out[blockId] = {
       solid = info.solid and true or false,
+      render = render and true or false,
       opaque = info.opaque and true or false,
       alpha = info.alpha or 1,
       color = { color[1] or 1, color[2] or 0, color[3] or 1 }
@@ -782,6 +787,16 @@ local function isAir(constants, block)
   return block == constants.BLOCK.AIR
 end
 
+local function isRenderableBlockInfo(info)
+  if not info then
+    return false
+  end
+  if info.render ~= nil then
+    return info.render and true or false
+  end
+  return info.solid and true or false
+end
+
 local function clamp(value, minValue, maxValue)
   if value < minValue then
     return minValue
@@ -1151,7 +1166,7 @@ function ChunkRenderer:_shouldDrawFace(block, neighbor)
   end
 
   local info = constants.BLOCK_INFO[block]
-  if not info or not info.solid then
+  if not isRenderableBlockInfo(info) then
     return false, false
   end
 

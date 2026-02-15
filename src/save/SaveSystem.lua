@@ -2,7 +2,12 @@ local SaveSystem = {}
 SaveSystem.__index = SaveSystem
 
 local SAVE_DIR = 'saves'
-local SAVE_FILE = SAVE_DIR .. '/world_v1.txt'
+local SAVE_FILE = SAVE_DIR .. '/world_v2.txt'
+local SAVE_FILE_BACKUP = SAVE_DIR .. '/world_v2.bak'
+local SAVE_FILE_TEMP = SAVE_DIR .. '/world_v2.tmp'
+local SAVE_FILE_LEGACY = SAVE_DIR .. '/world_v1.txt'
+local SAVE_READ_ORDER = { SAVE_FILE, SAVE_FILE_BACKUP, SAVE_FILE_LEGACY }
+local SAVE_DELETE_ORDER = { SAVE_FILE_TEMP, SAVE_FILE_BACKUP, SAVE_FILE, SAVE_FILE_LEGACY }
 local SAVE_MAGIC_V1 = 'MC_SAVE_V1'
 local SAVE_MAGIC_V2 = 'MC_SAVE_V2'
 
@@ -321,6 +326,9 @@ end
 local function normalizeReadResult(a, b)
   local data = a
   if type(data) == 'boolean' then
+    if not data then
+      return nil
+    end
     data = b
   end
   if data and type(data) ~= 'string' and data.getString then
@@ -329,19 +337,86 @@ local function normalizeReadResult(a, b)
   return data
 end
 
+local function fileExists(filesystem, path)
+  if not filesystem then
+    return false
+  end
+
+  if filesystem.getInfo then
+    return filesystem.getInfo(path) ~= nil
+  end
+
+  if filesystem.read then
+    local data = normalizeReadResult(filesystem.read(path))
+    return type(data) == 'string'
+  end
+
+  return false
+end
+
+local function readFileString(filesystem, path)
+  if not filesystem or not filesystem.read then
+    return nil
+  end
+
+  local data = normalizeReadResult(filesystem.read(path))
+  if type(data) ~= 'string' then
+    return nil
+  end
+  return data
+end
+
+local function parseSaveFromData(saveSystem, data, constants, options)
+  if type(data) ~= 'string' or data == '' then
+    return nil, 'corrupt', buildErrorInfo(nil)
+  end
+
+  local lines = saveSystem._loadLinesScratch
+  clearArray(lines)
+  for line in data:gmatch('[^\r\n]+') do
+    lines[#lines + 1] = line
+  end
+  return parseSave(lines, constants, options)
+end
+
+local function parseFirstAvailableSave(saveSystem, filesystem, constants, options)
+  local sawAny = false
+  local firstErr = nil
+  local firstInfo = nil
+
+  for i = 1, #SAVE_READ_ORDER do
+    local path = SAVE_READ_ORDER[i]
+    if fileExists(filesystem, path) then
+      sawAny = true
+      local data = readFileString(filesystem, path)
+      local parsed, err, info = parseSaveFromData(saveSystem, data, constants, options)
+      if parsed then
+        return parsed, nil, nil, path
+      end
+
+      if not firstErr then
+        firstErr = err or 'corrupt'
+        firstInfo = info
+      end
+    end
+  end
+
+  if not sawAny then
+    return nil, 'missing', nil, nil
+  end
+  return nil, firstErr or 'corrupt', firstInfo, nil
+end
+
 function SaveSystem:exists()
   local filesystem = getFilesystem()
   if not filesystem then
     return false
   end
 
-  if filesystem.getInfo and filesystem.getInfo(SAVE_FILE) ~= nil then
-    return true
-  end
-
-  if filesystem.read then
-    local data = normalizeReadResult(filesystem.read(SAVE_FILE))
-    return type(data) == 'string' and data ~= ''
+  for i = 1, #SAVE_READ_ORDER do
+    if fileExists(filesystem, SAVE_READ_ORDER[i]) then
+      return true
+    end
   end
 
   return false
@@ -353,16 +428,18 @@ function SaveSystem:delete()
     return false
   end
 
-  if not self:exists() then
-    return true
+  local allRemoved = true
+  for i = 1, #SAVE_DELETE_ORDER do
+    local path = SAVE_DELETE_ORDER[i]
+    if fileExists(filesystem, path) then
+      local ok = filesystem.remove(path)
+      if not ok and fileExists(filesystem, path) then
+        allRemoved = false
+      end
+    end
   end
 
-  local ok = filesystem.remove(SAVE_FILE)
-  if ok then
-    return true
-  end
-
-  return filesystem.getInfo(SAVE_FILE) == nil
+  return allRemoved
 end
 
 function SaveSystem:save(world, constants, player, inventory, sky)
@@ -458,10 +535,60 @@ function SaveSystem:save(world, constants, player, inventory, sky)
   end
 
   local payload = table.concat(lines, '\n', 1, lineCount)
-  local ok = filesystem.write(SAVE_FILE, payload)
-  if ok == false or ok == nil then
+  local previousData = readFileString(filesystem, SAVE_FILE)
+
+  local wroteTemp = filesystem.write(SAVE_FILE_TEMP, payload)
+  if wroteTemp == false or wroteTemp == nil then
     return false, 'write_failed'
   end
+
+  local tempData = readFileString(filesystem, SAVE_FILE_TEMP)
+  if tempData ~= payload then
+    if filesystem.remove then
+      filesystem.remove(SAVE_FILE_TEMP)
+    end
+    return false, 'write_verify_failed'
+  end
+
+  if previousData ~= nil then
+    local wroteBackup = filesystem.write(SAVE_FILE_BACKUP, previousData)
+    if wroteBackup == false or wroteBackup == nil then
+      if filesystem.remove then
+        filesystem.remove(SAVE_FILE_TEMP)
+      end
+      return false, 'backup_write_failed'
+    end
+  end
+
+  local wrotePrimary = filesystem.write(SAVE_FILE, payload)
+  if wrotePrimary == false or wrotePrimary == nil then
+    if previousData ~= nil then
+      filesystem.write(SAVE_FILE, previousData)
+    end
+    if filesystem.remove then
+      filesystem.remove(SAVE_FILE_TEMP)
+    end
+    return false, 'write_failed'
+  end
+
+  local verifyData = readFileString(filesystem, SAVE_FILE)
+  if verifyData ~= payload then
+    if previousData ~= nil then
+      filesystem.write(SAVE_FILE, previousData)
+    end
+    if filesystem.remove then
+      filesystem.remove(SAVE_FILE_TEMP)
+    end
+    return false, 'write_verify_failed'
+  end
+
+  if filesystem.remove then
+    filesystem.remove(SAVE_FILE_TEMP)
+    if SAVE_FILE_LEGACY ~= SAVE_FILE and fileExists(filesystem, SAVE_FILE_LEGACY) then
+      filesystem.remove(SAVE_FILE_LEGACY)
+    end
+  end
+
   if editCount <= 0 then
     return true, 'saved_empty'
   end
@@ -476,22 +603,8 @@ function SaveSystem:load(constants)
   if not constants then
     return nil, 0, 'invalid_arguments'
   end
-  if not self:exists() then
-    return nil, 0, 'missing'
-  end
 
-  local data = normalizeReadResult(filesystem.read(SAVE_FILE))
-  if type(data) ~= 'string' or data == '' then
-    return nil, 0, 'corrupt'
-  end
-
-  local lines = self._loadLinesScratch
-  clearArray(lines)
-  for line in data:gmatch('[^\r\n]+') do
-    lines[#lines + 1] = line
-  end
-
-  local parsed, err = parseSave(lines, constants, {
+  local parsed, err = parseFirstAvailableSave(self, filesystem, constants, {
     includeEdits = true,
     includeInventory = true
   })
@@ -510,22 +623,8 @@ function SaveSystem:peek(constants)
   if not constants then
     return { ok = false, err = 'invalid_arguments' }
   end
-  if not self:exists() then
-    return { ok = false, err = 'missing' }
-  end
 
-  local data = normalizeReadResult(filesystem.read(SAVE_FILE))
-  if type(data) ~= 'string' or data == '' then
-    return { ok = false, err = 'corrupt' }
-  end
-
-  local lines = self._loadLinesScratch
-  clearArray(lines)
-  for line in data:gmatch('[^\r\n]+') do
-    lines[#lines + 1] = line
-  end
-
-  local parsed, err, info = parseSave(lines, constants, {
+  local parsed, err, info = parseFirstAvailableSave(self, filesystem, constants, {
     includeEdits = false,
     includeInventory = false
   })

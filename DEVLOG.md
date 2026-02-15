@@ -2,6 +2,18 @@
 
 ## 2026-02-15
 
+### Audit Hardening (Crash Path + Save Safety)
+- Removed a renderer crash path in `src/render/ChunkRenderer.lua`:
+  - synchronous mesh-apply failures no longer call `error(...)`.
+  - rebuild now returns `false` so the chunk stays in deferred/retry flow instead of terminating the game.
+- Hardened save persistence in `src/save/SaveSystem.lua`:
+  - moved primary save path to `saves/world_v2.txt` to match `MC_SAVE_V2` format.
+  - added temp + verification write flow using `saves/world_v2.tmp`.
+  - added backup file support (`saves/world_v2.bak`) before overwriting an existing primary save.
+  - load/peek now use fallback read order: primary -> backup -> legacy (`saves/world_v1.txt`).
+  - delete now removes all related save artifacts (temp/backup/primary/legacy).
+  - successful saves clean up legacy `world_v1.txt` after migration.
+
 ### World Gen Refresh (Seeded Terrain + Sand/Water)
 - Replaced the flat-layer generator in `src/world/ChunkWorld.lua` with seeded height-based terrain:
   - deterministic value-noise/fBM sampling per world column using `WORLD_SEED`.

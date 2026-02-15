@@ -1656,7 +1656,8 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
     self._useIndexedMeshing
   )
   if not okApply then
-    error(tostring(applyErr or 'mesh_apply_failed'))
+    self._meshWorkerError = tostring(applyErr or 'mesh_apply_failed')
+    return false
   end
   return true
 end

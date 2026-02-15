@@ -8,6 +8,7 @@ local Interaction = require 'src.interaction.Interaction'
 local HUD = require 'src.ui.HUD'
 local Sky = require 'src.sky.Sky'
 local ChunkRenderer = require 'src.render.ChunkRenderer'
+local VoxelShader = require 'src.render.VoxelShader'
 local SaveSystem = require 'src.save.SaveSystem'
 local MainMenu = require 'src.ui.MainMenu'
 
@@ -74,6 +75,8 @@ function GameState.new(constants)
   self.hud = nil
   self.sky = nil
   self.renderer = nil
+  self.voxelShader = nil
+  self._voxelShaderError = nil
 
   self.saveSystem = nil
   self.menu = nil
@@ -280,6 +283,8 @@ function GameState:_teardownSession()
     self.renderer:shutdown()
   end
   self.renderer = nil
+  self.voxelShader = nil
+  self._voxelShaderError = nil
   self._autosaveTimer = 0
   self._chunkDirtyRadius = 0
   self._activeMinChunkY = 1
@@ -380,6 +385,14 @@ function GameState:_startSession(loadSave)
     self.sky:setTime(savedTimeOfDay)
   end
   self.renderer = ChunkRenderer.new(self.constants, self.world)
+  local okShader, shaderOrErr = pcall(VoxelShader.new)
+  if okShader then
+    self.voxelShader = shaderOrErr
+    self._voxelShaderError = nil
+  else
+    self.voxelShader = nil
+    self._voxelShaderError = tostring(shaderOrErr)
+  end
 
   local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
   self.renderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
@@ -657,6 +670,9 @@ function GameState:_updateGame(dt)
   end
 
   self:_updateAutosave(dt)
+  if self.world and self.world.updateSkyLight then
+    self.world:updateSkyLight()
+  end
   self.renderer:rebuildDirty(self.rebuildMaxPerFrame, self.rebuildMaxMillisPerFrame)
   self.input:beginFrame()
 end
@@ -707,7 +723,7 @@ function GameState:draw(pass)
   pass:setViewPose(1, self._cameraPosition, cameraOrientation)
 
   self.sky:draw(pass)
-  self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
+  self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, self.voxelShader, self.sky.timeOfDay)
   self.interaction:drawOutline(pass)
 
   local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
@@ -720,6 +736,8 @@ function GameState:draw(pass)
     timeOfDay = self.sky.timeOfDay,
     targetName = self.interaction:getTargetName(),
     mouseStatusText = self.mouseLock:getStatusText(),
+    lightingMode = (self.constants.LIGHTING and self.constants.LIGHTING.mode) or 'off',
+    shaderStatusText = self.voxelShader and string.format('On (SkySub %d)', self.voxelShader:getSkySubtract()) or ('Off: ' .. tostring(self._voxelShaderError or 'unavailable')),
     saveStatusText = self._saveStatusText,
     saveStatusTimer = self._saveStatusTimer,
     relativeMouseReady = self.relativeMouseReady,

@@ -47,6 +47,8 @@ function HUD:_rebuildHudText(state)
   lines[count] = string.format('Mouse: %s  |  Relative: %s', state.mouseStatusText or 'Unknown', state.relativeMouseReady and 'Yes' or 'No')
   count = count + 1
   lines[count] = string.format('Mesh: %s', state.meshingMode or 'Unknown')
+  count = count + 1
+  lines[count] = string.format('Light: %s  |  Shader: %s', state.lightingMode or 'off', state.shaderStatusText or 'Unknown')
 
   if state.showPerfHud ~= false then
     count = count + 1

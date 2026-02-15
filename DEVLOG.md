@@ -2,6 +2,38 @@
 
 ## 2026-02-14
 
+### Alpha Skylight Lighting Pass
+- Added configurable skylight settings in `src/constants.lua`:
+  - new `Constants.LIGHTING` (`enabled`, `mode`, `leafOpacity`, flood update budgets, debug flags)
+  - default mode is `vertical` for hitch-safe baseline; `floodfill` is available via config toggle
+  - per-block `lightOpacity` values in `BLOCK_INFO` (leaf opacity is tunable via lighting config)
+- Implemented chunked skylight storage and APIs in `src/world/ChunkWorld.lua`:
+  - `getSkyLight(x, y, z)`
+  - `fillSkyLightHalo(cx, cy, cz, out)` with `(chunkSize + 2)^3` layout matching block halos
+  - `ensureSkyLightForChunk(cx, cy, cz)`
+  - `updateSkyLight(maxOps, maxMillis)` for incremental flood-fill queue processing
+  - `pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)` tied to renderer keep radius
+- Added vertical skylight scan (0..15) and flood-fill propagation mode:
+  - vertical top-down attenuation uses per-block `lightOpacity` (including partial leaf attenuation)
+  - flood-fill propagation runs in budgeted incremental steps with O(1) queue head/tail
+  - block edits that change opacity now trigger skylight invalidation/rebuild scheduling and wider dirty marking in X/Z lighting influence range
+- Wired renderer/mesher skylight data flow:
+  - `ChunkRenderer` now builds a second skylight halo payload for both sync and threaded meshing paths
+  - threaded jobs now support `skyHaloBlob` / `skyHalo` payloads in addition to block halos
+  - `mesher_thread.lua` decodes block and sky halos into separate scratch buffers (prevents alias overwrite)
+  - greedy meshing merge keys now include skylight (`blockId * 16 + sky`) to prevent light-smear quads
+- Added `VertexLight` mesh attribute and new voxel shader:
+  - vertex format extended to include per-face skylight scalar
+  - new `src/render/VoxelShader.lua` applies classic alpha-style face shading + 16-step brightness LUT
+  - shader supports day/night skylight subtraction via `uSkySubtract`
+  - fixed shader input declaration for custom mesh attribute (`in float VertexLight;`) for LOVR custom-attribute binding
+- Integrated lighting update and shader draw flow in `src/game/GameState.lua`:
+  - `world:updateSkyLight(...)` now runs each frame before `renderer:rebuildDirty(...)`
+  - voxel shader is applied for chunk rendering pass so both opaque and alpha chunk meshes use skylight + day/night modulation
+  - HUD now shows lighting mode and shader runtime status (`On` with sky-subtract value, or shader compile error text when unavailable)
+- Skylight cache pruning is now coordinated with mesh pruning:
+  - `ChunkRenderer:setPriorityOriginWorld(...)` now calls `world:pruneSkyLightChunks(...)` with the current keep radius
+
 ### Audit Results #2 Follow-up
 - Removed per-frame camera/view allocations:
   - `src/game/GameState.lua` now reuses a persistent `lovr.math.newVec3` (`self._cameraPosition`) for `pass:setViewPose(...)`.

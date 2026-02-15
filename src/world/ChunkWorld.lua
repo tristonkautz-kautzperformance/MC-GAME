@@ -4,6 +4,10 @@ ChunkWorld.__index = ChunkWorld
 local EMPTY_DIRTY_KEYS = {}
 local RNG_MOD = 2147483648
 local COLUMN_SEED_MOD = 2147483647
+local hasFfi, ffi = pcall(require, 'ffi')
+if not hasFfi then
+  ffi = nil
+end
 
 local function clampInt(v, a, b)
   if v < a then return a end
@@ -63,7 +67,38 @@ function ChunkWorld.new(constants)
   self._treeLeafPad = 2
   self._activeMinChunkY = 1
   self._activeMaxChunkY = self.chunksY
+  self._chunkVolume = self.chunkSize * self.chunkSize * self.chunkSize
+  self._worldStrideZ = self.sizeX
+  self._worldStrideY = self.sizeX * self.sizeZ
 
+  self._lighting = constants.LIGHTING or {}
+  self._lightingEnabled = self._lighting.enabled ~= false
+  self._lightingMode = self._lighting.mode == 'floodfill' and 'floodfill' or 'vertical'
+  self._lightOpacityByBlock = {}
+  self._skyLightChunks = {}
+  self._skyColumnsReady = {}
+  self._skyColumnsQueue = {}
+  self._skyColumnsQueueSet = {}
+  self._skyColumnsQueueHead = 1
+  self._skyColumnsQueueTail = 0
+  self._skyFloodQueue = {}
+  self._skyFloodQueueHead = 1
+  self._skyFloodQueueTail = 0
+  self._skyStage = 'idle'
+  self._skyTrackDirty = false
+  self._skyCenterCx = 1
+  self._skyCenterCz = 1
+  self._skyKeepRadius = 0
+  self._skyActiveMinCx = 1
+  self._skyActiveMaxCx = 0
+  self._skyActiveMinCz = 1
+  self._skyActiveMaxCz = 0
+  self._skyActiveMinX = 1
+  self._skyActiveMaxX = 0
+  self._skyActiveMinZ = 1
+  self._skyActiveMaxZ = 0
+
+  self:_initLighting()
   self:_computeGenerationThresholds()
 
   return self
@@ -114,6 +149,681 @@ end
 
 function ChunkWorld:_columnKey(cx, cz)
   return cx + (cz - 1) * self.chunksX
+end
+
+function ChunkWorld:_worldColumnKey(x, z)
+  return x + (z - 1) * self.sizeX
+end
+
+function ChunkWorld:_decodeWorldColumnKey(columnKey)
+  local zeroBased = columnKey - 1
+  local z = math.floor(zeroBased / self.sizeX) + 1
+  local x = (zeroBased % self.sizeX) + 1
+  return x, z
+end
+
+function ChunkWorld:_worldIndex(x, y, z)
+  return x + (z - 1) * self._worldStrideZ + (y - 1) * self._worldStrideY
+end
+
+function ChunkWorld:_decodeWorldIndex(index)
+  local zeroBased = index - 1
+  local x = (zeroBased % self.sizeX) + 1
+  zeroBased = math.floor(zeroBased / self.sizeX)
+  local z = (zeroBased % self.sizeZ) + 1
+  local y = math.floor(zeroBased / self.sizeZ) + 1
+  return x, y, z
+end
+
+function ChunkWorld:_initLighting()
+  local lighting = self._lighting or {}
+  local leafOpacity = math.floor(tonumber(lighting.leafOpacity) or 2)
+  if leafOpacity < 0 then
+    leafOpacity = 0
+  elseif leafOpacity > 15 then
+    leafOpacity = 15
+  end
+
+  local blockInfo = self.constants.BLOCK_INFO or {}
+  local AIR = self.constants.BLOCK and self.constants.BLOCK.AIR or 0
+  local LEAF = self.constants.BLOCK and self.constants.BLOCK.LEAF or -1
+
+  for blockId, info in pairs(blockInfo) do
+    local opacity = tonumber(info.lightOpacity)
+    if opacity == nil then
+      if blockId == AIR then
+        opacity = 0
+      elseif blockId == LEAF then
+        opacity = leafOpacity
+      elseif info.opaque then
+        opacity = 15
+      else
+        opacity = 0
+      end
+    end
+    opacity = math.floor(opacity + 0.5)
+    if opacity < 0 then
+      opacity = 0
+    elseif opacity > 15 then
+      opacity = 15
+    end
+    self._lightOpacityByBlock[blockId] = opacity
+  end
+
+  self:_resetSkyLightData()
+end
+
+function ChunkWorld:_resetSkyLightData()
+  self._skyLightChunks = {}
+  self._skyColumnsReady = {}
+  self._skyColumnsQueue = {}
+  self._skyColumnsQueueSet = {}
+  self._skyColumnsQueueHead = 1
+  self._skyColumnsQueueTail = 0
+  self._skyFloodQueue = {}
+  self._skyFloodQueueHead = 1
+  self._skyFloodQueueTail = 0
+  self._skyStage = 'idle'
+  self._skyTrackDirty = false
+  self._skyCenterCx = 1
+  self._skyCenterCz = 1
+  self._skyKeepRadius = 0
+  self._skyActiveMinCx = 1
+  self._skyActiveMaxCx = 0
+  self._skyActiveMinCz = 1
+  self._skyActiveMaxCz = 0
+  self._skyActiveMinX = 1
+  self._skyActiveMaxX = 0
+  self._skyActiveMinZ = 1
+  self._skyActiveMaxZ = 0
+end
+
+function ChunkWorld:_getBlockLightOpacity(block)
+  local value = self._lightOpacityByBlock[block]
+  if value == nil then
+    return 0
+  end
+  return value
+end
+
+function ChunkWorld:_newSkyChunkData()
+  if ffi then
+    return ffi.new('uint8_t[?]', self._chunkVolume)
+  end
+  local data = {}
+  for i = 1, self._chunkVolume do
+    data[i] = 0
+  end
+  return data
+end
+
+function ChunkWorld:_getSkyChunk(chunkKey, create)
+  local chunk = self._skyLightChunks[chunkKey]
+  if chunk or not create then
+    return chunk
+  end
+
+  chunk = self:_newSkyChunkData()
+  self._skyLightChunks[chunkKey] = chunk
+  return chunk
+end
+
+function ChunkWorld:_getSkyChunkValue(chunk, localIndex)
+  if not chunk then
+    return 0
+  end
+  if ffi then
+    return chunk[localIndex - 1]
+  end
+  local value = chunk[localIndex]
+  if value == nil then
+    return 0
+  end
+  return value
+end
+
+function ChunkWorld:_setSkyChunkValue(chunk, localIndex, value)
+  if ffi then
+    chunk[localIndex - 1] = value
+  else
+    chunk[localIndex] = value
+  end
+end
+
+function ChunkWorld:_getSkyLightWorld(x, y, z)
+  if x < 1 or x > self.sizeX or z < 1 or z > self.sizeZ then
+    return 0
+  end
+  if y > self.sizeY then
+    return 15
+  end
+  if y < 1 then
+    return 0
+  end
+
+  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+  local chunkKey = self:chunkKey(cx, cy, cz)
+  local chunk = self._skyLightChunks[chunkKey]
+  if not chunk then
+    return 0
+  end
+
+  local localIndex = self:_localIndex(lx, ly, lz)
+  return self:_getSkyChunkValue(chunk, localIndex)
+end
+
+function ChunkWorld:_setSkyLightWorld(x, y, z, value, markDirty)
+  if not self:isInside(x, y, z) then
+    return false
+  end
+
+  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+  local chunkKey = self:chunkKey(cx, cy, cz)
+  local chunk = self:_getSkyChunk(chunkKey, true)
+  local localIndex = self:_localIndex(lx, ly, lz)
+  local oldValue = self:_getSkyChunkValue(chunk, localIndex)
+  if oldValue == value then
+    return false
+  end
+
+  self:_setSkyChunkValue(chunk, localIndex, value)
+  if markDirty then
+    self:_markDirty(cx, cy, cz)
+  end
+  return true
+end
+
+function ChunkWorld:getSkyLight(x, y, z)
+  if not self._lightingEnabled then
+    return 15
+  end
+
+  if y > self.sizeY and x >= 1 and x <= self.sizeX and z >= 1 and z <= self.sizeZ then
+    return 15
+  end
+  if not self:isInside(x, y, z) then
+    return 0
+  end
+
+  self:_ensureSkyColumnReady(x, z, false, false)
+  return self:_getSkyLightWorld(x, y, z)
+end
+
+function ChunkWorld:_enqueueSkyColumn(columnKey)
+  if self._skyColumnsQueueSet[columnKey] then
+    return false
+  end
+
+  local tail = self._skyColumnsQueueTail + 1
+  self._skyColumnsQueueTail = tail
+  self._skyColumnsQueue[tail] = columnKey
+  self._skyColumnsQueueSet[columnKey] = true
+  return true
+end
+
+function ChunkWorld:_dequeueSkyColumn()
+  local head = self._skyColumnsQueueHead
+  local tail = self._skyColumnsQueueTail
+  if head > tail then
+    return nil
+  end
+
+  local columnKey = self._skyColumnsQueue[head]
+  self._skyColumnsQueue[head] = nil
+  self._skyColumnsQueueHead = head + 1
+  if columnKey ~= nil then
+    self._skyColumnsQueueSet[columnKey] = nil
+  end
+
+  if self._skyColumnsQueueHead > self._skyColumnsQueueTail then
+    self._skyColumnsQueueHead = 1
+    self._skyColumnsQueueTail = 0
+  end
+
+  return columnKey
+end
+
+function ChunkWorld:_clearSkyColumnsQueue()
+  local queue = self._skyColumnsQueue
+  for i = self._skyColumnsQueueHead, self._skyColumnsQueueTail do
+    queue[i] = nil
+  end
+  self._skyColumnsQueueHead = 1
+  self._skyColumnsQueueTail = 0
+  for columnKey in pairs(self._skyColumnsQueueSet) do
+    self._skyColumnsQueueSet[columnKey] = nil
+  end
+end
+
+function ChunkWorld:_enqueueSkyFlood(worldIndex)
+  local tail = self._skyFloodQueueTail + 1
+  self._skyFloodQueueTail = tail
+  self._skyFloodQueue[tail] = worldIndex
+end
+
+function ChunkWorld:_dequeueSkyFlood()
+  local head = self._skyFloodQueueHead
+  local tail = self._skyFloodQueueTail
+  if head > tail then
+    return nil
+  end
+
+  local worldIndex = self._skyFloodQueue[head]
+  self._skyFloodQueue[head] = nil
+  self._skyFloodQueueHead = head + 1
+  if self._skyFloodQueueHead > self._skyFloodQueueTail then
+    self._skyFloodQueueHead = 1
+    self._skyFloodQueueTail = 0
+  end
+  return worldIndex
+end
+
+function ChunkWorld:_clearSkyFloodQueue()
+  local queue = self._skyFloodQueue
+  for i = self._skyFloodQueueHead, self._skyFloodQueueTail do
+    queue[i] = nil
+  end
+  self._skyFloodQueueHead = 1
+  self._skyFloodQueueTail = 0
+end
+
+function ChunkWorld:_isInsideSkyActiveWorldXZ(x, z)
+  return x >= self._skyActiveMinX
+    and x <= self._skyActiveMaxX
+    and z >= self._skyActiveMinZ
+    and z <= self._skyActiveMaxZ
+end
+
+function ChunkWorld:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
+  if x < 1 or x > self.sizeX or z < 1 or z > self.sizeZ then
+    return false
+  end
+
+  local columnKey = self:_worldColumnKey(x, z)
+  local light = 15
+
+  for y = self.sizeY, 1, -1 do
+    local block = self:get(x, y, z)
+    local opacity = self:_getBlockLightOpacity(block)
+    light = light - opacity
+    if light < 0 then
+      light = 0
+    end
+
+    self:_setSkyLightWorld(x, y, z, light, markDirty)
+    if enqueueFlood and light > 0 then
+      self:_enqueueSkyFlood(self:_worldIndex(x, y, z))
+    end
+
+    if light == 0 and opacity >= 15 then
+      for clearY = y - 1, 1, -1 do
+        self:_setSkyLightWorld(x, clearY, z, 0, markDirty)
+      end
+      break
+    end
+  end
+
+  self._skyColumnsReady[columnKey] = true
+  return true
+end
+
+function ChunkWorld:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty)
+  if x < 1 or x > self.sizeX or z < 1 or z > self.sizeZ then
+    return false
+  end
+
+  local columnKey = self:_worldColumnKey(x, z)
+  if self._skyColumnsReady[columnKey] then
+    return true
+  end
+
+  return self:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
+end
+
+function ChunkWorld:_ensureSkyHaloColumns(cx, cz, enqueueFlood, markDirty)
+  local cs = self.chunkSize
+  local minX = (cx - 1) * cs
+  local maxX = cx * cs + 1
+  local minZ = (cz - 1) * cs
+  local maxZ = cz * cs + 1
+
+  for z = minZ, maxZ do
+    if z >= 1 and z <= self.sizeZ then
+      for x = minX, maxX do
+        if x >= 1 and x <= self.sizeX then
+          self:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty)
+        end
+      end
+    end
+  end
+end
+
+function ChunkWorld:_markLightingDirtyRadius(cx, cz)
+  local radius = math.ceil(15 / self.chunkSize)
+  if radius < 0 then
+    radius = 0
+  end
+
+  local minX = clampInt(cx - radius, 1, self.chunksX)
+  local maxX = clampInt(cx + radius, 1, self.chunksX)
+  local minZ = clampInt(cz - radius, 1, self.chunksZ)
+  local maxZ = clampInt(cz + radius, 1, self.chunksZ)
+
+  for markCz = minZ, maxZ do
+    for markCx = minX, maxX do
+      for markCy = 1, self.chunksY do
+        self:_markDirty(markCx, markCy, markCz)
+      end
+    end
+  end
+end
+
+function ChunkWorld:_scheduleSkyRegionRebuild(trackDirty)
+  if not self._lightingEnabled or self._lightingMode ~= 'floodfill' then
+    return
+  end
+  if self._skyActiveMaxX < self._skyActiveMinX or self._skyActiveMaxZ < self._skyActiveMinZ then
+    return
+  end
+
+  self:_clearSkyColumnsQueue()
+  self:_clearSkyFloodQueue()
+
+  for z = self._skyActiveMinZ, self._skyActiveMaxZ do
+    for x = self._skyActiveMinX, self._skyActiveMaxX do
+      local columnKey = self:_worldColumnKey(x, z)
+      self._skyColumnsReady[columnKey] = nil
+      self:_enqueueSkyColumn(columnKey)
+    end
+  end
+
+  if self._skyColumnsQueueTail >= self._skyColumnsQueueHead then
+    self._skyStage = 'vertical'
+  else
+    self._skyStage = 'flood'
+  end
+  self._skyTrackDirty = trackDirty and true or false
+end
+
+function ChunkWorld:_onSkyOpacityChanged(x, z, cx, cz)
+  if not self._lightingEnabled then
+    return
+  end
+
+  self._skyColumnsReady[self:_worldColumnKey(x, z)] = nil
+  self:_markLightingDirtyRadius(cx, cz)
+
+  if self._lightingMode == 'floodfill' then
+    self:_scheduleSkyRegionRebuild(true)
+  else
+    self:_recomputeSkyColumn(x, z, false, false)
+  end
+end
+
+function ChunkWorld:ensureSkyLightForChunk(cx, cy, cz)
+  if not self._lightingEnabled then
+    return true
+  end
+  if cx < 1 or cx > self.chunksX
+    or cy < 1 or cy > self.chunksY
+    or cz < 1 or cz > self.chunksZ then
+    return false
+  end
+
+  self:prepareChunk(cx, cy, cz)
+  self:_ensureSkyHaloColumns(cx, cz, false, false)
+  return true
+end
+
+function ChunkWorld:fillSkyLightHalo(cx, cy, cz, out)
+  if not out then
+    return nil
+  end
+
+  if not self._lightingEnabled then
+    local cs = self.chunkSize
+    local haloSize = cs + 2
+    local required = haloSize * haloSize * haloSize
+    for i = 1, required do
+      out[i] = 15
+    end
+    for i = required + 1, #out do
+      out[i] = nil
+    end
+    return out
+  end
+
+  local cs = self.chunkSize
+  self:_ensureSkyHaloColumns(cx, cz, false, false)
+  local haloSize = cs + 2
+  local strideZ = haloSize
+  local strideY = haloSize * haloSize
+  local baseOriginX = (cx - 1) * cs
+  local baseOriginY = (cy - 1) * cs
+  local baseOriginZ = (cz - 1) * cs
+
+  for hy = 0, cs + 1 do
+    local wy = baseOriginY + hy
+    local syBase = (hy * strideY) + 1
+
+    for hz = 0, cs + 1 do
+      local wz = baseOriginZ + hz
+      local szBase = syBase + (hz * strideZ)
+
+      for hx = 0, cs + 1 do
+        local wx = baseOriginX + hx
+        local index = szBase + hx
+
+        if wx < 1 or wx > self.sizeX or wz < 1 or wz > self.sizeZ or wy < 1 then
+          out[index] = 0
+        elseif wy > self.sizeY then
+          out[index] = 15
+        else
+          out[index] = self:_getSkyLightWorld(wx, wy, wz)
+        end
+      end
+    end
+  end
+
+  local required = haloSize * haloSize * haloSize
+  for i = required + 1, #out do
+    out[i] = nil
+  end
+  return out
+end
+
+function ChunkWorld:_propagateSkyFloodFrom(worldIndex, markDirty)
+  local x, y, z = self:_decodeWorldIndex(worldIndex)
+  local sourceLight = self:_getSkyLightWorld(x, y, z)
+  if sourceLight <= 1 then
+    return
+  end
+
+  local function tryNeighbor(nx, ny, nz)
+    if ny < 1 or ny > self.sizeY then
+      return
+    end
+    if not self:_isInsideSkyActiveWorldXZ(nx, nz) then
+      return
+    end
+
+    local block = self:get(nx, ny, nz)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+    local candidate = sourceLight - step
+    if candidate <= 0 then
+      return
+    end
+
+    local neighborLight = self:_getSkyLightWorld(nx, ny, nz)
+    if candidate > neighborLight then
+      self:_setSkyLightWorld(nx, ny, nz, candidate, markDirty)
+      self:_enqueueSkyFlood(self:_worldIndex(nx, ny, nz))
+    end
+  end
+
+  tryNeighbor(x - 1, y, z)
+  tryNeighbor(x + 1, y, z)
+  tryNeighbor(x, y - 1, z)
+  tryNeighbor(x, y + 1, z)
+  tryNeighbor(x, y, z - 1)
+  tryNeighbor(x, y, z + 1)
+end
+
+function ChunkWorld:updateSkyLight(maxOps, maxMillis)
+  if not self._lightingEnabled then
+    return 0
+  end
+  if self._lightingMode ~= 'floodfill' then
+    return 0
+  end
+
+  if self._skyStage ~= 'vertical' and self._skyStage ~= 'flood' then
+    return 0
+  end
+
+  local config = self._lighting or {}
+  local opsLimit = tonumber(maxOps)
+  if opsLimit == nil then
+    opsLimit = tonumber(config.maxUpdatesPerFrame)
+  end
+  if opsLimit ~= nil then
+    opsLimit = math.floor(opsLimit)
+    if opsLimit < 0 then
+      opsLimit = 0
+    end
+  end
+
+  local millisLimit = tonumber(maxMillis)
+  if millisLimit == nil then
+    millisLimit = tonumber(config.maxMillisPerFrame)
+  end
+
+  local hasTimer = lovr and lovr.timer and lovr.timer.getTime
+  local useTimeBudget = hasTimer and millisLimit and millisLimit > 0
+  local startTime = 0
+  if useTimeBudget then
+    startTime = lovr.timer.getTime()
+  end
+  if (not opsLimit or opsLimit <= 0) and not useTimeBudget then
+    opsLimit = 1
+  end
+
+  local processed = 0
+  while true do
+    if opsLimit and opsLimit > 0 and processed >= opsLimit then
+      break
+    end
+    if useTimeBudget and processed > 0 then
+      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+      if elapsedMs >= millisLimit then
+        break
+      end
+    end
+
+    if self._skyStage == 'vertical' then
+      local columnKey = self:_dequeueSkyColumn()
+      if not columnKey then
+        self._skyStage = 'flood'
+      else
+        if not self._skyColumnsReady[columnKey] then
+          local x, z = self:_decodeWorldColumnKey(columnKey)
+          self:_recomputeSkyColumn(x, z, true, self._skyTrackDirty)
+        end
+        processed = processed + 1
+      end
+    elseif self._skyStage == 'flood' then
+      local worldIndex = self:_dequeueSkyFlood()
+      if not worldIndex then
+        self._skyStage = 'idle'
+        self._skyTrackDirty = false
+        break
+      end
+      self:_propagateSkyFloodFrom(worldIndex, self._skyTrackDirty)
+      processed = processed + 1
+    else
+      break
+    end
+  end
+
+  return processed
+end
+
+function ChunkWorld:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)
+  if not self._lightingEnabled then
+    return 0
+  end
+
+  local cx = clampInt(math.floor(tonumber(centerCx) or 1), 1, self.chunksX)
+  local cz = clampInt(math.floor(tonumber(centerCz) or 1), 1, self.chunksZ)
+  local keepRadius = math.floor(tonumber(keepRadiusChunks) or 0)
+  if keepRadius < 0 then
+    keepRadius = 0
+  end
+
+  local extraRadius = 0
+  if self._lightingMode == 'floodfill' then
+    extraRadius = math.floor(tonumber(self._lighting.floodfillExtraKeepRadiusChunks) or 1)
+    if extraRadius < 0 then
+      extraRadius = 0
+    end
+  end
+
+  local radius = keepRadius + extraRadius
+  local minCx = clampInt(cx - radius, 1, self.chunksX)
+  local maxCx = clampInt(cx + radius, 1, self.chunksX)
+  local minCz = clampInt(cz - radius, 1, self.chunksZ)
+  local maxCz = clampInt(cz + radius, 1, self.chunksZ)
+
+  local regionChanged = cx ~= self._skyCenterCx
+    or cz ~= self._skyCenterCz
+    or radius ~= self._skyKeepRadius
+    or minCx ~= self._skyActiveMinCx
+    or maxCx ~= self._skyActiveMaxCx
+    or minCz ~= self._skyActiveMinCz
+    or maxCz ~= self._skyActiveMaxCz
+
+  self._skyCenterCx = cx
+  self._skyCenterCz = cz
+  self._skyKeepRadius = radius
+  self._skyActiveMinCx = minCx
+  self._skyActiveMaxCx = maxCx
+  self._skyActiveMinCz = minCz
+  self._skyActiveMaxCz = maxCz
+  self._skyActiveMinX = (minCx - 1) * self.chunkSize + 1
+  self._skyActiveMaxX = math.min(maxCx * self.chunkSize, self.sizeX)
+  self._skyActiveMinZ = (minCz - 1) * self.chunkSize + 1
+  self._skyActiveMaxZ = math.min(maxCz * self.chunkSize, self.sizeZ)
+
+  local removed = 0
+  for chunkKey, _ in pairs(self._skyLightChunks) do
+    local chunkX, _, chunkZ = self:decodeChunkKey(chunkKey)
+    local dx = math.abs(chunkX - cx)
+    local dz = math.abs(chunkZ - cz)
+    local dist = dx
+    if dz > dist then
+      dist = dz
+    end
+    if dist > radius then
+      self._skyLightChunks[chunkKey] = nil
+      removed = removed + 1
+    end
+  end
+
+  for columnKey, _ in pairs(self._skyColumnsReady) do
+    local x, z = self:_decodeWorldColumnKey(columnKey)
+    if x < self._skyActiveMinX or x > self._skyActiveMaxX or z < self._skyActiveMinZ or z > self._skyActiveMaxZ then
+      self._skyColumnsReady[columnKey] = nil
+    end
+  end
+
+  if regionChanged and self._lightingMode == 'floodfill' then
+    self:_scheduleSkyRegionRebuild(false)
+  end
+
+  return removed
 end
 
 function ChunkWorld:_markDirty(cx, cy, cz)
@@ -442,6 +1152,8 @@ function ChunkWorld:set(x, y, z, value)
   if oldValue == value then
     return true
   end
+  local oldOpacity = self:_getBlockLightOpacity(oldValue)
+  local newOpacity = self:_getBlockLightOpacity(value)
 
   local baseValue = self:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
   local editChunk = self._editChunks[chunkKey]
@@ -477,6 +1189,10 @@ function ChunkWorld:set(x, y, z, value)
 
   self:_markDirty(cx, cy, cz)
   self:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
+
+  if oldOpacity ~= newOpacity then
+    self:_onSkyOpacityChanged(x, z, cx, cz)
+  end
   return true
 end
 
@@ -492,6 +1208,7 @@ function ChunkWorld:applyEditsBulk(edits, count)
 
   local applied = 0
   local AIR = self.constants.BLOCK.AIR
+  local opacityChanged = false
 
   for i = 1, limit do
     local entry = edits[i]
@@ -514,6 +1231,8 @@ function ChunkWorld:applyEditsBulk(edits, count)
         local editChunk = self._editChunks[chunkKey]
         local previousEdit = editChunk and editChunk[localIndex] or nil
         local oldValue = previousEdit ~= nil and previousEdit or baseValue
+        local oldOpacity = self:_getBlockLightOpacity(oldValue)
+        local newOpacity = self:_getBlockLightOpacity(value)
 
         if oldValue ~= value then
           if value == baseValue then
@@ -546,9 +1265,22 @@ function ChunkWorld:applyEditsBulk(edits, count)
 
           self:_markDirty(cx, cy, cz)
           self:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
+          if oldOpacity ~= newOpacity then
+            opacityChanged = true
+            self._skyColumnsReady[self:_worldColumnKey(x, z)] = nil
+          end
           applied = applied + 1
         end
       end
+    end
+  end
+
+  if opacityChanged then
+    if self._lightingMode == 'floodfill' then
+      self:_scheduleSkyRegionRebuild(false)
+    else
+      self._skyStage = 'idle'
+      self:_clearSkyFloodQueue()
     end
   end
 
@@ -759,6 +1491,7 @@ function ChunkWorld:generate()
   self._featureChunks = {}
   self._featureColumnsPrepared = {}
   self._editCount = 0
+  self:_resetSkyLightData()
 end
 
 function ChunkWorld:_placeTreeFeature(x, y, z, trunkHeight)
@@ -856,6 +1589,19 @@ function ChunkWorld:prepareChunk(cx, cy, cz)
 
   self._featureColumnsPrepared[columnKey] = true
   self:_prepareColumnFeatures(cx, cz)
+
+  if self._lightingEnabled then
+    local cs = self.chunkSize
+    local minX = (cx - 1) * cs + 1
+    local maxX = math.min(cx * cs, self.sizeX)
+    local minZ = (cz - 1) * cs + 1
+    local maxZ = math.min(cz * cs, self.sizeZ)
+    for z = minZ, maxZ do
+      for x = minX, maxX do
+        self._skyColumnsReady[self:_worldColumnKey(x, z)] = nil
+      end
+    end
+  end
 end
 
 function ChunkWorld:getEditCount()

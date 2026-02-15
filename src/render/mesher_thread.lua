@@ -4,7 +4,7 @@ local DIR_NEG_Y = 3
 local DIR_POS_Y = 4
 local DIR_NEG_Z = 5
 local DIR_POS_Z = 6
-local VERTEX_FLOAT_STRIDE = 10
+local VERTEX_FLOAT_STRIDE = 11
 
 local lovrGlobal = rawget(_G, 'lovr')
 local lovrThread = lovrGlobal and lovrGlobal.thread or nil
@@ -78,7 +78,7 @@ local function ensureIndexPackBufferU32(indexCount)
   return indexPackU32Buffer
 end
 
-local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a)
+local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a, light)
   count = count + 1
   local vertex = pool[count]
   if not vertex then
@@ -96,26 +96,27 @@ local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a)
   vertex[8] = g
   vertex[9] = b
   vertex[10] = a
+  vertex[11] = light or 15
   return count
 end
 
-local function emitQuad(pool, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, bx, by, bz, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, dx, dy, dz, nx, ny, nz, r, g, b, a)
+local function emitQuad(pool, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, bx, by, bz, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
   return count
 end
 
 local function emitQuadIndexed(vertexPool, vertexCount, indexPool, indexCount,
-  ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
   local base = vertexCount + 1
-  vertexCount = writeVertex(vertexPool, vertexCount, ax, ay, az, nx, ny, nz, r, g, b, a)
-  vertexCount = writeVertex(vertexPool, vertexCount, bx, by, bz, nx, ny, nz, r, g, b, a)
-  vertexCount = writeVertex(vertexPool, vertexCount, cx, cy, cz, nx, ny, nz, r, g, b, a)
-  vertexCount = writeVertex(vertexPool, vertexCount, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  vertexCount = writeVertex(vertexPool, vertexCount, ax, ay, az, nx, ny, nz, r, g, b, a, light)
+  vertexCount = writeVertex(vertexPool, vertexCount, bx, by, bz, nx, ny, nz, r, g, b, a, light)
+  vertexCount = writeVertex(vertexPool, vertexCount, cx, cy, cz, nx, ny, nz, r, g, b, a, light)
+  vertexCount = writeVertex(vertexPool, vertexCount, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
 
   indexCount = indexCount + 1
   indexPool[indexCount] = base
@@ -204,6 +205,7 @@ local function packVertexBlob(vertices, vertexCount)
     buffer[writeIndex + 7] = v[8] or 0
     buffer[writeIndex + 8] = v[9] or 0
     buffer[writeIndex + 9] = v[10] or 0
+    buffer[writeIndex + 10] = v[11] or 15
     writeIndex = writeIndex + VERTEX_FLOAT_STRIDE
   end
 
@@ -306,10 +308,10 @@ local function tryPackResultBlobs(result)
   return true
 end
 
-local haloScratch = {}
-local haloScratchCount = 0
+local blockHaloScratch = {}
+local skyHaloScratch = {}
 
-local function decodeHaloBlob(blob)
+local function decodeHaloBlob(blob, scratch)
   if not blob then
     return nil
   end
@@ -351,34 +353,38 @@ local function decodeHaloBlob(blob)
 
   local count = #blobString
   for i = 1, count do
-    haloScratch[i] = string.byte(blobString, i)
+    scratch[i] = string.byte(blobString, i)
   end
-  for i = count + 1, haloScratchCount do
-    haloScratch[i] = nil
+  for i = count + 1, #scratch do
+    scratch[i] = nil
   end
-  haloScratchCount = count
 
-  return haloScratch
+  return scratch
 end
 
-local function getJobHalo(job)
-  if job.haloBlob then
-    local halo = decodeHaloBlob(job.haloBlob)
+local function getJobHalo(job, blobField, tableField, scratch)
+  local blob = job[blobField]
+  if blob then
+    local halo = decodeHaloBlob(blob, scratch)
     if halo then
       return halo
     end
   end
-  return job.halo
+  return job[tableField]
 end
 
 local function buildChunkNaive(job)
   local cs = job.chunkSize
   local blockInfo = job.blockInfo
-  local halo = getJobHalo(job)
+  local halo = getJobHalo(job, 'haloBlob', 'halo', blockHaloScratch)
+  local skyHalo = getJobHalo(job, 'skyHaloBlob', 'skyHalo', skyHaloScratch)
   local useIndexed = job.indexed and true or false
   local airBlock = job.airBlock
   if not halo then
     error('missing_halo_payload')
+  end
+  if not skyHalo then
+    error('missing_sky_halo_payload')
   end
 
   local verticesOpaque = {}
@@ -423,31 +429,31 @@ local function buildChunkNaive(job)
             local count = isOpaqueBlock and opaqueCount or alphaCount
             local indexCount = isOpaqueBlock and indexOpaqueCount or indexAlphaCount
 
-            local function emit(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz)
+            local function emit(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, sky)
               if useIndexed then
-                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
               else
-                count = emitQuad(out, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+                count = emitQuad(out, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
               end
             end
 
             if shouldDrawFace(block, halo[index - 1], blockInfo, airBlock) then
-              emit(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0)
+              emit(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, skyHalo[index - 1] or 0)
             end
             if shouldDrawFace(block, halo[index + 1], blockInfo, airBlock) then
-              emit(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0)
+              emit(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, skyHalo[index + 1] or 0)
             end
             if shouldDrawFace(block, halo[index - strideY], blockInfo, airBlock) then
-              emit(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0)
+              emit(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, skyHalo[index - strideY] or 0)
             end
             if shouldDrawFace(block, halo[index + strideY], blockInfo, airBlock) then
-              emit(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0)
+              emit(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, skyHalo[index + strideY] or 0)
             end
             if shouldDrawFace(block, halo[index - strideZ], blockInfo, airBlock) then
-              emit(x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1)
+              emit(x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, skyHalo[index - strideZ] or 0)
             end
             if shouldDrawFace(block, halo[index + strideZ], blockInfo, airBlock) then
-              emit(x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1)
+              emit(x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, skyHalo[index + strideZ] or 0)
             end
 
             if isOpaqueBlock then
@@ -469,11 +475,15 @@ end
 local function buildChunkGreedy(job)
   local cs = job.chunkSize
   local blockInfo = job.blockInfo
-  local halo = getJobHalo(job)
+  local halo = getJobHalo(job, 'haloBlob', 'halo', blockHaloScratch)
+  local skyHalo = getJobHalo(job, 'skyHaloBlob', 'skyHalo', skyHaloScratch)
   local useIndexed = job.indexed and true or false
   local airBlock = job.airBlock
   if not halo then
     error('missing_halo_payload')
+  end
+  if not skyHalo then
+    error('missing_sky_halo_payload')
   end
 
   local verticesOpaque = {}
@@ -491,7 +501,9 @@ local function buildChunkGreedy(job)
   local mask = greedyMaskScratch
   local maskSize = cs * cs
 
-  local function emitRect(direction, slice, u, v, width, height, block)
+  local function emitRect(direction, slice, u, v, width, height, mergeKey)
+    local block = math.floor(mergeKey / 16)
+    local sky = mergeKey - block * 16
     local info = blockInfo[block]
     if not info then
       return
@@ -510,9 +522,9 @@ local function buildChunkGreedy(job)
 
     local function emit(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz)
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+        count = emitQuad(out, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
       end
     end
 
@@ -599,7 +611,8 @@ local function buildChunkGreedy(job)
           local block = halo[index]
           local neighbor = halo[index + neighborOffset]
           if shouldDrawFace(block, neighbor, blockInfo, airBlock) then
-            mask[(v - 1) * cs + u] = block
+            local faceLight = skyHalo[index + neighborOffset] or 0
+            mask[(v - 1) * cs + u] = block * 16 + faceLight
           end
         end
       end
@@ -608,12 +621,12 @@ local function buildChunkGreedy(job)
         local u = 1
         while u <= cs do
           local index = (v - 1) * cs + u
-          local block = mask[index]
-          if block == 0 then
+          local mergeKey = mask[index]
+          if mergeKey == 0 then
             u = u + 1
           else
             local width = 1
-            while (u + width) <= cs and mask[index + width] == block do
+            while (u + width) <= cs and mask[index + width] == mergeKey do
               width = width + 1
             end
 
@@ -622,7 +635,7 @@ local function buildChunkGreedy(job)
             while (v + height) <= cs and canGrow do
               local row = (v + height - 1) * cs + u
               for k = 0, width - 1 do
-                if mask[row + k] ~= block then
+                if mask[row + k] ~= mergeKey then
                   canGrow = false
                   break
                 end
@@ -632,7 +645,7 @@ local function buildChunkGreedy(job)
               end
             end
 
-            emitRect(direction, slice, u, v, width, height, block)
+            emitRect(direction, slice, u, v, width, height, mergeKey)
 
             for clearV = v, v + height - 1 do
               local base = (clearV - 1) * cs + u

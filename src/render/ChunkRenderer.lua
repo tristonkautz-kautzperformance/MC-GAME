@@ -6,10 +6,11 @@ local MeshWorker = require 'src.render.MeshWorker'
 local VERTEX_FORMAT = {
   { 'VertexPosition', 'vec3' },
   { 'VertexNormal', 'vec3' },
-  { 'VertexColor', 'vec4' }
+  { 'VertexColor', 'vec4' },
+  { 'VertexLight', 'float' }
 }
 
-local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a)
+local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a, light)
   count = count + 1
   local vertex = pool[count]
   if not vertex then
@@ -27,28 +28,29 @@ local function writeVertex(pool, count, x, y, z, nx, ny, nz, r, g, b, a)
   vertex[8] = g
   vertex[9] = b
   vertex[10] = a
+  vertex[11] = light or 15
   return count
 end
 
-local function emitQuad(pool, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+local function emitQuad(pool, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
   -- Two triangles (a,b,c) + (a,c,d).
-  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, bx, by, bz, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, bx, by, bz, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a, light)
 
-  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a)
-  count = writeVertex(pool, count, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  count = writeVertex(pool, count, ax, ay, az, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, cx, cy, cz, nx, ny, nz, r, g, b, a, light)
+  count = writeVertex(pool, count, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
   return count
 end
 
 local function emitQuadIndexed(vertexPool, vertexCount, indexPool, indexCount,
-  ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
   local base = vertexCount + 1
-  vertexCount = writeVertex(vertexPool, vertexCount, ax, ay, az, nx, ny, nz, r, g, b, a)
-  vertexCount = writeVertex(vertexPool, vertexCount, bx, by, bz, nx, ny, nz, r, g, b, a)
-  vertexCount = writeVertex(vertexPool, vertexCount, cx, cy, cz, nx, ny, nz, r, g, b, a)
-  vertexCount = writeVertex(vertexPool, vertexCount, dx, dy, dz, nx, ny, nz, r, g, b, a)
+  vertexCount = writeVertex(vertexPool, vertexCount, ax, ay, az, nx, ny, nz, r, g, b, a, light)
+  vertexCount = writeVertex(vertexPool, vertexCount, bx, by, bz, nx, ny, nz, r, g, b, a, light)
+  vertexCount = writeVertex(vertexPool, vertexCount, cx, cy, cz, nx, ny, nz, r, g, b, a, light)
+  vertexCount = writeVertex(vertexPool, vertexCount, dx, dy, dz, nx, ny, nz, r, g, b, a, light)
 
   indexCount = indexCount + 1
   indexPool[indexCount] = base
@@ -136,6 +138,7 @@ function ChunkRenderer.new(constants, world)
     self._greedyMask[i] = 0
   end
   self._blockHalo = {}
+  self._skyHalo = {}
   self._vertexPoolOpaque = {}
   self._vertexPoolAlpha = {}
   self._indexPoolOpaque = {}
@@ -172,9 +175,12 @@ function ChunkRenderer.new(constants, world)
   self._chunkBuildVersion = {}
   self._threadInFlightByKey = {}
   self._threadInFlightHaloByKey = {}
+  self._threadInFlightSkyHaloByKey = {}
   self._threadInFlightCount = 0
   self._threadHaloTablePool = {}
   self._threadHaloTablePoolCount = 0
+  self._threadSkyHaloTablePool = {}
+  self._threadSkyHaloTablePoolCount = 0
   self._threadHaloPackBytes = {}
   self._threadHaloPackParts = {}
   self._threadBlockInfo = self:_buildThreadBlockInfo()
@@ -263,6 +269,38 @@ function ChunkRenderer:_releaseThreadHaloTable(halo)
   self._threadHaloTablePoolCount = count
 end
 
+function ChunkRenderer:_acquireThreadSkyHaloTable()
+  local count = self._threadSkyHaloTablePoolCount or 0
+  if count > 0 then
+    local pool = self._threadSkyHaloTablePool
+    local halo = pool[count]
+    pool[count] = nil
+    self._threadSkyHaloTablePoolCount = count - 1
+    return halo
+  end
+  return {}
+end
+
+function ChunkRenderer:_releaseThreadSkyHaloTable(halo)
+  if not halo then
+    return
+  end
+
+  local pool = self._threadSkyHaloTablePool
+  local count = (self._threadSkyHaloTablePoolCount or 0) + 1
+  pool[count] = halo
+
+  local maxPool = self._threadMaxInFlight + 2
+  if count > maxPool then
+    for i = maxPool + 1, count do
+      pool[i] = nil
+    end
+    count = maxPool
+  end
+
+  self._threadSkyHaloTablePoolCount = count
+end
+
 function ChunkRenderer:_releaseInFlightHaloForKey(key)
   local inFlightHaloByKey = self._threadInFlightHaloByKey
   local halo = inFlightHaloByKey and inFlightHaloByKey[key]
@@ -270,17 +308,30 @@ function ChunkRenderer:_releaseInFlightHaloForKey(key)
     inFlightHaloByKey[key] = nil
     self:_releaseThreadHaloTable(halo)
   end
+
+  local inFlightSkyHaloByKey = self._threadInFlightSkyHaloByKey
+  local skyHalo = inFlightSkyHaloByKey and inFlightSkyHaloByKey[key]
+  if skyHalo then
+    inFlightSkyHaloByKey[key] = nil
+    self:_releaseThreadSkyHaloTable(skyHalo)
+  end
 end
 
 function ChunkRenderer:_releaseAllInFlightHalos()
   local inFlightHaloByKey = self._threadInFlightHaloByKey
-  if not inFlightHaloByKey then
-    return
+  if inFlightHaloByKey then
+    for key, halo in pairs(inFlightHaloByKey) do
+      inFlightHaloByKey[key] = nil
+      self:_releaseThreadHaloTable(halo)
+    end
   end
 
-  for key, halo in pairs(inFlightHaloByKey) do
-    inFlightHaloByKey[key] = nil
-    self:_releaseThreadHaloTable(halo)
+  local inFlightSkyHaloByKey = self._threadInFlightSkyHaloByKey
+  if inFlightSkyHaloByKey then
+    for key, halo in pairs(inFlightSkyHaloByKey) do
+      inFlightSkyHaloByKey[key] = nil
+      self:_releaseThreadSkyHaloTable(halo)
+    end
   end
 end
 
@@ -376,9 +427,12 @@ function ChunkRenderer:_disableMeshWorker(reason)
   self:_releaseAllInFlightHalos()
   self._threadInFlightByKey = {}
   self._threadInFlightHaloByKey = {}
+  self._threadInFlightSkyHaloByKey = {}
   self._threadInFlightCount = 0
   self._threadHaloTablePool = {}
   self._threadHaloTablePoolCount = 0
+  self._threadSkyHaloTablePool = {}
+  self._threadSkyHaloTablePoolCount = 0
 end
 
 function ChunkRenderer:_isMeshWorkerReady()
@@ -510,14 +564,26 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
   if not self.world.fillBlockHalo then
     return false
   end
+  if not self.world.fillSkyLightHalo then
+    return false
+  end
 
   if self.world.prepareChunk then
     self.world:prepareChunk(cx, cy, cz)
   end
+  if self.world.ensureSkyLightForChunk then
+    local ready = self.world:ensureSkyLightForChunk(cx, cy, cz)
+    if ready == false then
+      return false
+    end
+  end
 
   local halo = self:_acquireThreadHaloTable()
+  local skyHalo = self:_acquireThreadSkyHaloTable()
   self.world:fillBlockHalo(cx, cy, cz, halo)
+  self.world:fillSkyLightHalo(cx, cy, cz, skyHalo)
   local haloBlob = self:_packHaloBlob(halo)
+  local skyHaloBlob = self:_packHaloBlob(skyHalo)
   local version = self:_nextBuildVersion(key)
   local job = {
     type = 'build',
@@ -528,6 +594,7 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     version = version,
     chunkSize = self.chunkSize,
     haloCount = #halo,
+    skyHaloCount = #skyHalo,
     blockInfo = self._threadBlockInfo,
     airBlock = self.constants.BLOCK.AIR,
     useGreedy = self._useGreedyMeshing,
@@ -541,10 +608,18 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     job.halo = halo
     usesHaloTablePayload = true
   end
+  local usesSkyHaloTablePayload = false
+  if skyHaloBlob then
+    job.skyHaloBlob = skyHaloBlob
+  else
+    job.skyHalo = skyHalo
+    usesSkyHaloTablePayload = true
+  end
 
   local ok, err = self._meshWorker:push(job)
   if not ok then
     self:_releaseThreadHaloTable(halo)
+    self:_releaseThreadSkyHaloTable(skyHalo)
     self:_disableMeshWorker(err)
     return false
   end
@@ -553,6 +628,11 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     self._threadInFlightHaloByKey[key] = halo
   else
     self:_releaseThreadHaloTable(halo)
+  end
+  if usesSkyHaloTablePayload then
+    self._threadInFlightSkyHaloByKey[key] = skyHalo
+  else
+    self:_releaseThreadSkyHaloTable(skyHalo)
   end
 
   self._threadInFlightByKey[key] = version
@@ -642,9 +722,12 @@ function ChunkRenderer:shutdown()
   self:_releaseAllInFlightHalos()
   self._threadInFlightByKey = {}
   self._threadInFlightHaloByKey = {}
+  self._threadInFlightSkyHaloByKey = {}
   self._threadInFlightCount = 0
   self._threadHaloTablePool = {}
   self._threadHaloTablePoolCount = 0
+  self._threadSkyHaloTablePool = {}
+  self._threadSkyHaloTablePoolCount = 0
 end
 
 local function isAir(constants, block)
@@ -705,6 +788,10 @@ function ChunkRenderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
   self._pruneKeepRadius = self:_computePruneKeepRadius()
   self._prunePending = true
   self._pruneCursorKey = nil
+
+  if world and world.pruneSkyLightChunks then
+    world:pruneSkyLightChunks(pcx, pcz, self._pruneKeepRadius)
+  end
 end
 
 function ChunkRenderer:_computePruneKeepRadius()
@@ -1054,7 +1141,9 @@ function ChunkRenderer:_buildChunkNaive(cx, cy, cz)
   local indexAlphaCount = 0
 
   local halo = self._blockHalo
+  local skyHalo = self._skyHalo
   world:fillBlockHalo(cx, cy, cz, halo)
+  world:fillSkyLightHalo(cx, cy, cz, skyHalo)
   local haloSize = cs + 2
   local strideZ = haloSize
   local strideY = haloSize * haloSize
@@ -1089,79 +1178,85 @@ function ChunkRenderer:_buildChunkNaive(cx, cy, cz)
 
           local ok = self:_shouldDrawFace(block, halo[index - 1])
           if ok then
+            local sky = skyHalo[index - 1] or 0
             if useIndexed then
               count, indexCount = emitQuadIndexed(
                 out, count, outIndices, indexCount,
                 x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0,
-                -1, 0, 0, r, g, b, a
+                -1, 0, 0, r, g, b, a, sky
               )
             else
-              count = emitQuad(out, count, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, a)
+              count = emitQuad(out, count, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, a, sky)
             end
           end
 
           ok = self:_shouldDrawFace(block, halo[index + 1])
           if ok then
+            local sky = skyHalo[index + 1] or 0
             if useIndexed then
               count, indexCount = emitQuadIndexed(
                 out, count, outIndices, indexCount,
                 x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1,
-                1, 0, 0, r, g, b, a
+                1, 0, 0, r, g, b, a, sky
               )
             else
-              count = emitQuad(out, count, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, a)
+              count = emitQuad(out, count, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, a, sky)
             end
           end
 
           ok = self:_shouldDrawFace(block, halo[index - strideY])
           if ok then
+            local sky = skyHalo[index - strideY] or 0
             if useIndexed then
               count, indexCount = emitQuadIndexed(
                 out, count, outIndices, indexCount,
                 x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1,
-                0, -1, 0, r, g, b, a
+                0, -1, 0, r, g, b, a, sky
               )
             else
-              count = emitQuad(out, count, x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b, a)
+              count = emitQuad(out, count, x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b, a, sky)
             end
           end
 
           ok = self:_shouldDrawFace(block, halo[index + strideY])
           if ok then
+            local sky = skyHalo[index + strideY] or 0
             if useIndexed then
               count, indexCount = emitQuadIndexed(
                 out, count, outIndices, indexCount,
                 x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0,
-                0, 1, 0, r, g, b, a
+                0, 1, 0, r, g, b, a, sky
               )
             else
-              count = emitQuad(out, count, x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b, a)
+              count = emitQuad(out, count, x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b, a, sky)
             end
           end
 
           ok = self:_shouldDrawFace(block, halo[index - strideZ])
           if ok then
+            local sky = skyHalo[index - strideZ] or 0
             if useIndexed then
               count, indexCount = emitQuadIndexed(
                 out, count, outIndices, indexCount,
                 x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0,
-                0, 0, -1, r, g, b, a
+                0, 0, -1, r, g, b, a, sky
               )
             else
-              count = emitQuad(out, count, x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, r, g, b, a)
+              count = emitQuad(out, count, x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, r, g, b, a, sky)
             end
           end
 
           ok = self:_shouldDrawFace(block, halo[index + strideZ])
           if ok then
+            local sky = skyHalo[index + strideZ] or 0
             if useIndexed then
               count, indexCount = emitQuadIndexed(
                 out, count, outIndices, indexCount,
                 x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1,
-                0, 0, 1, r, g, b, a
+                0, 0, 1, r, g, b, a, sky
               )
             else
-              count = emitQuad(out, count, x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, r, g, b, a)
+              count = emitQuad(out, count, x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, r, g, b, a, sky)
             end
           end
 
@@ -1203,12 +1298,16 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
   local indexAlphaCount = 0
 
   local halo = self._blockHalo
+  local skyHalo = self._skyHalo
   world:fillBlockHalo(cx, cy, cz, halo)
+  world:fillSkyLightHalo(cx, cy, cz, skyHalo)
   local haloSize = cs + 2
   local strideZ = haloSize
   local strideY = haloSize * haloSize
 
-  local function emitRect(direction, slice, u, v, width, height, block)
+  local function emitRect(direction, slice, u, v, width, height, mergeKey)
+    local block = math.floor(mergeKey / 16)
+    local sky = mergeKey - block * 16
     local info = blockInfo[block]
     if not info then
       return
@@ -1231,9 +1330,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local z0 = u - 1
       local z1 = z0 + width
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a)
+        count = emitQuad(out, count, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a, sky)
       end
     elseif direction == DIR_POS_X then
       local x = slice
@@ -1242,9 +1341,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local z0 = u - 1
       local z1 = z0 + width
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a)
+        count = emitQuad(out, count, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a, sky)
       end
     elseif direction == DIR_NEG_Y then
       local y = slice - 1
@@ -1253,9 +1352,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local z0 = v - 1
       local z1 = z0 + height
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a)
+        count = emitQuad(out, count, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a, sky)
       end
     elseif direction == DIR_POS_Y then
       local y = slice
@@ -1264,9 +1363,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local z0 = v - 1
       local z1 = z0 + height
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a)
+        count = emitQuad(out, count, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a, sky)
       end
     elseif direction == DIR_NEG_Z then
       local z = slice - 1
@@ -1275,9 +1374,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local y0 = v - 1
       local y1 = y0 + height
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a)
+        count = emitQuad(out, count, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a, sky)
       end
     else
       local z = slice
@@ -1286,9 +1385,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
       local y0 = v - 1
       local y1 = y0 + height
       if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a)
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a, sky)
       else
-        count = emitQuad(out, count, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a)
+        count = emitQuad(out, count, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a, sky)
       end
     end
 
@@ -1344,7 +1443,8 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
           local neighbor = halo[index + neighborOffset]
           local shouldDraw = self:_shouldDrawFace(block, neighbor)
           if shouldDraw then
-            mask[(v - 1) * cs + u] = block
+            local sky = skyHalo[index + neighborOffset] or 0
+            mask[(v - 1) * cs + u] = block * 16 + sky
           end
         end
       end
@@ -1353,12 +1453,12 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
         local u = 1
         while u <= cs do
           local index = (v - 1) * cs + u
-          local block = mask[index]
-          if block == 0 then
+          local mergeKey = mask[index]
+          if mergeKey == 0 then
             u = u + 1
           else
             local width = 1
-            while (u + width) <= cs and mask[index + width] == block do
+            while (u + width) <= cs and mask[index + width] == mergeKey do
               width = width + 1
             end
 
@@ -1367,7 +1467,7 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
             while (v + height) <= cs and canGrow do
               local row = (v + height - 1) * cs + u
               for k = 0, width - 1 do
-                if mask[row + k] ~= block then
+                if mask[row + k] ~= mergeKey then
                   canGrow = false
                   break
                 end
@@ -1377,7 +1477,7 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
               end
             end
 
-            emitRect(direction, slice, u, v, width, height, block)
+            emitRect(direction, slice, u, v, width, height, mergeKey)
 
             for clearV = v, v + height - 1 do
               local base = (clearV - 1) * cs + u
@@ -1405,6 +1505,9 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
 
   if self.world.prepareChunk then
     self.world:prepareChunk(cx, cy, cz)
+  end
+  if self.world.ensureSkyLightForChunk then
+    self.world:ensureSkyLightForChunk(cx, cy, cz)
   end
 
   local oldOpaqueCount = #self._vertexPoolOpaque
@@ -1665,7 +1768,7 @@ function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward
   return dot >= math.cos(maxAngle)
 end
 
-function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
+function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, voxelShader, timeOfDay)
   local forward = self._drawForward
   if forward.set then
     forward:set(0, 0, -1)
@@ -1677,6 +1780,9 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
   self._visibleCount = 0
 
   pass:push('state')
+  if voxelShader and voxelShader.apply then
+    voxelShader:apply(pass, timeOfDay)
+  end
 
   local opaqueScratch = self._opaqueScratch
   local prevOpaqueCount = self._opaqueScratchCount or 0

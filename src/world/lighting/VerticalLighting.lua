@@ -384,7 +384,7 @@ function VerticalLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChun
   return removed
 end
 
-function VerticalLighting:onOpacityChanged(x, z, cx, cz)
+function VerticalLighting:onOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpacity)
   if not self.enabled then
     return
   end

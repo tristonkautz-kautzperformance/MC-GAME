@@ -38,29 +38,45 @@ function FloodfillLighting:reset()
   self.skyColumnsQueueSet = {}
   self.skyColumnsQueueHead = 1
   self.skyColumnsQueueTail = 0
+  self.skyColumnsUrgentCount = 0
 
   self.skyFloodQueue = {}
   self.skyFloodQueueSet = {}
   self.skyFloodQueueHead = 1
   self.skyFloodQueueTail = 0
+  self.skyFloodUrgentCount = 0
+
+  self.skyDarkQueue = {}
+  self.skyDarkQueueLevels = {}
+  self.skyDarkQueuePriority = {}
+  self.skyDarkQueueHead = 1
+  self.skyDarkQueueTail = 0
+  self.skyDarkUrgentCount = 0
 
   self.skyStage = 'idle'
   self.skyTrackDirtyVertical = false
   self.skyTrackDirtyFlood = false
+  self.skyWarmupActive = false
 
-  self.skyCenterCx = clampInt(math.floor((world.chunksX + 1) * 0.5), 1, world.chunksX)
-  self.skyCenterCz = clampInt(math.floor((world.chunksZ + 1) * 0.5), 1, world.chunksZ)
-  self.skyKeepRadius = math.max(world.chunksX, world.chunksZ)
+  -- Start with no active region so first prune call can enqueue initial relight work.
+  self.skyCenterCx = 0
+  self.skyCenterCz = 0
+  self.skyKeepRadius = -1
 
   self.skyActiveMinCx = 1
-  self.skyActiveMaxCx = world.chunksX
+  self.skyActiveMaxCx = 0
   self.skyActiveMinCz = 1
-  self.skyActiveMaxCz = world.chunksZ
+  self.skyActiveMaxCz = 0
 
   self.skyActiveMinX = 1
-  self.skyActiveMaxX = world.sizeX
+  self.skyActiveMaxX = 0
   self.skyActiveMinZ = 1
-  self.skyActiveMaxZ = world.sizeZ
+  self.skyActiveMaxZ = 0
+
+  self.skyPropMinX = nil
+  self.skyPropMaxX = nil
+  self.skyPropMinZ = nil
+  self.skyPropMaxZ = nil
 end
 
 function FloodfillLighting:_getBlockLightOpacity(block)
@@ -126,9 +142,24 @@ function FloodfillLighting:_hasSkyFloodQueue()
   return self.skyFloodQueueHead <= self.skyFloodQueueTail
 end
 
+function FloodfillLighting:_hasSkyDarkQueue()
+  return self.skyDarkQueueHead <= self.skyDarkQueueTail
+end
+
+function FloodfillLighting:_hasUrgentWork()
+  return self.skyColumnsUrgentCount > 0
+    or self.skyDarkUrgentCount > 0
+    or self.skyFloodUrgentCount > 0
+end
+
 function FloodfillLighting:_setSkyStageFromQueues()
   if self:_hasSkyColumnsQueue() then
     self.skyStage = 'vertical'
+    return
+  end
+
+  if self:_hasSkyDarkQueue() then
+    self.skyStage = 'dark'
     return
   end
 
@@ -140,40 +171,69 @@ function FloodfillLighting:_setSkyStageFromQueues()
   self.skyStage = 'idle'
   self.skyTrackDirtyVertical = false
   self.skyTrackDirtyFlood = false
+  self.skyWarmupActive = false
+  self:_clearSkyPropagationBounds()
 end
 
-function FloodfillLighting:_enqueueSkyColumn(columnKey)
-  if self.skyColumnsQueueSet[columnKey] then
-    return false
+function FloodfillLighting:_enqueueSkyColumn(columnKey, urgent)
+  local priority = self.skyColumnsQueueSet[columnKey]
+  if priority == nil then
+    priority = urgent and 1 or 0
+    self.skyColumnsQueueSet[columnKey] = priority
+    if priority == 1 then
+      self.skyColumnsUrgentCount = self.skyColumnsUrgentCount + 1
+      local head = self.skyColumnsQueueHead - 1
+      self.skyColumnsQueueHead = head
+      self.skyColumnsQueue[head] = columnKey
+    else
+      local tail = self.skyColumnsQueueTail + 1
+      self.skyColumnsQueueTail = tail
+      self.skyColumnsQueue[tail] = columnKey
+    end
+    return true
   end
 
-  local tail = self.skyColumnsQueueTail + 1
-  self.skyColumnsQueueTail = tail
-  self.skyColumnsQueue[tail] = columnKey
-  self.skyColumnsQueueSet[columnKey] = true
-  return true
+  if urgent and priority == 0 then
+    self.skyColumnsQueueSet[columnKey] = 1
+    self.skyColumnsUrgentCount = self.skyColumnsUrgentCount + 1
+    local head = self.skyColumnsQueueHead - 1
+    self.skyColumnsQueueHead = head
+    self.skyColumnsQueue[head] = columnKey
+    return true
+  end
+
+  return false
 end
 
 function FloodfillLighting:_dequeueSkyColumn()
-  local head = self.skyColumnsQueueHead
-  local tail = self.skyColumnsQueueTail
-  if head > tail then
-    return nil
+  local queue = self.skyColumnsQueue
+  local set = self.skyColumnsQueueSet
+
+  while self.skyColumnsQueueHead <= self.skyColumnsQueueTail do
+    local head = self.skyColumnsQueueHead
+    local columnKey = queue[head]
+    queue[head] = nil
+    self.skyColumnsQueueHead = head + 1
+
+    if columnKey ~= nil then
+      local priority = set[columnKey]
+      if priority ~= nil then
+        set[columnKey] = nil
+        if priority == 1 and self.skyColumnsUrgentCount > 0 then
+          self.skyColumnsUrgentCount = self.skyColumnsUrgentCount - 1
+        end
+        if self.skyColumnsQueueHead > self.skyColumnsQueueTail then
+          self.skyColumnsQueueHead = 1
+          self.skyColumnsQueueTail = 0
+        end
+        return columnKey, priority == 1
+      end
+    end
   end
 
-  local columnKey = self.skyColumnsQueue[head]
-  self.skyColumnsQueue[head] = nil
-  self.skyColumnsQueueHead = head + 1
-  if columnKey ~= nil then
-    self.skyColumnsQueueSet[columnKey] = nil
-  end
-
-  if self.skyColumnsQueueHead > self.skyColumnsQueueTail then
-    self.skyColumnsQueueHead = 1
-    self.skyColumnsQueueTail = 0
-  end
-
-  return columnKey
+  self.skyColumnsQueueHead = 1
+  self.skyColumnsQueueTail = 0
+  return nil, false
 end
 
 function FloodfillLighting:_clearSkyColumnsQueue()
@@ -187,40 +247,68 @@ function FloodfillLighting:_clearSkyColumnsQueue()
   for columnKey in pairs(self.skyColumnsQueueSet) do
     self.skyColumnsQueueSet[columnKey] = nil
   end
+  self.skyColumnsUrgentCount = 0
 end
 
-function FloodfillLighting:_enqueueSkyFlood(worldIndex)
-  if self.skyFloodQueueSet[worldIndex] then
-    return false
+function FloodfillLighting:_enqueueSkyFlood(worldIndex, urgent)
+  local priority = self.skyFloodQueueSet[worldIndex]
+  if priority == nil then
+    priority = urgent and 1 or 0
+    self.skyFloodQueueSet[worldIndex] = priority
+    if priority == 1 then
+      self.skyFloodUrgentCount = self.skyFloodUrgentCount + 1
+      local head = self.skyFloodQueueHead - 1
+      self.skyFloodQueueHead = head
+      self.skyFloodQueue[head] = worldIndex
+    else
+      local tail = self.skyFloodQueueTail + 1
+      self.skyFloodQueueTail = tail
+      self.skyFloodQueue[tail] = worldIndex
+    end
+    return true
   end
 
-  local tail = self.skyFloodQueueTail + 1
-  self.skyFloodQueueTail = tail
-  self.skyFloodQueue[tail] = worldIndex
-  self.skyFloodQueueSet[worldIndex] = true
-  return true
+  if urgent and priority == 0 then
+    self.skyFloodQueueSet[worldIndex] = 1
+    self.skyFloodUrgentCount = self.skyFloodUrgentCount + 1
+    local head = self.skyFloodQueueHead - 1
+    self.skyFloodQueueHead = head
+    self.skyFloodQueue[head] = worldIndex
+    return true
+  end
+
+  return false
 end
 
 function FloodfillLighting:_dequeueSkyFlood()
-  local head = self.skyFloodQueueHead
-  local tail = self.skyFloodQueueTail
-  if head > tail then
-    return nil
+  local queue = self.skyFloodQueue
+  local set = self.skyFloodQueueSet
+
+  while self.skyFloodQueueHead <= self.skyFloodQueueTail do
+    local head = self.skyFloodQueueHead
+    local worldIndex = queue[head]
+    queue[head] = nil
+    self.skyFloodQueueHead = head + 1
+
+    if worldIndex ~= nil then
+      local priority = set[worldIndex]
+      if priority ~= nil then
+        set[worldIndex] = nil
+        if priority == 1 and self.skyFloodUrgentCount > 0 then
+          self.skyFloodUrgentCount = self.skyFloodUrgentCount - 1
+        end
+        if self.skyFloodQueueHead > self.skyFloodQueueTail then
+          self.skyFloodQueueHead = 1
+          self.skyFloodQueueTail = 0
+        end
+        return worldIndex, priority == 1
+      end
+    end
   end
 
-  local worldIndex = self.skyFloodQueue[head]
-  self.skyFloodQueue[head] = nil
-  self.skyFloodQueueHead = head + 1
-  if worldIndex ~= nil then
-    self.skyFloodQueueSet[worldIndex] = nil
-  end
-
-  if self.skyFloodQueueHead > self.skyFloodQueueTail then
-    self.skyFloodQueueHead = 1
-    self.skyFloodQueueTail = 0
-  end
-
-  return worldIndex
+  self.skyFloodQueueHead = 1
+  self.skyFloodQueueTail = 0
+  return nil, false
 end
 
 function FloodfillLighting:_clearSkyFloodQueue()
@@ -234,6 +322,95 @@ function FloodfillLighting:_clearSkyFloodQueue()
   for worldIndex in pairs(self.skyFloodQueueSet) do
     self.skyFloodQueueSet[worldIndex] = nil
   end
+  self.skyFloodUrgentCount = 0
+end
+
+function FloodfillLighting:_enqueueSkyDark(worldIndex, removedLight, urgent)
+  if removedLight == nil then
+    return false
+  end
+
+  local oldLevel = self.skyDarkQueueLevels[worldIndex]
+  local priority = self.skyDarkQueuePriority[worldIndex]
+  if oldLevel ~= nil then
+    if removedLight > oldLevel then
+      self.skyDarkQueueLevels[worldIndex] = removedLight
+    end
+    if urgent and priority == 0 then
+      self.skyDarkQueuePriority[worldIndex] = 1
+      self.skyDarkUrgentCount = self.skyDarkUrgentCount + 1
+      local head = self.skyDarkQueueHead - 1
+      self.skyDarkQueueHead = head
+      self.skyDarkQueue[head] = worldIndex
+      return true
+    end
+    return removedLight > oldLevel
+  end
+
+  self.skyDarkQueuePriority[worldIndex] = urgent and 1 or 0
+  if urgent then
+    self.skyDarkUrgentCount = self.skyDarkUrgentCount + 1
+    local head = self.skyDarkQueueHead - 1
+    self.skyDarkQueueHead = head
+    self.skyDarkQueue[head] = worldIndex
+  else
+    local tail = self.skyDarkQueueTail + 1
+    self.skyDarkQueueTail = tail
+    self.skyDarkQueue[tail] = worldIndex
+  end
+  self.skyDarkQueueLevels[worldIndex] = removedLight
+  return true
+end
+
+function FloodfillLighting:_dequeueSkyDark()
+  local queue = self.skyDarkQueue
+  local levels = self.skyDarkQueueLevels
+  local priorities = self.skyDarkQueuePriority
+
+  while self.skyDarkQueueHead <= self.skyDarkQueueTail do
+    local head = self.skyDarkQueueHead
+    local worldIndex = queue[head]
+    queue[head] = nil
+    self.skyDarkQueueHead = head + 1
+
+    if worldIndex ~= nil then
+      local removedLight = levels[worldIndex]
+      local priority = priorities[worldIndex]
+      if removedLight ~= nil then
+        levels[worldIndex] = nil
+        priorities[worldIndex] = nil
+        if priority == 1 and self.skyDarkUrgentCount > 0 then
+          self.skyDarkUrgentCount = self.skyDarkUrgentCount - 1
+        end
+        if self.skyDarkQueueHead > self.skyDarkQueueTail then
+          self.skyDarkQueueHead = 1
+          self.skyDarkQueueTail = 0
+        end
+        return worldIndex, removedLight, priority == 1
+      end
+    end
+  end
+
+  self.skyDarkQueueHead = 1
+  self.skyDarkQueueTail = 0
+  return nil, nil, false
+end
+
+function FloodfillLighting:_clearSkyDarkQueue()
+  local queue = self.skyDarkQueue
+  for i = self.skyDarkQueueHead, self.skyDarkQueueTail do
+    queue[i] = nil
+  end
+  self.skyDarkQueueHead = 1
+  self.skyDarkQueueTail = 0
+
+  for worldIndex in pairs(self.skyDarkQueueLevels) do
+    self.skyDarkQueueLevels[worldIndex] = nil
+  end
+  for worldIndex in pairs(self.skyDarkQueuePriority) do
+    self.skyDarkQueuePriority[worldIndex] = nil
+  end
+  self.skyDarkUrgentCount = 0
 end
 
 function FloodfillLighting:_isInsideSkyActiveWorldXZ(x, z)
@@ -241,6 +418,110 @@ function FloodfillLighting:_isInsideSkyActiveWorldXZ(x, z)
     and x <= self.skyActiveMaxX
     and z >= self.skyActiveMinZ
     and z <= self.skyActiveMaxZ
+end
+
+function FloodfillLighting:_isInsideSkyPropagationWorldXZ(x, z)
+  if not self:_isInsideSkyActiveWorldXZ(x, z) then
+    return false
+  end
+  if self.skyPropMinX == nil then
+    return true
+  end
+  return x >= self.skyPropMinX
+    and x <= self.skyPropMaxX
+    and z >= self.skyPropMinZ
+    and z <= self.skyPropMaxZ
+end
+
+function FloodfillLighting:_clearSkyPropagationBounds()
+  self.skyPropMinX = nil
+  self.skyPropMaxX = nil
+  self.skyPropMinZ = nil
+  self.skyPropMaxZ = nil
+end
+
+function FloodfillLighting:_setSkyPropagationBounds(minX, maxX, minZ, maxZ)
+  local world = self.world
+  local bx0 = clampInt(math.floor(tonumber(minX) or 1), 1, world.sizeX)
+  local bx1 = clampInt(math.floor(tonumber(maxX) or world.sizeX), 1, world.sizeX)
+  local bz0 = clampInt(math.floor(tonumber(minZ) or 1), 1, world.sizeZ)
+  local bz1 = clampInt(math.floor(tonumber(maxZ) or world.sizeZ), 1, world.sizeZ)
+  if bx1 < bx0 or bz1 < bz0 then
+    self:_clearSkyPropagationBounds()
+    return
+  end
+
+  if bx0 < self.skyActiveMinX then bx0 = self.skyActiveMinX end
+  if bx1 > self.skyActiveMaxX then bx1 = self.skyActiveMaxX end
+  if bz0 < self.skyActiveMinZ then bz0 = self.skyActiveMinZ end
+  if bz1 > self.skyActiveMaxZ then bz1 = self.skyActiveMaxZ end
+  if bx1 < bx0 or bz1 < bz0 then
+    self:_clearSkyPropagationBounds()
+    return
+  end
+
+  self.skyPropMinX = bx0
+  self.skyPropMaxX = bx1
+  self.skyPropMinZ = bz0
+  self.skyPropMaxZ = bz1
+end
+
+function FloodfillLighting:_enqueueSkyFloodSeed(x, y, z, urgent)
+  local world = self.world
+  if not world:isInside(x, y, z) then
+    return false
+  end
+  if not self:_isInsideSkyPropagationWorldXZ(x, z) then
+    return false
+  end
+
+  local light = self:_getSkyLightWorld(x, y, z)
+  if light <= 1 then
+    return false
+  end
+  return self:_enqueueSkyFlood(world:_worldIndex(x, y, z), urgent)
+end
+
+function FloodfillLighting:_enqueueSkyDarkSeed(x, y, z, urgent)
+  local world = self.world
+  if not world:isInside(x, y, z) then
+    return false
+  end
+  if not self:_isInsideSkyPropagationWorldXZ(x, z) then
+    return false
+  end
+
+  local light = self:_getSkyLightWorld(x, y, z)
+  if light <= 0 then
+    return false
+  end
+  return self:_enqueueSkyDark(world:_worldIndex(x, y, z), light, urgent)
+end
+
+function FloodfillLighting:_seedEditNeighborhood(x, y, z, seedDark, seedFlood, urgent)
+  if not x or not y or not z then
+    return
+  end
+
+  if seedDark then
+    self:_enqueueSkyDarkSeed(x, y, z, urgent)
+    self:_enqueueSkyDarkSeed(x - 1, y, z, urgent)
+    self:_enqueueSkyDarkSeed(x + 1, y, z, urgent)
+    self:_enqueueSkyDarkSeed(x, y - 1, z, urgent)
+    self:_enqueueSkyDarkSeed(x, y + 1, z, urgent)
+    self:_enqueueSkyDarkSeed(x, y, z - 1, urgent)
+    self:_enqueueSkyDarkSeed(x, y, z + 1, urgent)
+  end
+
+  if seedFlood then
+    self:_enqueueSkyFloodSeed(x, y, z, urgent)
+    self:_enqueueSkyFloodSeed(x - 1, y, z, urgent)
+    self:_enqueueSkyFloodSeed(x + 1, y, z, urgent)
+    self:_enqueueSkyFloodSeed(x, y - 1, z, urgent)
+    self:_enqueueSkyFloodSeed(x, y + 1, z, urgent)
+    self:_enqueueSkyFloodSeed(x, y, z - 1, urgent)
+    self:_enqueueSkyFloodSeed(x, y, z + 1, urgent)
+  end
 end
 
 function FloodfillLighting:_getSkyLightWorld(x, y, z)
@@ -299,7 +580,7 @@ function FloodfillLighting:_setSkyLightWorld(x, y, z, value, markDirty, createIf
   return true
 end
 
-function FloodfillLighting:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
+function FloodfillLighting:_recomputeSkyColumn(x, z, enqueueFlood, markDirty, seedUrgent)
   local world = self.world
   if x < 1 or x > world.sizeX or z < 1 or z > world.sizeZ then
     return false
@@ -309,6 +590,7 @@ function FloodfillLighting:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
   local light = 15
 
   for y = world.sizeY, 1, -1 do
+    local oldLight = self:_getSkyLightWorld(x, y, z)
     local block = world:get(x, y, z)
     local opacity = self:_getBlockLightOpacity(block)
     light = light - opacity
@@ -316,14 +598,27 @@ function FloodfillLighting:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
       light = 0
     end
 
-    local changed = self:_setSkyLightWorld(x, y, z, light, markDirty, true)
-    if enqueueFlood and changed and light > 1 then
-      self:_enqueueSkyFlood(world:_worldIndex(x, y, z))
+    if oldLight ~= light then
+      self:_setSkyLightWorld(x, y, z, light, markDirty, true)
+      if enqueueFlood then
+        local worldIndex = world:_worldIndex(x, y, z)
+        if light < oldLight and oldLight > 0 then
+          self:_enqueueSkyDark(worldIndex, oldLight, seedUrgent)
+        elseif light > oldLight and light > 1 then
+          self:_enqueueSkyFlood(worldIndex, seedUrgent)
+        end
+      end
     end
 
     if light == 0 and opacity >= 15 then
       for clearY = y - 1, 1, -1 do
-        self:_setSkyLightWorld(x, clearY, z, 0, markDirty, true)
+        local oldClear = self:_getSkyLightWorld(x, clearY, z)
+        if oldClear ~= 0 then
+          self:_setSkyLightWorld(x, clearY, z, 0, markDirty, true)
+          if enqueueFlood then
+            self:_enqueueSkyDark(world:_worldIndex(x, clearY, z), oldClear, seedUrgent)
+          end
+        end
       end
       break
     end
@@ -336,7 +631,7 @@ function FloodfillLighting:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
   return true
 end
 
-function FloodfillLighting:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty)
+function FloodfillLighting:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty, seedUrgent)
   local world = self.world
   if x < 1 or x > world.sizeX or z < 1 or z > world.sizeZ then
     return false
@@ -347,10 +642,10 @@ function FloodfillLighting:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty)
     return true
   end
 
-  return self:_recomputeSkyColumn(x, z, enqueueFlood, markDirty)
+  return self:_recomputeSkyColumn(x, z, enqueueFlood, markDirty, seedUrgent)
 end
 
-function FloodfillLighting:_ensureSkyHaloColumns(cx, cz, enqueueFlood, markDirty)
+function FloodfillLighting:_ensureSkyHaloColumns(cx, cz, enqueueFlood, markDirty, seedUrgent)
   local world = self.world
   local cs = world.chunkSize
   local minX = (cx - 1) * cs
@@ -362,7 +657,7 @@ function FloodfillLighting:_ensureSkyHaloColumns(cx, cz, enqueueFlood, markDirty
     if z >= 1 and z <= world.sizeZ then
       for x = minX, maxX do
         if x >= 1 and x <= world.sizeX then
-          self:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty)
+          self:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty, seedUrgent)
         end
       end
     end
@@ -405,6 +700,7 @@ function FloodfillLighting:_scheduleSkyBoundsRebuild(minX, maxX, minZ, maxZ, tra
 
   if resetQueues then
     self:_clearSkyColumnsQueue()
+    self:_clearSkyDarkQueue()
     self:_clearSkyFloodQueue()
   end
 
@@ -417,7 +713,7 @@ function FloodfillLighting:_scheduleSkyBoundsRebuild(minX, maxX, minZ, maxZ, tra
     for x = bx0, bx1 do
       local columnKey = world:_worldColumnKey(x, z)
       self.skyColumnsReady[columnKey] = nil
-      if self:_enqueueSkyColumn(columnKey) then
+      if self:_enqueueSkyColumn(columnKey, false) then
         queued = queued + 1
       end
     end
@@ -425,7 +721,7 @@ function FloodfillLighting:_scheduleSkyBoundsRebuild(minX, maxX, minZ, maxZ, tra
 
   if queued > 0 then
     local dirty = asBool(trackDirty)
-    self.skyTrackDirtyVertical = dirty
+    self.skyTrackDirtyVertical = false
     self.skyTrackDirtyFlood = dirty
     self:_setSkyStageFromQueues()
   elseif resetQueues then
@@ -449,8 +745,8 @@ function FloodfillLighting:_scheduleSkyLocalRebuild(centerX, centerZ, radiusBloc
     z - radius,
     z + radius,
     trackDirty,
-    true,
-    true
+    false,
+    false
   )
 end
 
@@ -497,6 +793,8 @@ function FloodfillLighting:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMa
     return 0
   end
 
+  self:_clearSkyPropagationBounds()
+
   local world = self.world
   local oldHasRegion = oldMaxX and oldMinX and oldMaxX >= oldMinX and oldMaxZ and oldMinZ and oldMaxZ >= oldMinZ
   local queued = 0
@@ -510,7 +808,7 @@ function FloodfillLighting:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMa
       if not inOldRegion then
         local columnKey = world:_worldColumnKey(x, z)
         self.skyColumnsReady[columnKey] = nil
-        if self:_enqueueSkyColumn(columnKey) then
+        if self:_enqueueSkyColumn(columnKey, false) then
           queued = queued + 1
         end
       end
@@ -520,16 +818,73 @@ function FloodfillLighting:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMa
   if queued > 0 then
     self.skyTrackDirtyVertical = false
     self.skyTrackDirtyFlood = true
+    if not oldHasRegion then
+      self.skyWarmupActive = true
+    end
     self:_setSkyStageFromQueues()
   end
 
   return queued
 end
 
-function FloodfillLighting:_propagateSkyFloodFrom(worldIndex, markDirty)
+function FloodfillLighting:_propagateSkyDarkFrom(worldIndex, removedLight, markDirty, urgent)
+  if not worldIndex or not removedLight or removedLight <= 0 then
+    return
+  end
+
   local world = self.world
   local x, y, z = world:_decodeWorldIndex(worldIndex)
-  if not self:_isInsideSkyActiveWorldXZ(x, z) then
+  if not self:_isInsideSkyPropagationWorldXZ(x, z) then
+    return
+  end
+
+  local function tryNeighbor(nx, ny, nz)
+    if nx < 1 or nx > world.sizeX then
+      return
+    end
+    if ny < 1 or ny > world.sizeY then
+      return
+    end
+    if nz < 1 or nz > world.sizeZ then
+      return
+    end
+    if not self:_isInsideSkyPropagationWorldXZ(nx, nz) then
+      return
+    end
+
+    local neighborLight = self:_getSkyLightWorld(nx, ny, nz)
+    if neighborLight <= 0 then
+      return
+    end
+
+    local block = world:get(nx, ny, nz)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+
+    if neighborLight + step <= removedLight then
+      if self:_setSkyLightWorld(nx, ny, nz, 0, markDirty, true) then
+        self:_enqueueSkyDark(world:_worldIndex(nx, ny, nz), neighborLight, urgent)
+      end
+    else
+      self:_enqueueSkyFlood(world:_worldIndex(nx, ny, nz), urgent)
+    end
+  end
+
+  tryNeighbor(x - 1, y, z)
+  tryNeighbor(x + 1, y, z)
+  tryNeighbor(x, y - 1, z)
+  tryNeighbor(x, y + 1, z)
+  tryNeighbor(x, y, z - 1)
+  tryNeighbor(x, y, z + 1)
+  self:_enqueueSkyFlood(worldIndex, urgent)
+end
+
+function FloodfillLighting:_propagateSkyFloodFrom(worldIndex, markDirty, urgent)
+  local world = self.world
+  local x, y, z = world:_decodeWorldIndex(worldIndex)
+  if not self:_isInsideSkyPropagationWorldXZ(x, z) then
     return
   end
 
@@ -548,7 +903,7 @@ function FloodfillLighting:_propagateSkyFloodFrom(worldIndex, markDirty)
     if nz < 1 or nz > world.sizeZ then
       return
     end
-    if not self:_isInsideSkyActiveWorldXZ(nx, nz) then
+    if not self:_isInsideSkyPropagationWorldXZ(nx, nz) then
       return
     end
 
@@ -566,7 +921,7 @@ function FloodfillLighting:_propagateSkyFloodFrom(worldIndex, markDirty)
     local neighborLight = self:_getSkyLightWorld(nx, ny, nz)
     if candidate > neighborLight then
       if self:_setSkyLightWorld(nx, ny, nz, candidate, markDirty, true) then
-        self:_enqueueSkyFlood(world:_worldIndex(nx, ny, nz))
+        self:_enqueueSkyFlood(world:_worldIndex(nx, ny, nz), urgent)
       end
     end
   end
@@ -608,8 +963,33 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
     return false
   end
 
+  local config = self.lightingConfig or {}
+  local localOps = math.floor(tonumber(config.chunkEnsureOps) or 768)
+  local localMillis = tonumber(config.chunkEnsureMillis)
+  if localMillis == nil then
+    localMillis = 0.2
+  end
+
   world:prepareChunk(cx, cy, cz)
-  self:_ensureSkyHaloColumns(cx, cz, true, false)
+
+  if self:_hasUrgentWork() then
+    if localOps > 0 then
+      self:updateSkyLight(localOps, localMillis)
+    end
+    if self:_hasUrgentWork() then
+      return false
+    end
+  end
+
+  self:_ensureSkyHaloColumns(cx, cz, true, false, true)
+
+  if localOps > 0 and self:_hasUrgentWork() then
+    self:updateSkyLight(localOps, localMillis)
+  end
+
+  if self:_hasUrgentWork() then
+    return false
+  end
   return true
 end
 
@@ -633,8 +1013,19 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
     return out
   end
 
-  self:_ensureSkyHaloColumns(cx, cz, true, false)
-  self:_drainSkyLightForMeshPrep()
+  local hadPropBounds = self.skyPropMinX ~= nil
+  local oldMinX = self.skyPropMinX
+  local oldMaxX = self.skyPropMaxX
+  local oldMinZ = self.skyPropMinZ
+  local oldMaxZ = self.skyPropMaxZ
+  self:_clearSkyPropagationBounds()
+  self:_ensureSkyHaloColumns(cx, cz, true, false, false)
+  if hadPropBounds then
+    self.skyPropMinX = oldMinX
+    self.skyPropMaxX = oldMaxX
+    self.skyPropMinZ = oldMinZ
+    self.skyPropMaxZ = oldMaxZ
+  end
 
   local strideZ = haloSize
   local strideY = haloSize * haloSize
@@ -682,6 +1073,8 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   end
 
   local config = self.lightingConfig or {}
+  local explicitOpsLimit = maxOps ~= nil
+  local explicitMillisLimit = maxMillis ~= nil
   local opsLimit = tonumber(maxOps)
   if opsLimit == nil then
     opsLimit = tonumber(config.maxUpdatesPerFrame)
@@ -696,6 +1089,38 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   local millisLimit = tonumber(maxMillis)
   if millisLimit == nil then
     millisLimit = tonumber(config.maxMillisPerFrame)
+  end
+
+  if self.skyWarmupActive then
+    local warmupOps = math.floor(tonumber(config.startupWarmupOpsPerFrame) or 32768)
+    if warmupOps > 0 and not explicitOpsLimit then
+      if opsLimit == nil or opsLimit < warmupOps then
+        opsLimit = warmupOps
+      end
+    end
+
+    local warmupMillis = tonumber(config.startupWarmupMillisPerFrame) or 4.0
+    if warmupMillis > 0 and not explicitMillisLimit then
+      if millisLimit == nil or millisLimit < warmupMillis then
+        millisLimit = warmupMillis
+      end
+    end
+  end
+
+  if self:_hasUrgentWork() then
+    local urgentOps = math.floor(tonumber(config.urgentOpsPerFrame) or 12288)
+    if urgentOps > 0 and not explicitOpsLimit then
+      if opsLimit == nil or opsLimit < urgentOps then
+        opsLimit = urgentOps
+      end
+    end
+
+    local urgentMillis = tonumber(config.urgentMillisPerFrame) or 1.75
+    if urgentMillis > 0 and not explicitMillisLimit then
+      if millisLimit == nil or millisLimit < urgentMillis then
+        millisLimit = urgentMillis
+      end
+    end
   end
 
   local hasTimer = lovr and lovr.timer and lovr.timer.getTime
@@ -723,20 +1148,26 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
       end
     end
 
-    local columnKey = self:_dequeueSkyColumn()
+    local columnKey, isUrgent = self:_dequeueSkyColumn()
     if columnKey then
       local x, z = world:_decodeWorldColumnKey(columnKey)
       if self:_isInsideSkyActiveWorldXZ(x, z) and not self.skyColumnsReady[columnKey] then
-        self:_recomputeSkyColumn(x, z, true, self.skyTrackDirtyVertical)
+        self:_recomputeSkyColumn(x, z, true, self.skyTrackDirtyVertical, isUrgent)
       end
       processed = processed + 1
     else
-      local worldIndex = self:_dequeueSkyFlood()
-      if not worldIndex then
-        break
+      local darkIndex, removedLight, darkUrgent = self:_dequeueSkyDark()
+      if darkIndex then
+        self:_propagateSkyDarkFrom(darkIndex, removedLight, self.skyTrackDirtyFlood, darkUrgent)
+        processed = processed + 1
+      else
+        local worldIndex, floodUrgent = self:_dequeueSkyFlood()
+        if not worldIndex then
+          break
+        end
+        self:_propagateSkyFloodFrom(worldIndex, self.skyTrackDirtyFlood, floodUrgent)
+        processed = processed + 1
       end
-      self:_propagateSkyFloodFrom(worldIndex, self.skyTrackDirtyFlood)
-      processed = processed + 1
     end
   end
 
@@ -817,18 +1248,38 @@ function FloodfillLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChu
   return removed
 end
 
-function FloodfillLighting:onOpacityChanged(x, z, cx, cz)
+function FloodfillLighting:onOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpacity)
   if not self.enabled then
     return
   end
 
   local world = self.world
-  self.skyColumnsReady[world:_worldColumnKey(x, z)] = nil
-
-  local queued = self:_scheduleSkyLocalRebuild(x, z, 15, true)
-  if queued > 0 then
-    self:_primeSkyLightAfterOpacityEdit()
+  local config = self.lightingConfig or {}
+  local radius = math.floor(tonumber(config.editRelightRadiusBlocks) or 15)
+  if radius < 1 then
+    radius = 1
   end
+  self:_setSkyPropagationBounds(x - radius, x + radius, z - radius, z + radius)
+
+  local columnKey = world:_worldColumnKey(x, z)
+  self.skyColumnsReady[columnKey] = nil
+  self:_enqueueSkyColumn(columnKey, true)
+
+  local increase = oldOpacity and newOpacity and newOpacity > oldOpacity
+  local decrease = oldOpacity and newOpacity and newOpacity < oldOpacity
+  if increase then
+    self:_seedEditNeighborhood(x, y, z, true, false, true)
+  elseif decrease then
+    self:_seedEditNeighborhood(x, y, z, false, true, true)
+  else
+    -- Fallback for unknown/ambiguous opacity changes.
+    self:_seedEditNeighborhood(x, y, z, true, true, true)
+  end
+
+  self.skyTrackDirtyVertical = false
+  self.skyTrackDirtyFlood = true
+  self:_setSkyStageFromQueues()
+  self:_primeSkyLightAfterOpacityEdit()
 end
 
 function FloodfillLighting:onBulkOpacityChanged(minX, maxX, minZ, maxZ)
@@ -836,15 +1287,22 @@ function FloodfillLighting:onBulkOpacityChanged(minX, maxX, minZ, maxZ)
     return
   end
 
-  local radius = 15
+  local config = self.lightingConfig or {}
+  local radius = math.floor(tonumber(config.editRelightRadiusBlocks) or 15)
+  if radius < 1 then
+    radius = 1
+  end
+  self:_setSkyPropagationBounds(minX - radius, maxX + radius, minZ - radius, maxZ + radius)
+
+  local queuePad = 1
   local queued = self:_scheduleSkyBoundsRebuild(
-    minX - radius,
-    maxX + radius,
-    minZ - radius,
-    maxZ + radius,
+    minX - queuePad,
+    maxX + queuePad,
+    minZ - queuePad,
+    maxZ + queuePad,
     true,
-    true,
-    true
+    false,
+    false
   )
   if queued > 0 then
     self:_primeSkyLightAfterOpacityEdit()

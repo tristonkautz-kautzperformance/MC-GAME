@@ -229,10 +229,10 @@ function ChunkWorld:getSkyLight(x, y, z)
   return 15
 end
 
-function ChunkWorld:_onSkyOpacityChanged(x, z, cx, cz)
+function ChunkWorld:_onSkyOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpacity)
   local backend = self._lightingBackend
   if backend and backend.onOpacityChanged then
-    backend:onOpacityChanged(x, z, cx, cz)
+    backend:onOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpacity)
   end
 end
 
@@ -633,7 +633,7 @@ function ChunkWorld:set(x, y, z, value)
   self:_markNeighborsIfBoundary(cx, cy, cz, lx, ly, lz)
 
   if oldOpacity ~= newOpacity then
-    self:_onSkyOpacityChanged(x, z, cx, cz)
+    self:_onSkyOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpacity)
   end
   return true
 end

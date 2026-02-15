@@ -2,6 +2,58 @@
 
 ## 2026-02-15
 
+### Floodfill Pass 3 (Urgent Priority + Mesh Gating)
+- Added urgent-priority queueing in `src/world/lighting/FloodfillLighting.lua`:
+  - sky column, dark, and flood queues now support urgent insertion/promotion.
+  - edit-triggered relight seeds now enqueue as urgent (`onOpacityChanged`), and urgency propagates through dark/flood steps.
+- Added urgent-aware budget behavior:
+  - `updateSkyLight(...)` now boosts to `urgentOpsPerFrame` / `urgentMillisPerFrame` while urgent work exists.
+  - added new lighting tunables in `src/constants.lua`:
+    - `urgentOpsPerFrame`, `urgentMillisPerFrame`
+    - `chunkEnsureOps`, `chunkEnsureMillis`
+- Added chunk-ready lighting gate + lower per-chunk ensure cost:
+  - `ensureSkyLightForChunk(...)` now performs a small bounded local lighting catch-up and returns `false` while urgent work for that chunk area is still pending.
+  - reduced default per-call ensure budget to avoid chunk-load spikes.
+- Updated renderer rebuild flow in `src/render/ChunkRenderer.lua` to respect lighting readiness:
+  - threaded rebuild enqueue now returns explicit states (`queued`, `defer`, `fallback`).
+  - chunks that are not lighting-ready are deferred and requeued instead of immediately forcing a sync mesh build with stale vertical-only lighting.
+  - sync rebuild path now also defers if lighting is not ready.
+
+### Floodfill Pass 2 (Startup + Edit-Seeding Reliability)
+- Added startup floodfill warmup in `src/world/lighting/FloodfillLighting.lua`:
+  - lighting now starts with no active region and first prune enqueues initial region columns for relight.
+  - warmup mode boosts lighting budget using `startupWarmupOpsPerFrame` / `startupWarmupMillisPerFrame` until queues drain.
+- Added full edit-context lighting hook plumbing:
+  - `ChunkWorld:_onSkyOpacityChanged(...)` now passes `x,y,z,cx,cy,cz,oldOpacity,newOpacity` to backends.
+  - updated `VerticalLighting:onOpacityChanged(...)` signature for compatibility (no behavior change).
+- Added explicit edit-neighborhood seed injection for floodfill:
+  - new `_seedEditNeighborhood(...)` seeds flood or dark queues from edited voxel + 6-neighbor cells.
+  - opacity decrease (opening) now seeds bright flood sources; opacity increase (closing) seeds dark removal sources.
+  - this fixes side-wall/opening cases where vertical column values alone were not enough to trigger relight.
+- Added runtime tuning knobs in `src/constants.lua`:
+  - `editRelightRadiusBlocks`
+  - `startupWarmupOpsPerFrame`
+  - `startupWarmupMillisPerFrame`
+
+### Floodfill Pass 1 Follow-up (Bounded Edit Propagation)
+- Added optional local propagation bounds to `src/world/lighting/FloodfillLighting.lua` for edit-triggered relight work:
+  - new helpers `_setSkyPropagationBounds(...)`, `_clearSkyPropagationBounds(...)`, `_isInsideSkyPropagationWorldXZ(...)`.
+  - dark/flood propagation now honors these bounds during edit updates.
+- `onOpacityChanged(...)` and `onBulkOpacityChanged(...)` now set a local relight window using `editRelightRadiusBlocks` (default 15) so updates do not flood across the whole active region.
+- Non-edit paths now avoid accidentally inheriting edit bounds:
+  - bounds clear on idle stage transition and movement-region delta queueing.
+  - `fillSkyLightHalo(...)` temporarily lifts bounds for mesh-prep column readiness/drain, then restores prior edit bounds.
+
+### Floodfill Pass 1 (Incremental Edit Relight)
+- Reworked floodfill edit updates in `src/world/lighting/FloodfillLighting.lua` to avoid reset-to-vertical behavior on block opacity changes.
+- Added a dedicated darkening queue (`skyDarkQueue`) and dark propagation pass:
+  - column recompute now enqueues both decrease and increase deltas (dark + flood), instead of flood-only growth.
+  - `updateSkyLight(...)` now processes `vertical -> dark -> flood` work under existing per-frame budgets.
+- Removed clear-and-reset edit relight path:
+  - single-block `onOpacityChanged(...)` now enqueues only the changed column for recompute.
+  - bulk-opacity updates now enqueue bounded columns without clearing old skylight state or resetting queues.
+- Vertical-stage relight from edit scheduling now stays non-dirty; dirty remesh signaling is driven by actual flood/dark light changes.
+
 ### Lighting Mode Toggle (Verification)
 - Switched active runtime mode to `vertical` in `src/constants.lua` (`Constants.LIGHTING.mode`) for regression verification of the vertical backend.
 

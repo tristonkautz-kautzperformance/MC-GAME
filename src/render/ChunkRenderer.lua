@@ -553,19 +553,19 @@ end
 
 function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
   if not self:_isMeshWorkerReady() then
-    return false
+    return 'fallback'
   end
   if self._threadInFlightCount >= self._threadMaxInFlight then
-    return false
+    return 'defer'
   end
   if self._threadInFlightByKey[key] then
-    return false
+    return 'defer'
   end
   if not self.world.fillBlockHalo then
-    return false
+    return 'fallback'
   end
   if not self.world.fillSkyLightHalo then
-    return false
+    return 'fallback'
   end
 
   if self.world.prepareChunk then
@@ -574,7 +574,7 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
   if self.world.ensureSkyLightForChunk then
     local ready = self.world:ensureSkyLightForChunk(cx, cy, cz)
     if ready == false then
-      return false
+      return 'defer'
     end
   end
 
@@ -621,7 +621,7 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     self:_releaseThreadHaloTable(halo)
     self:_releaseThreadSkyHaloTable(skyHalo)
     self:_disableMeshWorker(err)
-    return false
+    return 'fallback'
   end
 
   if usesHaloTablePayload then
@@ -637,7 +637,7 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
 
   self._threadInFlightByKey[key] = version
   self._threadInFlightCount = self._threadInFlightCount + 1
-  return true
+  return 'queued'
 end
 
 function ChunkRenderer:_applyThreadedResults(maxMillis)
@@ -703,7 +703,16 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
         )
         if not okApply then
           self:_disableMeshWorker(applyErr or 'mesh_apply_failed')
-          self:_rebuildChunk(result.cx, result.cy, result.cz)
+          local rebuiltSync = self:_rebuildChunk(result.cx, result.cy, result.cz)
+          if rebuiltSync == false then
+            self:_requeueDirtyEntry({
+              key = key,
+              cx = result.cx,
+              cy = result.cy,
+              cz = result.cz,
+              dist = 0
+            })
+          end
           break
         end
         applied = applied + 1
@@ -1507,7 +1516,10 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
     self.world:prepareChunk(cx, cy, cz)
   end
   if self.world.ensureSkyLightForChunk then
-    self.world:ensureSkyLightForChunk(cx, cy, cz)
+    local ready = self.world:ensureSkyLightForChunk(cx, cy, cz)
+    if ready == false then
+      return false
+    end
   end
 
   local oldOpaqueCount = #self._vertexPoolOpaque
@@ -1591,6 +1603,7 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
   if not okApply then
     error(tostring(applyErr or 'mesh_apply_failed'))
   end
+  return true
 end
 
 function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
@@ -1657,18 +1670,39 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
   end
 
   local rebuilt = 0
+  local attempted = 0
   local staleRequeued = 0
   local staleRequeueCap = self._staleRequeueCap or 0
+  local deferredEntries = {}
+  local deferredCount = 0
+
+  local function deferEntry(entry)
+    deferredCount = deferredCount + 1
+    deferredEntries[deferredCount] = entry
+  end
+
   local function processRebuildEntry(chunkEntry)
-    local queuedThreaded = self:_queueThreadedRebuild(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz, chunkEntry.key)
-    if not queuedThreaded then
-      self:_rebuildChunk(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz)
+    local threadStatus = self:_queueThreadedRebuild(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz, chunkEntry.key)
+    if threadStatus == 'queued' then
+      rebuilt = rebuilt + 1
+      return
+    end
+
+    if threadStatus == 'defer' then
+      deferEntry(chunkEntry)
+      return
+    end
+
+    local rebuiltSync = self:_rebuildChunk(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz)
+    if rebuiltSync == false then
+      deferEntry(chunkEntry)
+      return
     end
     rebuilt = rebuilt + 1
   end
 
-  while rebuilt < hardCap do
-    if useTimeBudget and rebuilt > 0 then
+  while attempted < hardCap do
+    if useTimeBudget and attempted > 0 then
       local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
       if elapsedMs >= maxMillis then
         break
@@ -1679,6 +1713,7 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
     if not entry then
       break
     end
+    attempted = attempted + 1
 
     local stalePriority = self._usePriorityRebuild
       and self._hasPriorityChunk
@@ -1693,6 +1728,14 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
     else
       processRebuildEntry(entry)
     end
+  end
+
+  for i = 1, deferredCount do
+    self:_requeueDirtyEntry(deferredEntries[i])
+    deferredEntries[i] = nil
+  end
+  for i = deferredCount + 1, #deferredEntries do
+    deferredEntries[i] = nil
   end
 
   self:_applyThreadedResults(self._threadMaxApplyMillis)

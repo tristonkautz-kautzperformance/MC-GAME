@@ -1,5 +1,99 @@
 # Dev Log
 
+## 2026-02-15
+
+### Lighting Mode Toggle (Verification)
+- Switched active runtime mode to `vertical` in `src/constants.lua` (`Constants.LIGHTING.mode`) for regression verification of the vertical backend.
+
+### Floodfill Lighting Rebuild (Clean Backend Rewrite)
+- Replaced `src/world/lighting/FloodfillLighting.lua` with a clean, standalone floodfill backend implementation (same public API, rewritten internals).
+- Rebuilt floodfill around an explicit two-phase queue model:
+  - vertical column recompute queue (`skyColumnsQueue`) for baseline skylight values.
+  - flood propagation queue (`skyFloodQueue`) using max-propagation (`candidate > neighbor`) with bounded per-frame budgets.
+- Kept world/chunk integration compatible with existing systems:
+  - `getSkyLight(...)`, `ensureSkyLightForChunk(...)`, `fillSkyLightHalo(...)`, `updateSkyLight(...)`, `pruneSkyLightChunks(...)`.
+  - edit hooks: `onOpacityChanged(...)`, `onBulkOpacityChanged(...)`, `onPrepareChunk(...)`.
+- Improved lighting-to-mesh correctness on chunk boundaries:
+  - skylight voxel changes now mark dirty chunks and boundary-neighbor chunks when the changed voxel sits on a chunk edge.
+- Rebuilt edit-driven relight behavior:
+  - opacity edits schedule bounded local rebuild windows (`radius=15` blocks), clear stale skylight in-window, then recompute/flood.
+  - immediate catch-up pass after edits still uses `editImmediateOps` / `editImmediateMillis`.
+- Added bounded flood catch-up during halo generation:
+  - `fillSkyLightHalo(...)` now runs a small synchronous lighting update budget (`meshImmediateOps` / `meshImmediateMillis`) before packing halo light data, reducing vertical-only snapshots in newly meshed chunks.
+
+### Floodfill Lighting Follow-up (Behavior + Cost)
+- Fixed floodfill seed generation during meshing prep in `src/world/ChunkWorld.lua`:
+  - `ensureSkyLightForChunk(...)` and `fillSkyLightHalo(...)` now request flood seeding when `Constants.LIGHTING.mode == 'floodfill'`.
+  - This prevents chunk halo prep from silently baking vertical-only light in floodfill mode.
+- Added idle-stage flood kickoff after lazy column recompute:
+  - `_recomputeSkyColumn(...)` now transitions to `flood` stage when it enqueues flood nodes while the stage is `idle`.
+- Replaced movement-triggered full-region flood relight with incremental region delta queueing:
+  - new `_queueSkyRegionDelta(...)` only enqueues newly entered active columns instead of clearing/rebuilding the whole active region every center-chunk move.
+  - `pruneSkyLightChunks(...)` now uses this delta queue path for floodfill mode.
+- Reduced floodfill thrash from vertical pass:
+  - `updateSkyLight(...)` vertical stage now recomputes columns with `markDirty=false`; dirty marking is driven by actual flood propagation changes.
+- Added stale queue guards:
+  - vertical-stage queued columns are ignored if outside the active sky X/Z region.
+  - flood propagation now early-outs for sources outside the active sky X/Z region.
+
+### Floodfill Lighting Fix (Flood Stage Visibility)
+- Reduced flood queue seed volume in `src/world/lighting/FloodfillLighting.lua`:
+  - `_recomputeSkyColumn(...)` now seeds flood from the topmost and bottommost lit voxels (instead of every lit voxel).
+  - flood propagation can now "walk down" columns on equal-light vertical steps, enabling sideways spread from lower heights without per-y seeding.
+- Split dirty tracking between vertical and flood stages:
+  - movement-driven region deltas keep vertical recompute non-dirty, but flood propagation marks affected chunks dirty so meshes can be rebuilt with updated light.
+
+### Floodfill Edit Path Follow-up (No Full-Region Reset)
+- Reworked floodfill edit scheduling in `src/world/ChunkWorld.lua` to avoid resetting to vertical across the entire active region on each opacity edit:
+  - added `_scheduleSkyBoundsRebuild(...)` and `_scheduleSkyLocalRebuild(...)`.
+  - `_onSkyOpacityChanged(...)` now queues a local rebuild window (`radius=15` blocks) instead of `_scheduleSkyRegionRebuild(true)`.
+- Added bounded immediate floodfill catch-up after single opacity edits:
+  - `_primeSkyLightAfterOpacityEdit(...)` runs a synchronous, bounded skylight update pass right after local edit relight scheduling.
+  - supports optional `Constants.LIGHTING.editImmediateOps` / `editImmediateMillis` tuning (defaults now: `8192` ops, `0` ms budget for op-capped catch-up).
+- Reduced flood queue bloat during vertical recompute:
+  - `_recomputeSkyColumn(...)` now enqueues flood seeds only for skylight voxels that actually changed, instead of every lit voxel in the column.
+  - this prevents long post-edit "vertical first, flood later" transitions caused by huge unchanged-seed queues.
+- Reduced edit-induced visual fallback to vertical:
+  - floodfill no longer calls `_markLightingDirtyRadius(...)` up-front during normal local edit relight scheduling.
+  - vertical-stage dirty marking now follows `_skyTrackDirty` so edit-driven relights can mark changed chunks, while movement-driven region deltas stay non-dirty.
+- Movement-driven delta queueing now stays non-dirty:
+  - `_queueSkyRegionDelta(...)` now sets `_skyTrackDirty=false` to avoid unnecessary mesh churn while the player moves.
+- Updated bulk-edit floodfill scheduling:
+  - `applyEditsBulk(...)` now tracks opacity-change bounds and queues a bounded floodfill rebuild window (expanded by 15 blocks), instead of scheduling a full active-region rebuild.
+
+### Floodfill Status Reset
+- Default runtime mode remains `floodfill` in `src/constants.lua` (`Constants.LIGHTING.mode`).
+
+### Lighting Backend Isolation Refactor
+- Added isolated lighting backend modules:
+  - `src/world/lighting/VerticalLighting.lua`
+  - `src/world/lighting/FloodfillLighting.lua`
+- Refactored `src/world/ChunkWorld.lua` to use a single active backend selected by `Constants.LIGHTING.mode`:
+  - backend factory + initialization now lives in `_initLighting(...)`.
+  - public skylight APIs now delegate to backend implementations:
+    - `getSkyLight(...)`
+    - `ensureSkyLightForChunk(...)`
+    - `fillSkyLightHalo(...)`
+    - `updateSkyLight(...)`
+    - `pruneSkyLightChunks(...)`
+  - opacity-change and chunk-prepare hooks now delegate through backend methods:
+    - `_onSkyOpacityChanged(...)`
+    - `applyEditsBulk(...)` opacity notifications
+    - `prepareChunk(...)` column invalidation hook
+- `FloodfillLighting` is now standalone and no longer delegates to vertical internals.
+
+### Floodfill Backend Decoupling Pass
+- Replaced `src/world/lighting/FloodfillLighting.lua` scaffold with a fully independent floodfill implementation:
+  - owns its own skylight chunk cache, vertical/flood queues, active-region bounds, and update scheduling.
+  - keeps floodfill-only edit hooks (`onOpacityChanged`, `onBulkOpacityChanged`, `onPrepareChunk`) isolated from vertical.
+- Added floodfill queue dedupe + bounded rebuild clearing in the new backend:
+  - flood queue now tracks `worldIndex` membership to avoid duplicate queue bloat.
+  - edit-driven rebuild windows clear existing skylight values in-bounds before recompute to avoid stale carry-over.
+- Removed legacy in-world floodfill internals from `src/world/ChunkWorld.lua`:
+  - deleted old `_sky*` state fields and helper methods so `ChunkWorld` only routes through the selected lighting backend.
+  - this eliminates mixed execution paths between vertical and floodfill logic.
+- Switched `Constants.LIGHTING.mode` back to `floodfill` in `src/constants.lua` for direct in-game validation of the decoupled backend.
+
 ## 2026-02-14
 
 ### Alpha Skylight Lighting Pass

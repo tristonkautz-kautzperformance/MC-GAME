@@ -30,10 +30,12 @@ Constants.SKY_NIGHT = { .03, .04, .09 }
 
 Constants.LIGHTING = {
   enabled = true,
-  mode = 'vertical',
+  mode = 'floodfill',
   leafOpacity = 4,
   maxUpdatesPerFrame = 8192,
   maxMillisPerFrame = 1.25,
+  editImmediateOps = 8192,
+  editImmediateMillis = 0,
   floodfillExtraKeepRadiusChunks = 1,
   debugDraw = false,
   debugForceGrayscale = false

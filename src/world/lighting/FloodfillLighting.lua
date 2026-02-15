@@ -77,6 +77,18 @@ function FloodfillLighting:reset()
   self.skyPropMaxX = nil
   self.skyPropMinZ = nil
   self.skyPropMaxZ = nil
+
+  self.skyRegionTasks = {}
+  self.skyRegionTaskHead = 1
+  self.skyRegionTaskTail = 0
+  self.skyRegionTaskCount = 0
+  self.skyRegionOpsPending = 0
+  self.skyRegionOpsProcessedLast = 0
+  self.skyRegionTaskPool = {}
+
+  self._frameMsHint = 0
+  self._worstFrameMsHint = 0
+  self._chunkEnsureScaleLast = 1
 end
 
 function FloodfillLighting:_getBlockLightOpacity(block)
@@ -168,11 +180,270 @@ function FloodfillLighting:_setSkyStageFromQueues()
     return
   end
 
+  if self:_hasRegionTasks() then
+    self.skyStage = 'idle'
+    return
+  end
+
   self.skyStage = 'idle'
   self.skyTrackDirtyVertical = false
   self.skyTrackDirtyFlood = false
   self.skyWarmupActive = false
   self:_clearSkyPropagationBounds()
+end
+
+function FloodfillLighting:_hasRegionTasks()
+  return self.skyRegionTaskHead <= self.skyRegionTaskTail
+end
+
+function FloodfillLighting:_acquireRegionTask(kind, x1, z, x, urgent, opsRemaining)
+  local pool = self.skyRegionTaskPool
+  local task = pool[#pool]
+  if task then
+    pool[#pool] = nil
+  else
+    task = {}
+  end
+
+  task.kind = kind
+  task.x1 = x1
+  task.z = z
+  task.x = x
+  task.urgent = urgent and true or false
+  task.opsRemaining = opsRemaining
+  return task
+end
+
+function FloodfillLighting:_recycleRegionTask(task)
+  if not task then
+    return
+  end
+  task.kind = nil
+  task.x1 = nil
+  task.z = nil
+  task.x = nil
+  task.urgent = nil
+  task.opsRemaining = nil
+  local pool = self.skyRegionTaskPool
+  pool[#pool + 1] = task
+end
+
+function FloodfillLighting:_clearRegionTasks()
+  local tasks = self.skyRegionTasks
+  for i = self.skyRegionTaskHead, self.skyRegionTaskTail do
+    local task = tasks[i]
+    tasks[i] = nil
+    if task then
+      self:_recycleRegionTask(task)
+    end
+  end
+  self.skyRegionTaskHead = 1
+  self.skyRegionTaskTail = 0
+  self.skyRegionTaskCount = 0
+  self.skyRegionOpsPending = 0
+  self.skyRegionOpsProcessedLast = 0
+end
+
+function FloodfillLighting:_enqueueRegionTask(task)
+  if not task then
+    return 0
+  end
+
+  local opsRemaining = math.floor(tonumber(task.opsRemaining) or 0)
+  if opsRemaining <= 0 then
+    return 0
+  end
+
+  task.opsRemaining = opsRemaining
+  local tail = self.skyRegionTaskTail + 1
+  self.skyRegionTaskTail = tail
+  self.skyRegionTasks[tail] = task
+  self.skyRegionTaskCount = self.skyRegionTaskCount + 1
+  self.skyRegionOpsPending = self.skyRegionOpsPending + opsRemaining
+  return opsRemaining
+end
+
+function FloodfillLighting:_peekRegionTask()
+  if self.skyRegionTaskHead > self.skyRegionTaskTail then
+    return nil
+  end
+  return self.skyRegionTasks[self.skyRegionTaskHead]
+end
+
+function FloodfillLighting:_popRegionTask()
+  if self.skyRegionTaskHead > self.skyRegionTaskTail then
+    self.skyRegionTaskHead = 1
+    self.skyRegionTaskTail = 0
+    self.skyRegionTaskCount = 0
+    return
+  end
+
+  local head = self.skyRegionTaskHead
+  local task = self.skyRegionTasks[head]
+  self.skyRegionTasks[head] = nil
+  self.skyRegionTaskHead = head + 1
+  if self.skyRegionTaskCount > 0 then
+    self.skyRegionTaskCount = self.skyRegionTaskCount - 1
+  end
+
+  if self.skyRegionTaskHead > self.skyRegionTaskTail then
+    self.skyRegionTaskHead = 1
+    self.skyRegionTaskTail = 0
+    self.skyRegionTaskCount = 0
+  end
+  self:_recycleRegionTask(task)
+end
+
+function FloodfillLighting:_scheduleRegionQueueColumnsRows(minX, maxX, minZ, maxZ, urgent, clipToActive)
+  local world = self.world
+  local bx0 = clampInt(math.floor(tonumber(minX) or 1), 1, world.sizeX)
+  local bx1 = clampInt(math.floor(tonumber(maxX) or world.sizeX), 1, world.sizeX)
+  local bz0 = clampInt(math.floor(tonumber(minZ) or 1), 1, world.sizeZ)
+  local bz1 = clampInt(math.floor(tonumber(maxZ) or world.sizeZ), 1, world.sizeZ)
+  if bx1 < bx0 or bz1 < bz0 then
+    return 0
+  end
+
+  if clipToActive then
+    if bx0 < self.skyActiveMinX then bx0 = self.skyActiveMinX end
+    if bx1 > self.skyActiveMaxX then bx1 = self.skyActiveMaxX end
+    if bz0 < self.skyActiveMinZ then bz0 = self.skyActiveMinZ end
+    if bz1 > self.skyActiveMaxZ then bz1 = self.skyActiveMaxZ end
+    if bx1 < bx0 or bz1 < bz0 then
+      return 0
+    end
+  end
+
+  local width = bx1 - bx0 + 1
+  local scheduled = 0
+  local isUrgent = urgent and true or false
+  for z = bz0, bz1 do
+    local task = self:_acquireRegionTask('queue_columns_row', bx1, z, bx0, isUrgent, width)
+    scheduled = scheduled + self:_enqueueRegionTask(task)
+  end
+  return scheduled
+end
+
+function FloodfillLighting:_scheduleRegionRemoveReadyRows(minX, maxX, minZ, maxZ)
+  local world = self.world
+  local bx0 = clampInt(math.floor(tonumber(minX) or 1), 1, world.sizeX)
+  local bx1 = clampInt(math.floor(tonumber(maxX) or world.sizeX), 1, world.sizeX)
+  local bz0 = clampInt(math.floor(tonumber(minZ) or 1), 1, world.sizeZ)
+  local bz1 = clampInt(math.floor(tonumber(maxZ) or world.sizeZ), 1, world.sizeZ)
+  if bx1 < bx0 or bz1 < bz0 then
+    return 0
+  end
+
+  local width = bx1 - bx0 + 1
+  local scheduled = 0
+  for z = bz0, bz1 do
+    local task = self:_acquireRegionTask('remove_ready_row', bx1, z, bx0, false, width)
+    scheduled = scheduled + self:_enqueueRegionTask(task)
+  end
+  return scheduled
+end
+
+function FloodfillLighting:_processRegionTasks(maxOps, maxMillis)
+  if not self:_hasRegionTasks() then
+    self.skyRegionOpsProcessedLast = 0
+    return 0
+  end
+
+  local explicitOpsLimit = maxOps ~= nil
+  local opsLimit = tonumber(maxOps)
+  if opsLimit ~= nil then
+    opsLimit = math.floor(opsLimit)
+    if opsLimit < 0 then
+      opsLimit = 0
+    end
+  end
+
+  local millisLimit = tonumber(maxMillis)
+  local hasTimer = lovr and lovr.timer and lovr.timer.getTime
+  local useTimeBudget = hasTimer and millisLimit and millisLimit > 0
+  local startTime = 0
+  if useTimeBudget then
+    startTime = lovr.timer.getTime()
+  end
+
+  if (not opsLimit or opsLimit <= 0) and not useTimeBudget then
+    if explicitOpsLimit then
+      self.skyRegionOpsProcessedLast = 0
+      return 0
+    end
+    opsLimit = 1
+  end
+
+  local world = self.world
+  local processed = 0
+  while true do
+    if opsLimit and opsLimit > 0 and processed >= opsLimit then
+      break
+    end
+    if useTimeBudget and processed > 0 then
+      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+      if elapsedMs >= millisLimit then
+        break
+      end
+    end
+
+    local task = self:_peekRegionTask()
+    if not task then
+      break
+    end
+
+    local stepDone = false
+    if task.kind == 'queue_columns_row' then
+      local x = task.x
+      if x and x <= task.x1 then
+        if self:_isInsideSkyActiveWorldXZ(x, task.z) then
+          local columnKey = world:_worldColumnKey(x, task.z)
+          self.skyColumnsReady[columnKey] = nil
+          self:_enqueueSkyColumn(columnKey, task.urgent)
+        end
+        task.x = x + 1
+        stepDone = true
+      end
+    elseif task.kind == 'remove_ready_row' then
+      local x = task.x
+      if x and x <= task.x1 then
+        self.skyColumnsReady[world:_worldColumnKey(x, task.z)] = nil
+        task.x = x + 1
+        stepDone = true
+      end
+    end
+
+    if not stepDone then
+      self:_popRegionTask()
+    else
+      processed = processed + 1
+      task.opsRemaining = (task.opsRemaining or 1) - 1
+      if self.skyRegionOpsPending > 0 then
+        self.skyRegionOpsPending = self.skyRegionOpsPending - 1
+      end
+      if task.opsRemaining <= 0 then
+        self:_popRegionTask()
+      end
+    end
+  end
+
+  if self.skyRegionOpsPending < 0 then
+    self.skyRegionOpsPending = 0
+  end
+  self.skyRegionOpsProcessedLast = processed
+  return processed
+end
+
+function FloodfillLighting:setFrameTiming(frameMs, worstFrameMs)
+  self._frameMsHint = tonumber(frameMs) or 0
+  self._worstFrameMsHint = tonumber(worstFrameMs) or self._frameMsHint
+end
+
+function FloodfillLighting:getPerfStats()
+  return self.skyRegionOpsProcessedLast or 0,
+    self.skyRegionOpsPending or 0,
+    self.skyRegionTaskCount or 0,
+    self._chunkEnsureScaleLast or 1
 end
 
 function FloodfillLighting:_enqueueSkyColumn(columnKey, urgent)
@@ -702,6 +973,7 @@ function FloodfillLighting:_scheduleSkyBoundsRebuild(minX, maxX, minZ, maxZ, tra
     self:_clearSkyColumnsQueue()
     self:_clearSkyDarkQueue()
     self:_clearSkyFloodQueue()
+    self:_clearRegionTasks()
   end
 
   if clearOld then
@@ -788,6 +1060,32 @@ function FloodfillLighting:_drainSkyLightForMeshPrep()
   return self:updateSkyLight(immediateOps, immediateMillis)
 end
 
+function FloodfillLighting:_removeSkyLightChunksInBounds(minCx, maxCx, minCz, maxCz)
+  local world = self.world
+  local cx0 = clampInt(math.floor(tonumber(minCx) or 1), 1, world.chunksX)
+  local cx1 = clampInt(math.floor(tonumber(maxCx) or world.chunksX), 1, world.chunksX)
+  local cz0 = clampInt(math.floor(tonumber(minCz) or 1), 1, world.chunksZ)
+  local cz1 = clampInt(math.floor(tonumber(maxCz) or world.chunksZ), 1, world.chunksZ)
+  if cx1 < cx0 or cz1 < cz0 then
+    return 0
+  end
+
+  local removed = 0
+  for cz = cz0, cz1 do
+    for cx = cx0, cx1 do
+      for cy = 1, world.chunksY do
+        local chunkKey = world:chunkKey(cx, cy, cz)
+        if self.skyLightChunks[chunkKey] ~= nil then
+          self.skyLightChunks[chunkKey] = nil
+          removed = removed + 1
+        end
+      end
+    end
+  end
+
+  return removed
+end
+
 function FloodfillLighting:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMaxZ)
   if not self.enabled then
     return 0
@@ -797,21 +1095,42 @@ function FloodfillLighting:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMa
 
   local world = self.world
   local oldHasRegion = oldMaxX and oldMinX and oldMaxX >= oldMinX and oldMaxZ and oldMinZ and oldMaxZ >= oldMinZ
+  local newMinX = self.skyActiveMinX
+  local newMaxX = self.skyActiveMaxX
+  local newMinZ = self.skyActiveMinZ
+  local newMaxZ = self.skyActiveMaxZ
   local queued = 0
 
-  for z = self.skyActiveMinZ, self.skyActiveMaxZ do
-    for x = self.skyActiveMinX, self.skyActiveMaxX do
-      local inOldRegion = oldHasRegion
-        and x >= oldMinX and x <= oldMaxX
-        and z >= oldMinZ and z <= oldMaxZ
+  if not oldHasRegion then
+    self:_clearRegionTasks()
+    queued = self:_scheduleRegionQueueColumnsRows(newMinX, newMaxX, newMinZ, newMaxZ, false, true)
+  else
+    local oldWidth = oldMaxX - oldMinX + 1
+    local oldDepth = oldMaxZ - oldMinZ + 1
+    local newWidth = newMaxX - newMinX + 1
+    local newDepth = newMaxZ - newMinZ + 1
+    local shiftX = newMinX - oldMinX
+    local shiftZ = newMinZ - oldMinZ
+    local canUseRingDelta = oldWidth == newWidth
+      and oldDepth == newDepth
+      and math.abs(shiftX) <= world.chunkSize
+      and math.abs(shiftZ) <= world.chunkSize
 
-      if not inOldRegion then
-        local columnKey = world:_worldColumnKey(x, z)
-        self.skyColumnsReady[columnKey] = nil
-        if self:_enqueueSkyColumn(columnKey, false) then
-          queued = queued + 1
-        end
+    if canUseRingDelta then
+      if shiftX > 0 then
+        queued = queued + self:_scheduleRegionQueueColumnsRows(oldMaxX + 1, newMaxX, newMinZ, newMaxZ, false, true)
+      elseif shiftX < 0 then
+        queued = queued + self:_scheduleRegionQueueColumnsRows(newMinX, oldMinX - 1, newMinZ, newMaxZ, false, true)
       end
+
+      if shiftZ > 0 then
+        queued = queued + self:_scheduleRegionQueueColumnsRows(newMinX, newMaxX, oldMaxZ + 1, newMaxZ, false, true)
+      elseif shiftZ < 0 then
+        queued = queued + self:_scheduleRegionQueueColumnsRows(newMinX, newMaxX, newMinZ, oldMinZ - 1, false, true)
+      end
+    else
+      self:_clearRegionTasks()
+      queued = self:_scheduleRegionQueueColumnsRows(newMinX, newMaxX, newMinZ, newMaxZ, false, true)
     end
   end
 
@@ -821,7 +1140,9 @@ function FloodfillLighting:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMa
     if not oldHasRegion then
       self.skyWarmupActive = true
     end
-    self:_setSkyStageFromQueues()
+    if self:_hasSkyColumnsQueue() or self:_hasSkyDarkQueue() or self:_hasSkyFloodQueue() then
+      self:_setSkyStageFromQueues()
+    end
   end
 
   return queued
@@ -951,6 +1272,58 @@ function FloodfillLighting:getSkyLight(x, y, z)
   return self:_getSkyLightWorld(x, y, z)
 end
 
+function FloodfillLighting:_computeChunkEnsureScale(config)
+  local softMs = tonumber(config.chunkEnsureSpikeSoftMs)
+  if softMs == nil then
+    softMs = 12
+  end
+
+  local hardMs = tonumber(config.chunkEnsureSpikeHardMs)
+  if hardMs == nil then
+    hardMs = 20
+  end
+  if hardMs < softMs then
+    hardMs = softMs
+  end
+
+  local softScale = tonumber(config.chunkEnsureSpikeSoftScale)
+  if softScale == nil then
+    softScale = 0.5
+  end
+  local hardScale = tonumber(config.chunkEnsureSpikeHardScale)
+  if hardScale == nil then
+    hardScale = 0.2
+  end
+
+  if softScale < 0 then
+    softScale = 0
+  elseif softScale > 1 then
+    softScale = 1
+  end
+
+  if hardScale < 0 then
+    hardScale = 0
+  elseif hardScale > softScale then
+    hardScale = softScale
+  end
+
+  local frameMs = tonumber(self._frameMsHint) or 0
+  local worstMs = tonumber(self._worstFrameMsHint) or frameMs
+  local sampleMs = frameMs
+  local dampedWorstMs = worstMs * 0.5
+  if dampedWorstMs > sampleMs then
+    sampleMs = dampedWorstMs
+  end
+
+  if sampleMs >= hardMs then
+    return hardScale
+  end
+  if sampleMs >= softMs then
+    return softScale
+  end
+  return 1
+end
+
 function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
   local world = self.world
   if not self.enabled then
@@ -968,6 +1341,16 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
   local localMillis = tonumber(config.chunkEnsureMillis)
   if localMillis == nil then
     localMillis = 0.2
+  end
+
+  local ensureScale = self:_computeChunkEnsureScale(config)
+  self._chunkEnsureScaleLast = ensureScale
+  if ensureScale < 1 then
+    localOps = math.floor(localOps * ensureScale)
+    if localOps < 0 then
+      localOps = 0
+    end
+    localMillis = localMillis * ensureScale
   end
 
   world:prepareChunk(cx, cy, cz)
@@ -1064,11 +1447,7 @@ end
 
 function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   if not self.enabled then
-    return 0
-  end
-
-  self:_setSkyStageFromQueues()
-  if self.skyStage == 'idle' then
+    self.skyRegionOpsProcessedLast = 0
     return 0
   end
 
@@ -1124,14 +1503,65 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   end
 
   local hasTimer = lovr and lovr.timer and lovr.timer.getTime
+  local useOverallTimeBudget = hasTimer and millisLimit and millisLimit > 0
+  local overallStartTime = 0
+  if useOverallTimeBudget then
+    overallStartTime = lovr.timer.getTime()
+  end
+
+  if (not opsLimit or opsLimit <= 0) and not useOverallTimeBudget then
+    opsLimit = 1
+  end
+
+  local regionOpsLimit = math.floor(tonumber(config.regionStripOpsPerFrame) or 1024)
+  if regionOpsLimit < 0 then
+    regionOpsLimit = 0
+  end
+  local regionMillisLimit = tonumber(config.regionStripMillisPerFrame)
+  if regionMillisLimit == nil then
+    regionMillisLimit = 0.35
+  end
+  if explicitOpsLimit and opsLimit and opsLimit >= 0 and regionOpsLimit > opsLimit then
+    regionOpsLimit = opsLimit
+  end
+  if explicitMillisLimit and millisLimit and millisLimit >= 0 and regionMillisLimit > millisLimit then
+    regionMillisLimit = millisLimit
+  end
+
+  local regionProcessed = 0
+  if self:_hasRegionTasks() then
+    regionProcessed = self:_processRegionTasks(regionOpsLimit, regionMillisLimit)
+  else
+    self.skyRegionOpsProcessedLast = 0
+  end
+
+  if opsLimit and opsLimit > 0 then
+    opsLimit = opsLimit - regionProcessed
+    if opsLimit < 0 then
+      opsLimit = 0
+    end
+  end
+
+  if useOverallTimeBudget then
+    local spentMs = (lovr.timer.getTime() - overallStartTime) * 1000
+    millisLimit = millisLimit - spentMs
+    if millisLimit < 0 then
+      millisLimit = 0
+    end
+  end
+
+  self:_setSkyStageFromQueues()
+  if self.skyStage == 'idle' then
+    return regionProcessed
+  end
+
   local useTimeBudget = hasTimer and millisLimit and millisLimit > 0
   local startTime = 0
   if useTimeBudget then
     startTime = lovr.timer.getTime()
   end
-
   if (not opsLimit or opsLimit <= 0) and not useTimeBudget then
-    opsLimit = 1
+    return regionProcessed
   end
 
   local world = self.world
@@ -1172,7 +1602,7 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   end
 
   self:_setSkyStageFromQueues()
-  return processed
+  return processed + regionProcessed
 end
 
 function FloodfillLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)
@@ -1181,6 +1611,10 @@ function FloodfillLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChu
   end
 
   local world = self.world
+  local oldMinCx = self.skyActiveMinCx
+  local oldMaxCx = self.skyActiveMaxCx
+  local oldMinCz = self.skyActiveMinCz
+  local oldMaxCz = self.skyActiveMaxCz
   local oldMinX = self.skyActiveMinX
   local oldMaxX = self.skyActiveMaxX
   local oldMinZ = self.skyActiveMinZ
@@ -1226,22 +1660,57 @@ function FloodfillLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChu
   self.skyActiveMaxZ = math.min(maxCz * world.chunkSize, world.sizeZ)
 
   local removed = 0
-  for chunkKey in pairs(self.skyLightChunks) do
-    local chunkX, _, chunkZ = world:decodeChunkKey(chunkKey)
-    if chunkX < minCx or chunkX > maxCx or chunkZ < minCz or chunkZ > maxCz then
-      self.skyLightChunks[chunkKey] = nil
-      removed = removed + 1
-    end
-  end
-
-  for columnKey in pairs(self.skyColumnsReady) do
-    local x, z = world:_decodeWorldColumnKey(columnKey)
-    if x < self.skyActiveMinX or x > self.skyActiveMaxX or z < self.skyActiveMinZ or z > self.skyActiveMaxZ then
-      self.skyColumnsReady[columnKey] = nil
-    end
-  end
-
   if regionChanged then
+    local oldHasRegion = oldMaxCx and oldMinCx and oldMaxCx >= oldMinCx and oldMaxCz and oldMinCz and oldMaxCz >= oldMinCz
+    local oldWidth = oldHasRegion and (oldMaxCx - oldMinCx + 1) or 0
+    local oldDepth = oldHasRegion and (oldMaxCz - oldMinCz + 1) or 0
+    local newWidth = maxCx - minCx + 1
+    local newDepth = maxCz - minCz + 1
+    local shiftCx = minCx - (oldMinCx or minCx)
+    local shiftCz = minCz - (oldMinCz or minCz)
+    local canUseRingDeltaPrune = oldHasRegion
+      and oldWidth == newWidth
+      and oldDepth == newDepth
+      and math.abs(shiftCx) <= 1
+      and math.abs(shiftCz) <= 1
+
+    if not canUseRingDeltaPrune then
+      self:_clearRegionTasks()
+    end
+
+    if canUseRingDeltaPrune then
+      if shiftCx > 0 then
+        removed = removed + self:_removeSkyLightChunksInBounds(oldMinCx, minCx - 1, oldMinCz, oldMaxCz)
+        self:_scheduleRegionRemoveReadyRows(oldMinX, self.skyActiveMinX - 1, oldMinZ, oldMaxZ)
+      elseif shiftCx < 0 then
+        removed = removed + self:_removeSkyLightChunksInBounds(maxCx + 1, oldMaxCx, oldMinCz, oldMaxCz)
+        self:_scheduleRegionRemoveReadyRows(self.skyActiveMaxX + 1, oldMaxX, oldMinZ, oldMaxZ)
+      end
+
+      if shiftCz > 0 then
+        removed = removed + self:_removeSkyLightChunksInBounds(oldMinCx, oldMaxCx, oldMinCz, minCz - 1)
+        self:_scheduleRegionRemoveReadyRows(oldMinX, oldMaxX, oldMinZ, self.skyActiveMinZ - 1)
+      elseif shiftCz < 0 then
+        removed = removed + self:_removeSkyLightChunksInBounds(oldMinCx, oldMaxCx, maxCz + 1, oldMaxCz)
+        self:_scheduleRegionRemoveReadyRows(oldMinX, oldMaxX, self.skyActiveMaxZ + 1, oldMaxZ)
+      end
+    else
+      for chunkKey in pairs(self.skyLightChunks) do
+        local chunkX, _, chunkZ = world:decodeChunkKey(chunkKey)
+        if chunkX < minCx or chunkX > maxCx or chunkZ < minCz or chunkZ > maxCz then
+          self.skyLightChunks[chunkKey] = nil
+          removed = removed + 1
+        end
+      end
+
+      for columnKey in pairs(self.skyColumnsReady) do
+        local x, z = world:_decodeWorldColumnKey(columnKey)
+        if x < self.skyActiveMinX or x > self.skyActiveMaxX or z < self.skyActiveMinZ or z > self.skyActiveMaxZ then
+          self.skyColumnsReady[columnKey] = nil
+        end
+      end
+    end
+
     self:_queueSkyRegionDelta(oldMinX, oldMaxX, oldMinZ, oldMaxZ)
   end
 

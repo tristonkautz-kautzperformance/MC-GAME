@@ -103,6 +103,7 @@ function ChunkRenderer.new(constants, world)
   self._rebuildConfig = constants.REBUILD or {}
   self._usePriorityRebuild = self._rebuildConfig.prioritize ~= false
   self._priorityHorizontalOnly = self._rebuildConfig.prioritizeHorizontalOnly ~= false
+  self._releaseMeshesRuntime = self._rebuildConfig.releaseMeshesRuntime == true
   self._rebucketFullThreshold = math.floor(tonumber(self._rebuildConfig.rebucketFullThreshold) or 128)
   if self._rebucketFullThreshold < 0 then
     self._rebucketFullThreshold = 0
@@ -220,6 +221,34 @@ function ChunkRenderer:getMeshingModeLabel()
     return 'Greedy'
   end
   return 'Naive'
+end
+
+function ChunkRenderer:_releaseMesh(mesh)
+  if mesh and type(mesh.release) == 'function' then
+    pcall(function()
+      mesh:release()
+    end)
+  end
+end
+
+function ChunkRenderer:_releaseChunkMeshEntry(entry, forceRelease)
+  if not entry then
+    return
+  end
+
+  local opaque = entry.opaque
+  local alpha = entry.alpha
+  entry.opaque = nil
+  entry.alpha = nil
+
+  if forceRelease or self._releaseMeshesRuntime then
+    if opaque and opaque ~= alpha then
+      self:_releaseMesh(opaque)
+    end
+    if alpha then
+      self:_releaseMesh(alpha)
+    end
+  end
 end
 
 function ChunkRenderer:_buildThreadBlockInfo()
@@ -486,6 +515,7 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
 
     if indexedMode and indexCount > 0 then
       if not indexData then
+        self:_releaseMesh(mesh)
         return nil, 'missing_index_data'
       end
 
@@ -501,6 +531,7 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
       end
 
       if not okIndex then
+        self:_releaseMesh(mesh)
         return nil, indexErr
       end
     end
@@ -512,20 +543,23 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
   if errOpaque then
     return false, errOpaque
   end
-  if opaqueMesh then
-    entry.opaque = opaqueMesh
-  else
-    entry.opaque = nil
-  end
 
   local alphaMesh, errAlpha = createMesh(verticesAlpha, alphaCount, indicesAlpha, indexCountAlpha, indexTypeAlpha)
   if errAlpha then
+    self:_releaseMesh(opaqueMesh)
     return false, errAlpha
   end
-  if alphaMesh then
-    entry.alpha = alphaMesh
-  else
-    entry.alpha = nil
+
+  local oldOpaque = entry.opaque
+  local oldAlpha = entry.alpha
+  entry.opaque = opaqueMesh or nil
+  entry.alpha = alphaMesh or nil
+
+  if self._releaseMeshesRuntime and oldOpaque and oldOpaque ~= entry.opaque and oldOpaque ~= oldAlpha then
+    self:_releaseMesh(oldOpaque)
+  end
+  if self._releaseMeshesRuntime and oldAlpha and oldAlpha ~= entry.alpha then
+    self:_releaseMesh(oldAlpha)
   end
 
   local originX = (cx - 1) * cs
@@ -724,6 +758,11 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
 end
 
 function ChunkRenderer:shutdown()
+  for key, entry in pairs(self._chunkMeshes) do
+    self:_releaseChunkMeshEntry(entry, true)
+    self._chunkMeshes[key] = nil
+  end
+
   if self._meshWorker then
     self._meshWorker:shutdown()
     self._meshWorker = nil
@@ -890,6 +929,7 @@ function ChunkRenderer:_pruneChunkMeshesStep(maxChecks, maxMillis)
       end
 
       if dist > keepRadius then
+        self:_releaseChunkMeshEntry(entry)
         self._chunkMeshes[key] = nil
         removed = removed + 1
         keep = false
@@ -1707,6 +1747,13 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
       if elapsedMs >= maxMillis then
         break
       end
+    end
+
+    -- Avoid pop->defer->requeue churn when worker slots are saturated.
+    if self._threadEnabled
+      and self._threadInFlightCount >= self._threadMaxInFlight
+      and self:_isMeshWorkerReady() then
+      break
     end
 
     local entry = self:_popDirtyEntry()

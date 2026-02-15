@@ -89,6 +89,21 @@ function HUD:_rebuildHudText(state)
       math.floor(tonumber(state.pruneRemoved) or 0),
       state.prunePending and 'yes' or 'no'
     )
+    if state.lightingMode == 'floodfill' then
+      local ensureScale = tonumber(state.chunkEnsureScale) or 1
+      local ensureSuffix = ''
+      if ensureScale < 0.999 then
+        ensureSuffix = string.format('  Ensure x%.2f', ensureScale)
+      end
+      count = count + 1
+      lines[count] = string.format(
+        'LightQ: Strip %d  Pending %d  Tasks %d%s',
+        math.floor(tonumber(state.lightStripOps) or 0),
+        math.floor(tonumber(state.lightStripPending) or 0),
+        math.floor(tonumber(state.lightStripTasks) or 0),
+        ensureSuffix
+      )
+    end
     if (state.enqueuedTimer or 0) > 0 then
       count = count + 1
       lines[count] = string.format('Stream: Enqueued %d', state.enqueuedCount or 0)

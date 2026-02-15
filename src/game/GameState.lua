@@ -592,6 +592,9 @@ function GameState:_updateGame(dt)
 
   self:_updateFrameTiming(dt)
   self:_tickEnqueuedMetric(dt)
+  if self.world and self.world.setFrameTiming then
+    self.world:setFrameTiming(self.frameMs, self.worstFrameMs)
+  end
 
   local dx, dy = self.input:getLookDelta()
   if dx ~= 0 or dy ~= 0 then
@@ -728,6 +731,10 @@ function GameState:draw(pass)
 
   local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
   local dirtyQueue = self.renderer:getDirtyQueueSize()
+  local lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = 0, 0, 0, 1
+  if self.world and self.world.getLightingPerfStats then
+    lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = self.world:getLightingPerfStats()
+  end
   self.hud:draw(pass, {
     cameraX = cameraX,
     cameraY = cameraY,
@@ -758,6 +765,10 @@ function GameState:draw(pass)
     pruneScanned = pruneScanned,
     pruneRemoved = pruneRemoved,
     prunePending = prunePendingFlag == 1,
+    lightStripOps = lightStripOps,
+    lightStripPending = lightStripPending,
+    lightStripTasks = lightStripTasks,
+    chunkEnsureScale = chunkEnsureScale,
     enqueuedCount = self._enqueuedCount,
     enqueuedTimer = self._enqueuedTimer
   })

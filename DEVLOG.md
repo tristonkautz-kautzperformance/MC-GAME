@@ -2,6 +2,28 @@
 
 ## 2026-02-15
 
+### Floodfill Pass 4 (Incremental Strip Queue + Spike Guard + HUD Telemetry)
+- Added incremental strip-task processing in `src/world/lighting/FloodfillLighting.lua`:
+  - chunk-crossing region delta enqueue now schedules strip rows into a bounded per-frame task queue instead of immediately iterating all strip columns at crossing time.
+  - ring-delta prune now schedules `skyColumnsReady` strip removals incrementally (chunk cache strip eviction remains immediate and small).
+  - added reusable region-task pooling to reduce per-crossing temporary table churn and GC-induced hitch risk.
+  - new tunables in `src/constants.lua`:
+    - `regionStripOpsPerFrame`
+    - `regionStripMillisPerFrame`
+- Added frame-time spike guard for chunk-local ensure work:
+  - `GameState` now forwards frame timing each update via `ChunkWorld:setFrameTiming(...)`.
+  - `FloodfillLighting:ensureSkyLightForChunk(...)` now scales local ensure budgets down when frame time is high using:
+    - `chunkEnsureSpikeSoftMs`, `chunkEnsureSpikeHardMs`
+    - `chunkEnsureSpikeSoftScale`, `chunkEnsureSpikeHardScale`
+- Added floodfill strip telemetry to HUD:
+  - `FloodfillLighting:getPerfStats()` exposes strip ops processed in last lighting update, pending strip ops, and pending strip tasks.
+  - `ChunkWorld:getLightingPerfStats()` forwards stats to `GameState`, and `HUD` now shows:
+    - `LightQ: Strip <ops>  Pending <ops>  Tasks <n>`
+    - optional `Ensure x<scale>` when chunk-ensure spike guard is actively downscaling.
+- Added no-op compatibility methods for vertical backend:
+  - `VerticalLighting:setFrameTiming(...)`
+  - `VerticalLighting:getPerfStats()`
+
 ### Floodfill Pass 3 (Urgent Priority + Mesh Gating)
 - Added urgent-priority queueing in `src/world/lighting/FloodfillLighting.lua`:
   - sky column, dark, and flood queues now support urgent insertion/promotion.
@@ -421,6 +443,29 @@
 - Updated save behavior so an explicit save creates a valid save file even with zero world edits (Continue now registers reliably).
 - Extended save format to persist player position and look direction; Continue now restores player state with safe spawn fallback if invalid/colliding.
 - Updated `README.md` controls and feature list for menu/save behavior.
+
+## 2026-02-15
+
+### Frametime Spike Mitigation Pass (Renderer + Floodfill)
+- Added explicit mesh lifetime management in `src/render/ChunkRenderer.lua`:
+  - Release old chunk meshes when a mesh entry is replaced.
+  - Release meshes when chunks are evicted by mesh-cache pruning.
+  - Release all cached chunk meshes during renderer shutdown.
+  - Release newly-created meshes on indexed-mesh setup failures to avoid leaking partial mesh objects.
+- Reduced dirty-queue churn when threaded meshing is saturated:
+  - `ChunkRenderer:rebuildDirty` now exits its pop loop early when all thread slots are full, avoiding repeated pop/defer/requeue work in the same frame.
+- Tuned chunk-ensure lighting flow for streaming:
+  - `FloodfillLighting:ensureSkyLightForChunk` performs bounded local catch-up (`chunkEnsureOps`/`chunkEnsureMillis`).
+  - Chunk meshing still defers when urgent lighting work remains, avoiding repeated not-ready rebuild attempts.
+- Reworked floodfill region maintenance to avoid full active-area scans on normal chunk crossings:
+  - Added ring-delta column queueing for newly entered regions.
+  - Added strip-based pruning for `skyLightChunks` and `skyColumnsReady` when moving by one chunk.
+  - Retained full-scan fallback only for large jumps/radius changes.
+
+### Follow-up Tuning (Regression Guard)
+- Adjusted runtime behavior after streaming-regression testing:
+  - Added `Constants.REBUILD.releaseMeshesRuntime = false` default so mesh releases are deferred during gameplay (still force-released on shutdown).
+  - Restored bounded local chunk-ensure lighting catch-up in `FloodfillLighting:ensureSkyLightForChunk(...)` to reduce urgent-work starvation under sustained chunk streaming.
 
 ## 2026-02-10
 

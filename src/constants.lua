@@ -34,10 +34,16 @@ Constants.LIGHTING = {
   leafOpacity = 4,
   maxUpdatesPerFrame = 8192,
   maxMillisPerFrame = 1.25,
+  regionStripOpsPerFrame = 1024,
+  regionStripMillisPerFrame = 0.35,
   urgentOpsPerFrame = 12288,
   urgentMillisPerFrame = 1.75,
   chunkEnsureOps = 768,
   chunkEnsureMillis = 0.2,
+  chunkEnsureSpikeSoftMs = 12,
+  chunkEnsureSpikeHardMs = 20,
+  chunkEnsureSpikeSoftScale = 0.5,
+  chunkEnsureSpikeHardScale = 0.2,
   startupWarmupOpsPerFrame = 32768,
   startupWarmupMillisPerFrame = 4.0,
   editRelightRadiusBlocks = 15,
@@ -79,6 +85,9 @@ Constants.THREAD_MESH = {
 Constants.REBUILD = {
   maxPerFrame = 24,
   maxMillisPerFrame = 2.5,
+  -- Releasing many meshes during movement can stall on some drivers.
+  -- Keep runtime releases off by default; meshes are still released on shutdown.
+  releaseMeshesRuntime = false,
   -- Prevents a huge startup hitch when the world has many chunks.
   initialBurstMax = 700,
   initialBurstMaxMillis = 12.0,

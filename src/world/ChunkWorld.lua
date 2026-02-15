@@ -260,6 +260,21 @@ function ChunkWorld:updateSkyLight(maxOps, maxMillis)
   return 0
 end
 
+function ChunkWorld:setFrameTiming(frameMs, worstFrameMs)
+  local backend = self._lightingBackend
+  if backend and backend.setFrameTiming then
+    backend:setFrameTiming(frameMs, worstFrameMs)
+  end
+end
+
+function ChunkWorld:getLightingPerfStats()
+  local backend = self._lightingBackend
+  if backend and backend.getPerfStats then
+    return backend:getPerfStats()
+  end
+  return 0, 0, 0, 1
+end
+
 function ChunkWorld:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)
   local backend = self._lightingBackend
   if backend and backend.pruneSkyLightChunks then

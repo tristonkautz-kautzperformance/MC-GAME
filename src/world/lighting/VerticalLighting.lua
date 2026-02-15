@@ -329,6 +329,13 @@ function VerticalLighting:updateSkyLight(maxOps, maxMillis)
   return 0
 end
 
+function VerticalLighting:setFrameTiming(frameMs, worstFrameMs)
+end
+
+function VerticalLighting:getPerfStats()
+  return 0, 0, 0, 1
+end
+
 function VerticalLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)
   if not self.enabled then
     return 0

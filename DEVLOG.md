@@ -2,6 +2,57 @@
 
 ## 2026-02-15
 
+### Mobs + Sword Combat Prototype
+- Added lightweight mob system in `src/mobs/MobSystem.lua`:
+  - passive `Sheep` spawning with simple wander behavior.
+  - hostile `Ghost` spawning at night only, with chase + contact damage.
+  - conservative spawn/despawn caps and distances for low baseline runtime cost.
+- Wired mob runtime into `src/game/GameState.lua`:
+  - mobs update every gameplay frame and draw in-world.
+  - crosshair targeting now prefers mobs when in reach.
+  - left-click now attacks targeted mobs before falling back to block breaking.
+- Added starter combat/item constants in `src/constants.lua`:
+  - `Constants.ITEM.SWORD` item id and metadata.
+  - `Constants.COMBAT` damage values (hand vs sword).
+  - `Constants.MOBS` spawn/AI tuning values.
+- Updated `src/inventory.lua` defaults parsing so hotbar entries can set custom per-slot counts (used for one starter sword).
+- Added damage/heal helpers in `src/player/PlayerStats.lua` and used them for ghost attacks.
+- Updated docs in `README.md` for mob/combat controls and features.
+
+### Survival Stats Scaffold (Health/Hunger + Persistence)
+- Added `src/player/PlayerStats.lua`:
+  - tracks `health`, `hunger`, `experience`, and `level` with configurable caps/start values.
+  - runs per-frame hunger drain and hunger-threshold-gated health regeneration.
+  - exposes `getState`/`applyState` for persistence and runtime wiring.
+- Wired runtime stats usage in `src/game/GameState.lua`:
+  - replaced temporary `ui*` HUD values with `PlayerStats` values.
+  - updates stats each gameplay frame (`_updateGame`), while paused/menu remains frozen.
+  - `SaveSystem:save(...)` now receives current stats state.
+- Extended save format parsing/writing in `src/save/SaveSystem.lua`:
+  - V2 saves now write a `stats` line before `edits`.
+  - loader accepts optional `stats` line for backward compatibility with older V2 saves.
+  - `SaveSystem:load(...)` now returns parsed stats state for session restore.
+- Added new stats tuning block in `src/constants.lua`:
+  - `Constants.STATS` controls caps, defaults, hunger drain rate, and regen behavior.
+- Updated `README.md` feature list to document the new survival-stats scaffold and persistence.
+
+### Survival HUD Visual Refresh (UI-Only)
+- Reworked `src/ui/HUD.lua` from a text-only overlay into a stylized survival HUD pass:
+  - custom crosshair with target-highlight tinting.
+  - bottom hotbar panel with selected-slot glow, block swatches, and stack counts.
+  - health/armor/hunger pip rows, XP bar, and status-effects panel.
+  - target-name tooltip and polished save/help/tip panel styling.
+- Preserved existing perf/debug metrics and `F3` behavior, but moved them into a cleaner utility panel while keeping readability-first formatting.
+- Added temporary preview values in `src/game/GameState.lua` for health/armor/hunger/xp/effects so UI can be iterated independently before survival systems are wired.
+- Follow-up tuning pass:
+  - increased overall HUD apparent size for better readability in gameplay view.
+  - removed armor row from the main survival HUD.
+  - removed status-effects panel from gameplay HUD and dropped now-unused preview plumbing in `src/game/GameState.lua`.
+  - spread the lower HUD farther across the screen and moved it closer to the bottom edge.
+  - moved the lower gameplay HUD even closer to the screen bottom, and shifted the F3/perf panel much farther toward the top-left corner.
+  - final tuning pass: applied another large downward shift for the main HUD and another large up-left shift for the F3/perf panel.
+  - removed the XP bar from the gameplay HUD per scope reduction.
+
 ### Audit Hardening (Crash Path + Save Safety)
 - Removed a renderer crash path in `src/render/ChunkRenderer.lua`:
   - synchronous mesh-apply failures no longer call `error(...)`.

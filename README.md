@@ -17,12 +17,23 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - Inventory / hotbar UI:
   - 8 slots
   - Number keys and mouse wheel selection
+- Basic survival stats scaffold:
+  - Health and hunger values feed the HUD
+  - Hunger drains over time
+  - Health regeneration is enabled only above a hunger threshold
+- Lightweight mobs:
+  - Sheep (passive ambient mobs)
+  - Ghost (hostile mob) spawns at night only and damages player on contact
+  - Spawn caps are intentionally low for early perf safety
+- Combat starter:
+  - Added Sword item to hotbar
+  - Left click attacks targeted mobs; sword deals higher damage than hand hits
 - Day/night cycle with animated sky color and sun/moon
 - Seeded procedural terrain (height + beaches + sea level) with sparse edit/feature overlays (no eager per-voxel base storage)
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling + mesh cache pruning
 - Main menu + pause menu with keyboard navigation
 - Single-slot save/load for world block edits (diff-based)
-- Continue restores player position/look, inventory/hotbar state, and time-of-day
+- Continue restores player position/look, inventory/hotbar state, time-of-day, and survival stats
 - Autosave every 60 seconds during active gameplay with HUD/menu status text
 - Main menu save metadata (availability, last saved time, edit count, version health)
 
@@ -31,7 +42,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - `WASD`: move
 - `Mouse`: look (when captured)
 - `Space`: jump
-- `Left Mouse`: click to capture mouse, then break block
+- `Left Mouse`: click to capture mouse, then attack mob / break block
 - `Right Mouse`: place selected block (when captured)
 - `Mouse Wheel`: cycle hotbar
 - `1-8`: select hotbar slot

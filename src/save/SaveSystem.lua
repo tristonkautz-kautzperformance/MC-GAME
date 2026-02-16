@@ -17,6 +17,7 @@ function SaveSystem.new()
   self._editsScratch = {}
   self._loadLinesScratch = {}
   self._inventoryScratch = { slots = {} }
+  self._statsScratch = {}
   return self
 end
 
@@ -101,6 +102,39 @@ local function parseEditLine(line)
   return x, y, z, block
 end
 
+local function parseStatsLine(line)
+  local healthToken, maxHealthToken, hungerToken, maxHungerToken, xpToken, levelToken = (line or ''):match(
+    '^stats%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)%s+([^%s]+)$'
+  )
+  if not healthToken or not maxHealthToken or not hungerToken or not maxHungerToken or not xpToken or not levelToken then
+    return nil
+  end
+
+  local health = parseFiniteNumber(healthToken)
+  local maxHealth = parseFiniteNumber(maxHealthToken)
+  local hunger = parseFiniteNumber(hungerToken)
+  local maxHunger = parseFiniteNumber(maxHungerToken)
+  local experience = parseFiniteNumber(xpToken)
+  local level = parseInteger(levelToken)
+
+  if not health or not maxHealth or not hunger or not maxHunger or not experience or not level then
+    return nil
+  end
+
+  if maxHealth <= 0 or maxHunger <= 0 or level < 0 then
+    return nil
+  end
+
+  return {
+    health = math.max(0, math.min(maxHealth, health)),
+    maxHealth = maxHealth,
+    hunger = math.max(0, math.min(maxHunger, hunger)),
+    maxHunger = maxHunger,
+    experience = math.max(0, math.min(1, experience)),
+    level = level
+  }
+end
+
 local function parseCoreHeaders(lines, constants)
   local seed = parseInteger((lines[2] or ''):match('^seed%s+(-?%d+)$'))
   local sizeX, sizeY, sizeZ = (lines[3] or ''):match('^world%s+(%d+)%s+(%d+)%s+(%d+)$')
@@ -145,6 +179,7 @@ local function parseSave(lines, constants, options)
   options = options or {}
   local includeEdits = options.includeEdits == true
   local includeInventory = options.includeInventory == true
+  local includeStats = options.includeStats == true
 
   local magic = lines[1]
   local version = nil
@@ -175,6 +210,7 @@ local function parseSave(lines, constants, options)
     timeOfDay = nil,
     player = nil,
     inventory = nil,
+    stats = nil,
     editCount = 0,
     edits = includeEdits and {} or nil
   }
@@ -269,6 +305,18 @@ local function parseSave(lines, constants, options)
         block = blockId,
         count = count
       }
+    end
+    index = index + 1
+  end
+
+  local statsLine = lines[index]
+  if statsLine and statsLine:match('^stats%s+') then
+    local statsState = parseStatsLine(statsLine)
+    if not statsState then
+      return nil, 'corrupt', buildErrorInfo(version, savedAt)
+    end
+    if includeStats then
+      result.stats = statsState
     end
     index = index + 1
   end
@@ -442,7 +490,7 @@ function SaveSystem:delete()
   return allRemoved
 end
 
-function SaveSystem:save(world, constants, player, inventory, sky)
+function SaveSystem:save(world, constants, player, inventory, sky, stats)
   local filesystem = getFilesystem()
   if not filesystem or not filesystem.write then
     return false, 'filesystem_unavailable'
@@ -522,6 +570,41 @@ function SaveSystem:save(world, constants, player, inventory, sky)
     lineCount = lineCount + 1
     lines[lineCount] = string.format('slot %d %d %d', i, blockId, count)
   end
+
+  local statsState = self._statsScratch
+  statsState.health = 20
+  statsState.maxHealth = 20
+  statsState.hunger = 20
+  statsState.maxHunger = 20
+  statsState.experience = 0
+  statsState.level = 0
+  if stats and stats.getState then
+    stats:getState(statsState)
+  end
+
+  local maxHealth = parseFiniteNumber(statsState.maxHealth) or 20
+  local maxHunger = parseFiniteNumber(statsState.maxHunger) or 20
+  if maxHealth <= 0 then
+    maxHealth = 20
+  end
+  if maxHunger <= 0 then
+    maxHunger = 20
+  end
+
+  local health = parseFiniteNumber(statsState.health) or maxHealth
+  local hunger = parseFiniteNumber(statsState.hunger) or maxHunger
+  local experience = parseFiniteNumber(statsState.experience) or 0
+  local level = parseInteger(statsState.level) or 0
+  if level < 0 then
+    level = 0
+  end
+
+  health = math.max(0, math.min(maxHealth, health))
+  hunger = math.max(0, math.min(maxHunger, hunger))
+  experience = math.max(0, math.min(1, experience))
+
+  lineCount = lineCount + 1
+  lines[lineCount] = string.format('stats %.6f %.6f %.6f %.6f %.6f %d', health, maxHealth, hunger, maxHunger, experience, level)
 
   lineCount = lineCount + 1
   lines[lineCount] = string.format('edits %d', editCount)
@@ -606,13 +689,14 @@ function SaveSystem:load(constants)
 
   local parsed, err = parseFirstAvailableSave(self, filesystem, constants, {
     includeEdits = true,
-    includeInventory = true
+    includeInventory = true,
+    includeStats = true
   })
   if not parsed then
     return nil, 0, err or 'corrupt'
   end
 
-  return parsed.edits or {}, parsed.editCount or 0, nil, parsed.player, parsed.inventory, parsed.timeOfDay, parsed.savedAt, parsed.version
+  return parsed.edits or {}, parsed.editCount or 0, nil, parsed.player, parsed.inventory, parsed.timeOfDay, parsed.savedAt, parsed.version, parsed.stats
 end
 
 function SaveSystem:peek(constants)
@@ -626,7 +710,8 @@ function SaveSystem:peek(constants)
 
   local parsed, err, info = parseFirstAvailableSave(self, filesystem, constants, {
     includeEdits = false,
-    includeInventory = false
+    includeInventory = false,
+    includeStats = false
   })
 
   if not parsed then

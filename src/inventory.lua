@@ -26,10 +26,26 @@ function Inventory.new(defaultBlocks, slotCount, startCount)
   self.slots = {}
 
   for i = 1, self.slotCount do
-    local block = defaultBlocks and defaultBlocks[i] or nil
+    local entry = defaultBlocks and defaultBlocks[i] or nil
+    local block = nil
+    local count = 0
+
+    if type(entry) == 'table' then
+      block = entry.block or entry.id
+      local explicitCount = parseInteger(entry.count)
+      if block then
+        count = explicitCount or (startCount or 0)
+      end
+    else
+      block = entry
+      if block then
+        count = startCount or 0
+      end
+    end
+
     self.slots[i] = {
       block = block,
-      count = block and (startCount or 0) or 0
+      count = count
     }
   end
 

@@ -137,6 +137,10 @@ Constants.BLOCK = {
   WATER = 8
 }
 
+Constants.ITEM = {
+  SWORD = 1001
+}
+
 Constants.BLOCK_INFO = {
   [Constants.BLOCK.AIR] = {
     name = 'Air',
@@ -229,12 +233,23 @@ Constants.BLOCK_INFO = {
     breakable = true,
     placeable = true,
     alpha = .74
+  },
+  [Constants.ITEM.SWORD] = {
+    name = 'Sword',
+    color = { .76, .78, .84 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1
   }
 }
 
 Constants.INVENTORY_SLOT_COUNT = 8
 Constants.INVENTORY_START_COUNT = 48
 Constants.HOTBAR_DEFAULTS = {
+  { block = Constants.ITEM.SWORD, count = 1 },
   Constants.BLOCK.GRASS,
   Constants.BLOCK.DIRT,
   Constants.BLOCK.STONE,
@@ -242,6 +257,28 @@ Constants.HOTBAR_DEFAULTS = {
   Constants.BLOCK.WATER,
   Constants.BLOCK.WOOD,
   Constants.BLOCK.LEAF
+}
+
+Constants.COMBAT = {
+  handDamage = 1,
+  swordDamage = 4
+}
+
+Constants.MOBS = {
+  enabled = true,
+  maxSheep = 4,
+  maxGhosts = 2,
+  sheepSpawnIntervalSeconds = 8,
+  ghostSpawnIntervalSeconds = 12,
+  spawnMinDistance = 10,
+  spawnMaxDistance = 24,
+  despawnDistance = 52,
+  sheepSpeed = 1.2,
+  ghostSpeed = 2.2,
+  ghostAttackRange = 1.25,
+  ghostAttackDamage = 2,
+  ghostAttackCooldownSeconds = 1.4,
+  nightDaylightThreshold = 0.30
 }
 
 Constants.PLAYER = {
@@ -253,6 +290,19 @@ Constants.PLAYER = {
   jumpSpeed = 8.0,
   reach = 6.0,
   lookSensitivity = 0.0028
+}
+
+Constants.STATS = {
+  maxHealth = 20,
+  maxHunger = 20,
+  startHealth = 20,
+  startHunger = 20,
+  startExperience = 0,
+  startLevel = 0,
+  hungerDrainPerSecond = 0.02,
+  healthRegenThreshold = 15,
+  healthRegenIntervalSeconds = 4.0,
+  healthRegenAmount = 1.0
 }
 
 return Constants

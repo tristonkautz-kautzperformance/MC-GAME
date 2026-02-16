@@ -1,12 +1,14 @@
 local World = require 'src.world'
 local Player = require 'src.player'
 local Inventory = require 'src.inventory'
+local PlayerStats = require 'src.player.PlayerStats'
 
 local MouseLock = require 'src.input.MouseLock'
 local Input = require 'src.input.Input'
 local Interaction = require 'src.interaction.Interaction'
 local HUD = require 'src.ui.HUD'
 local Sky = require 'src.sky.Sky'
+local MobSystem = require 'src.mobs.MobSystem'
 local ChunkRenderer = require 'src.render.ChunkRenderer'
 local VoxelShader = require 'src.render.VoxelShader'
 local SaveSystem = require 'src.save.SaveSystem'
@@ -68,12 +70,14 @@ function GameState.new(constants)
   self.world = nil
   self.player = nil
   self.inventory = nil
+  self.stats = nil
 
   self.mouseLock = nil
   self.input = nil
   self.interaction = nil
   self.hud = nil
   self.sky = nil
+  self.mobs = nil
   self.renderer = nil
   self.voxelShader = nil
   self._voxelShaderError = nil
@@ -216,7 +220,7 @@ function GameState:_saveNow()
     return false, 'missing_session'
   end
 
-  return self.saveSystem:save(self.world, self.constants, self.player, self.inventory, self.sky)
+  return self.saveSystem:save(self.world, self.constants, self.player, self.inventory, self.sky, self.stats)
 end
 
 function GameState:_updateAutosave(dt)
@@ -274,11 +278,13 @@ function GameState:_teardownSession()
   self.world = nil
   self.player = nil
   self.inventory = nil
+  self.stats = nil
 
   self.input = nil
   self.interaction = nil
   self.hud = nil
   self.sky = nil
+  self.mobs = nil
   if self.renderer and self.renderer.shutdown then
     self.renderer:shutdown()
   end
@@ -309,9 +315,10 @@ function GameState:_startSession(loadSave)
   local savedPlayerState = nil
   local savedInventoryState = nil
   local savedTimeOfDay = nil
+  local savedStatsState = nil
 
   if loadSave then
-    local edits, count, err, playerState, inventoryState, timeOfDay = self.saveSystem:load(self.constants)
+    local edits, count, err, playerState, inventoryState, timeOfDay, _, _, statsState = self.saveSystem:load(self.constants)
     if edits then
       self.saveSystem:apply(self.world, edits, count)
       if playerState then
@@ -322,6 +329,9 @@ function GameState:_startSession(loadSave)
       end
       if timeOfDay ~= nil then
         savedTimeOfDay = timeOfDay
+      end
+      if statsState then
+        savedStatsState = statsState
       end
     elseif err and err ~= 'missing' then
       self:_teardownSession()
@@ -376,11 +386,16 @@ function GameState:_startSession(loadSave)
   if savedInventoryState then
     self.inventory:applyState(savedInventoryState)
   end
+  self.stats = PlayerStats.new(self.constants.STATS)
+  if savedStatsState then
+    self.stats:applyState(savedStatsState)
+  end
 
   self.input = Input.new(self.mouseLock, self.inventory)
   self.interaction = Interaction.new(self.constants, self.world, self.player, self.inventory)
   self.hud = HUD.new(self.constants)
   self.sky = Sky.new(self.constants)
+  self.mobs = MobSystem.new(self.constants, self.world, self.player, self.stats)
   if savedTimeOfDay ~= nil then
     self.sky:setTime(savedTimeOfDay)
   end
@@ -638,13 +653,36 @@ function GameState:_updateGame(dt)
 
   local _, daylight = self.sky:update(dt)
   self.sky:applyBackground(daylight)
+  if self.mobs then
+    self.mobs:update(dt, self.sky.timeOfDay)
+  end
 
   self.interaction:updateTarget()
+  local lookX, lookY, lookZ = self.player:getLookVector()
+  if self.mobs then
+    self.mobs:updateTarget(cameraX, cameraY, cameraZ, lookX, lookY, lookZ, self.player.reach)
+  end
   if self.input:consumeBreak() then
-    self.interaction:tryBreak()
+    local attackedMob = false
+    if self.mobs then
+      local combat = self.constants.COMBAT or {}
+      local handDamage = tonumber(combat.handDamage) or 1
+      local swordDamage = tonumber(combat.swordDamage) or 4
+      local selectedId = self.inventory and self.inventory:getSelectedBlock() or nil
+      local swordId = self.constants.ITEM and self.constants.ITEM.SWORD or nil
+      local damage = (selectedId == swordId) and swordDamage or handDamage
+      attackedMob = self.mobs:tryAttackTarget(damage)
+    end
+
+    if not attackedMob then
+      self.interaction:tryBreak()
+    end
   end
   if self.input:consumePlace() then
     self.interaction:tryPlace()
+  end
+  if self.stats then
+    self.stats:update(dt)
   end
 
   if self.input:consumeToggleHelp() then
@@ -727,6 +765,9 @@ function GameState:draw(pass)
 
   self.sky:draw(pass)
   self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, self.voxelShader, self.sky.timeOfDay)
+  if self.mobs then
+    self.mobs:draw(pass)
+  end
   self.interaction:drawOutline(pass)
 
   local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
@@ -735,13 +776,20 @@ function GameState:draw(pass)
   if self.world and self.world.getLightingPerfStats then
     lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = self.world:getLightingPerfStats()
   end
+  local stats = self.stats
+  local mobTargetName = self.mobs and self.mobs:getTargetName() or 'None'
+  local blockTargetName = self.interaction:getTargetName()
+  local targetName = mobTargetName ~= 'None' and mobTargetName or blockTargetName
+  local targetActive = mobTargetName ~= 'None' or self.interaction.targetHit ~= nil
+
   self.hud:draw(pass, {
     cameraX = cameraX,
     cameraY = cameraY,
     cameraZ = cameraZ,
     cameraOrientation = cameraOrientation,
     timeOfDay = self.sky.timeOfDay,
-    targetName = self.interaction:getTargetName(),
+    targetName = targetName,
+    targetActive = targetActive,
     mouseStatusText = self.mouseLock:getStatusText(),
     lightingMode = (self.constants.LIGHTING and self.constants.LIGHTING.mode) or 'off',
     shaderStatusText = self.voxelShader and string.format('On (SkySub %d)', self.voxelShader:getSkySubtract()) or ('Off: ' .. tostring(self._voxelShaderError or 'unavailable')),
@@ -750,6 +798,12 @@ function GameState:draw(pass)
     relativeMouseReady = self.relativeMouseReady,
     meshingMode = self.renderer:getMeshingModeLabel(),
     inventory = self.inventory,
+    health = stats and stats.health or 20,
+    maxHealth = stats and stats.maxHealth or 20,
+    hunger = stats and stats.hunger or 20,
+    maxHunger = stats and stats.maxHunger or 20,
+    experience = stats and stats.experience or 0,
+    level = stats and stats.level or 0,
     showHelp = self.showHelp,
     showPerfHud = self.showPerfHud,
     fps = fps,

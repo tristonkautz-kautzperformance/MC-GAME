@@ -21,10 +21,13 @@ Simple Minecraft-style prototype in Lua using LOVR.
   - Health and hunger values feed the HUD
   - Hunger drains over time
   - Health regeneration is enabled only above a hunger threshold
+  - On death (health reaches 0), player respawns at world spawn with full health/hunger
+  - Respawn grants a short damage-immunity window to avoid instant death loops
 - Lightweight mobs:
   - Sheep (passive ambient mobs)
   - Ghost (hostile mob) spawns at night only and damages player on contact
   - Spawn caps are intentionally low for early perf safety
+  - Mob AI runs on a fixed tick and is temporarily skipped during heavy chunk-rebuild backlog
 - Combat starter:
   - Added Sword item to hotbar
   - Left click attacks targeted mobs; sword deals higher damage than hand hits
@@ -34,7 +37,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - Main menu + pause menu with keyboard navigation
 - Single-slot save/load for world block edits (diff-based)
 - Continue restores player position/look, inventory/hotbar state, time-of-day, and survival stats
-- Autosave every 60 seconds during active gameplay with HUD/menu status text
+- Autosave system exists but is currently disabled by default for perf testing
 - Main menu save metadata (availability, last saved time, edit count, version health)
 
 ## Controls
@@ -56,7 +59,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 
 Quit and save:
 - Use pause menu `Save` to save without exiting.
-- Autosave runs every 60 seconds while actively playing (not paused/menu).
+- Autosave is currently disabled by default (`Constants.SAVE.enabled = false`).
 - In pause menu, `Quit` saves and returns to the main menu.
 - In main menu, `Quit` exits the game.
 - Window close/Alt+F4 also saves world edits.

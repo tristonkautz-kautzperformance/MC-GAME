@@ -70,12 +70,15 @@ function MobSystem.new(constants, world, player, stats)
   self.ghostAttackRange = math.max(0.5, parseNumber(cfg.ghostAttackRange, 1.25))
   self.ghostAttackDamage = math.max(0, parseNumber(cfg.ghostAttackDamage, 2))
   self.ghostAttackCooldown = math.max(0.1, parseNumber(cfg.ghostAttackCooldownSeconds, 1.4))
+  self.aiTickSeconds = math.max(0.05, parseNumber(cfg.aiTickSeconds, 0.20))
+  self.maxAiTicksPerFrame = math.max(1, math.floor(parseNumber(cfg.maxAiTicksPerFrame, 2)))
   self.nightDaylightThreshold = clamp(parseNumber(cfg.nightDaylightThreshold, 0.30), 0, 1)
 
   self._sheepTimer = 0
   self._ghostTimer = 0
   self._time = 0
   self._timeOfDay = 0
+  self._aiAccumulator = 0
   self._nextId = 1
 
   self.mobs = {}
@@ -187,7 +190,6 @@ function MobSystem:_spawn(kind)
 end
 
 function MobSystem:_updateSheep(mob, dt)
-  mob.hurtTimer = math.max(0, (mob.hurtTimer or 0) - dt)
   mob.wanderTimer = (mob.wanderTimer or 0) - dt
   if mob.wanderTimer <= 0 then
     local angle = math.random() * math.pi * 2
@@ -211,9 +213,6 @@ function MobSystem:_updateSheep(mob, dt)
 end
 
 function MobSystem:_updateGhost(mob, dt)
-  mob.hurtTimer = math.max(0, (mob.hurtTimer or 0) - dt)
-  mob.attackCooldown = math.max(0, (mob.attackCooldown or 0) - dt)
-
   local playerX, playerY, playerZ = self.player:getCameraPosition()
   local dx = playerX - mob.x
   local dz = playerZ - mob.z
@@ -298,21 +297,32 @@ function MobSystem:getTargetName()
   return 'Mob'
 end
 
-function MobSystem:update(dt, timeOfDay)
-  if not self.enabled then
-    self.targetMob = nil
-    return
+function MobSystem:onPlayerRespawn()
+  for i = #self.mobs, 1, -1 do
+    if self.mobs[i].kind == 'ghost' then
+      table.remove(self.mobs, i)
+    end
   end
+  self.targetMob = nil
+  self._ghostTimer = 0
+end
 
-  local delta = parseNumber(dt, 0)
-  if delta <= 0 then
-    return
+function MobSystem:_decayTimers(delta)
+  for i = #self.mobs, 1, -1 do
+    local mob = self.mobs[i]
+    if mob.dead then
+      table.remove(self.mobs, i)
+    else
+      mob.hurtTimer = math.max(0, (mob.hurtTimer or 0) - delta)
+      if mob.kind == 'ghost' then
+        mob.attackCooldown = math.max(0, (mob.attackCooldown or 0) - delta)
+      end
+    end
   end
+end
 
-  self._time = self._time + delta
-  self._timeOfDay = parseNumber(timeOfDay, self._timeOfDay) or self._timeOfDay
+function MobSystem:_updateAiStep(delta)
   local night = self:_isNight(self._timeOfDay)
-
   self._sheepTimer = self._sheepTimer + delta
   if self._sheepTimer >= self.sheepSpawnInterval and self:_countByKind('sheep') < self.maxSheep then
     self._sheepTimer = 0
@@ -355,6 +365,44 @@ function MobSystem:update(dt, timeOfDay)
         end
       end
     end
+  end
+end
+
+function MobSystem:update(dt, timeOfDay, skipAi)
+  if not self.enabled then
+    self.targetMob = nil
+    self._aiAccumulator = 0
+    return
+  end
+
+  local delta = parseNumber(dt, 0)
+  if delta <= 0 then
+    return
+  end
+
+  self._time = self._time + delta
+  self._timeOfDay = parseNumber(timeOfDay, self._timeOfDay) or self._timeOfDay
+  self:_decayTimers(delta)
+
+  if skipAi then
+    self._aiAccumulator = 0
+    return
+  end
+
+  local step = self.aiTickSeconds
+  local maxTicks = self.maxAiTicksPerFrame
+  local maxCarry = step * maxTicks
+  self._aiAccumulator = math.min(maxCarry, self._aiAccumulator + delta)
+
+  local ticks = 0
+  while self._aiAccumulator >= step and ticks < maxTicks do
+    self._aiAccumulator = self._aiAccumulator - step
+    self:_updateAiStep(step)
+    ticks = ticks + 1
+  end
+
+  if ticks >= maxTicks and self._aiAccumulator >= step then
+    self._aiAccumulator = 0
   end
 end
 

@@ -1,5 +1,37 @@
 # Dev Log
 
+## 2026-02-16
+
+### Mob Perf Guardrails + Autosave Disabled
+- Tuned default mob pressure in `src/constants.lua`:
+  - reduced `maxSheep`/`maxGhosts`.
+  - slowed default sheep/ghost spawn intervals.
+- Added fixed-tick mob AI in `src/mobs/MobSystem.lua`:
+  - mob simulation now advances on `aiTickSeconds` (default `0.20`) instead of full per-frame updates.
+  - capped catch-up work with `maxAiTicksPerFrame` to avoid AI bursts after long frames.
+- Added chunk-backlog-aware mob throttling in `src/game/GameState.lua`:
+  - reads renderer dirty queue size each frame.
+  - temporarily skips mob AI updates when queue exceeds `Constants.MOBS.skipAiWhenDirtyQueueAbove`.
+- Disabled autosave by default in `src/constants.lua` (`Constants.SAVE.enabled = false`) to remove periodic save spikes during current perf tuning.
+- Updated `README.md` to reflect fixed-tick mob AI and autosave-disabled default state.
+
+### Death + Respawn Loop (Health Zero Handling)
+- Added death handling in `src/game/GameState.lua`:
+  - when player health reaches `0`, gameplay immediately respawns player at world spawn.
+  - player transform/velocity/look are reset for a stable respawn state.
+  - if spawn position collides, respawn now probes upward for a safe standing height.
+  - chunk-streaming hint state is reset so meshing priorities recover correctly after teleporting.
+- Added respawn behavior in `src/player/PlayerStats.lua`:
+  - new `isDead()` and `respawn()` helpers.
+  - respawn restores full health and hunger.
+  - added damage-immunity timer support in stats update/damage flow.
+- Added post-respawn hostile cleanup in `src/mobs/MobSystem.lua`:
+  - `onPlayerRespawn()` now clears active ghosts and resets ghost spawn timer.
+  - prevents immediate re-death loops at spawn while preserving ambient sheep.
+- Added new stats tuning in `src/constants.lua`:
+  - `Constants.STATS.respawnInvulnerabilitySeconds` (default `2.0`).
+- Updated `README.md` feature list to document death/respawn behavior and brief immunity window.
+
 ## 2026-02-15
 
 ### Mobs + Sword Combat Prototype

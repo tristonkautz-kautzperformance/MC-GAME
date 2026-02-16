@@ -101,6 +101,7 @@ function GameState.new(constants)
   self._enqueuedTimer = 0
   self._enqueuedShowSeconds = 0.5
   self._cameraPosition = nil
+  self._mobSkipDirtyQueueAbove = 0
 
   self.showHelp = false
   self.showPerfHud = true
@@ -396,6 +397,15 @@ function GameState:_startSession(loadSave)
   self.hud = HUD.new(self.constants)
   self.sky = Sky.new(self.constants)
   self.mobs = MobSystem.new(self.constants, self.world, self.player, self.stats)
+  do
+    local mobConfig = self.constants.MOBS or {}
+    local threshold = tonumber(mobConfig.skipAiWhenDirtyQueueAbove)
+    if threshold and threshold >= 0 then
+      self._mobSkipDirtyQueueAbove = math.floor(threshold)
+    else
+      self._mobSkipDirtyQueueAbove = 0
+    end
+  end
   if savedTimeOfDay ~= nil then
     self.sky:setTime(savedTimeOfDay)
   end
@@ -597,6 +607,67 @@ function GameState:_updateMenu()
   self:_handleMenuAction(action)
 end
 
+function GameState:_placePlayerAtRespawn(spawnX, spawnY, spawnZ)
+  local player = self.player
+  local world = self.world
+  if not player or not world then
+    return
+  end
+
+  player.x = spawnX
+  player.y = spawnY
+  player.z = spawnZ
+  player.yaw = 0
+  player.pitch = 0
+  player.velocityY = 0
+  player.onGround = false
+
+  local maxY = math.max(2, world.sizeY - 1)
+  local startY = clamp(spawnY, 2, maxY)
+  for offset = 0, 10 do
+    local candidateY = startY + offset
+    if candidateY > maxY then
+      break
+    end
+    player.y = candidateY
+    if not player:_collides(world) then
+      return
+    end
+  end
+
+  player.y = math.min(maxY, startY + 1)
+end
+
+function GameState:_handleDeathRespawn()
+  if not (self.stats and self.player and self.world) then
+    return false
+  end
+  if not self.stats.isDead or not self.stats:isDead() then
+    return false
+  end
+
+  local spawnX, spawnY, spawnZ = self.world:getSpawnPoint()
+  self:_placePlayerAtRespawn(spawnX, spawnY, spawnZ)
+  if self.stats.respawn then
+    self.stats:respawn()
+  else
+    self.stats.health = self.stats.maxHealth or 20
+    self.stats.hunger = self.stats.maxHunger or 20
+  end
+
+  if self.mobs and self.mobs.onPlayerRespawn then
+    self.mobs:onPlayerRespawn(spawnX, spawnY, spawnZ)
+  end
+  if self.interaction then
+    self.interaction.targetHit = nil
+  end
+
+  self._lastPlayerChunkX = nil
+  self._lastPlayerChunkZ = nil
+  self:_setSaveStatus('You died. Respawned.', 2.0)
+  return true
+end
+
 function GameState:_updateGame(dt)
   if not self:_hasSession() or not self.input then
     self.mode = 'menu'
@@ -653,8 +724,26 @@ function GameState:_updateGame(dt)
 
   local _, daylight = self.sky:update(dt)
   self.sky:applyBackground(daylight)
+  local skipMobAi = false
+  local mobSkipThreshold = self._mobSkipDirtyQueueAbove or 0
+  if mobSkipThreshold > 0 then
+    local dirtyQueueSize = self.renderer:getDirtyQueueSize()
+    if dirtyQueueSize >= mobSkipThreshold then
+      skipMobAi = true
+    end
+  end
   if self.mobs then
-    self.mobs:update(dt, self.sky.timeOfDay)
+    self.mobs:update(dt, self.sky.timeOfDay, skipMobAi)
+  end
+  if self.stats then
+    self.stats:update(dt)
+  end
+
+  if self:_handleDeathRespawn() then
+    local respawnCameraX, respawnCameraY, respawnCameraZ = self.player:getCameraPosition()
+    self.renderer:setPriorityOriginWorld(respawnCameraX, respawnCameraY, respawnCameraZ)
+    self.input:beginFrame()
+    return
   end
 
   self.interaction:updateTarget()
@@ -680,9 +769,6 @@ function GameState:_updateGame(dt)
   end
   if self.input:consumePlace() then
     self.interaction:tryPlace()
-  end
-  if self.stats then
-    self.stats:update(dt)
   end
 
   if self.input:consumeToggleHelp() then

@@ -58,8 +58,10 @@ function PlayerStats.new(config)
   self.healthRegenThreshold = clamp(parseNumber(config.healthRegenThreshold, self.maxHunger), 0, self.maxHunger)
   self.healthRegenIntervalSeconds = math.max(0, parseNumber(config.healthRegenIntervalSeconds, 0))
   self.healthRegenAmount = math.max(0, parseNumber(config.healthRegenAmount, 0))
+  self.respawnInvulnerabilitySeconds = math.max(0, parseNumber(config.respawnInvulnerabilitySeconds, 2.0))
 
   self._regenTimer = 0
+  self._damageImmunityTimer = 0
 
   return self
 end
@@ -68,6 +70,10 @@ function PlayerStats:update(dt)
   local delta = parseNumber(dt, 0)
   if delta <= 0 then
     return
+  end
+
+  if self._damageImmunityTimer > 0 then
+    self._damageImmunityTimer = math.max(0, self._damageImmunityTimer - delta)
   end
 
   if self.hungerDrainPerSecond > 0 and self.hunger > 0 then
@@ -96,6 +102,10 @@ function PlayerStats:update(dt)
 end
 
 function PlayerStats:applyDamage(amount)
+  if self._damageImmunityTimer > 0 or self.health <= 0 then
+    return false
+  end
+
   local damage = parseNumber(amount, 0)
   if damage <= 0 then
     return false
@@ -115,6 +125,22 @@ function PlayerStats:heal(amount)
   local previous = self.health
   self.health = clamp(self.health + value, 0, self.maxHealth)
   return self.health > previous
+end
+
+function PlayerStats:isDead()
+  return self.health <= 0
+end
+
+function PlayerStats:setDamageImmunity(seconds)
+  local value = math.max(0, parseNumber(seconds, 0))
+  self._damageImmunityTimer = value
+end
+
+function PlayerStats:respawn()
+  self.health = self.maxHealth
+  self.hunger = self.maxHunger
+  self._regenTimer = 0
+  self._damageImmunityTimer = self.respawnInvulnerabilitySeconds
 end
 
 function PlayerStats:getState(out)
@@ -143,6 +169,7 @@ function PlayerStats:applyState(state)
   self.experience = clamp(parseNumber(state.experience, self.experience), 0, 1)
   self.level = math.max(0, parseInteger(state.level, self.level))
   self._regenTimer = 0
+  self._damageImmunityTimer = 0
   return true
 end
 

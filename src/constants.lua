@@ -120,7 +120,7 @@ Constants.PERF = {
 }
 
 Constants.SAVE = {
-  enabled = true,
+  enabled = false,
   autosaveIntervalSeconds = 60,
   autosaveShowHudSeconds = 1.5
 }
@@ -266,10 +266,10 @@ Constants.COMBAT = {
 
 Constants.MOBS = {
   enabled = true,
-  maxSheep = 4,
-  maxGhosts = 2,
-  sheepSpawnIntervalSeconds = 8,
-  ghostSpawnIntervalSeconds = 12,
+  maxSheep = 2,
+  maxGhosts = 1,
+  sheepSpawnIntervalSeconds = 14,
+  ghostSpawnIntervalSeconds = 20,
   spawnMinDistance = 10,
   spawnMaxDistance = 24,
   despawnDistance = 52,
@@ -278,6 +278,9 @@ Constants.MOBS = {
   ghostAttackRange = 1.25,
   ghostAttackDamage = 2,
   ghostAttackCooldownSeconds = 1.4,
+  aiTickSeconds = 0.20,
+  maxAiTicksPerFrame = 2,
+  skipAiWhenDirtyQueueAbove = 120,
   nightDaylightThreshold = 0.30
 }
 
@@ -302,7 +305,8 @@ Constants.STATS = {
   hungerDrainPerSecond = 0.02,
   healthRegenThreshold = 15,
   healthRegenIntervalSeconds = 4.0,
-  healthRegenAmount = 1.0
+  healthRegenAmount = 1.0,
+  respawnInvulnerabilitySeconds = 2.0
 }
 
 return Constants

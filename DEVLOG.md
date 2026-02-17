@@ -2,6 +2,38 @@
 
 ## 2026-02-16
 
+### Frame Spike Tuning Pass (Thread/Apply/Rebuild Budgets)
+- Tightened default streaming budgets in `src/constants.lua` to reduce rare long-frame spikes:
+  - `THREAD_MESH.maxInFlight`: `0` (auto) -> `4`
+  - `THREAD_MESH.maxApplyMillis`: `1.0` -> `0.6`
+  - `REBUILD.maxPerFrame`: `24` -> `16`
+  - `REBUILD.maxMillisPerFrame`: `2.5` -> `1.8`
+- Goal: improve frame-time stability by reducing main-thread mesh-apply and rebuild burst size at the cost of slower dirty-queue drain during heavy streaming.
+
+### Perf HUD Core Utilization Readout
+- Added renderer threading perf stats in `src/render/ChunkRenderer.lua` (`getThreadingPerfStats`):
+  - logical core count detected at runtime.
+  - active mesh worker count and target worker count.
+  - active meshing thread count (`workers + main thread`) and fallback/threaded state flag.
+- Wired threading stats through `src/game/GameState.lua` into HUD draw state.
+- Updated F3/perf text in `src/ui/HUD.lua`:
+  - new line now shows `CPU: meshing threads <active>/<logical> logical` plus `Mesh workers <active>/<target>`.
+  - appends `(fallback)` when threaded pool is not active.
+
+### Mesh Worker Pool (Auto Core Scaling + Fallback)
+- Upgraded meshing threading in `src/render/ChunkRenderer.lua` from a single worker to a worker pool:
+  - selects active worker count automatically from logical CPU cores (`cores - 1`) with configurable cap.
+  - dispatches mesh jobs round-robin across active workers.
+  - drains results from all workers with existing main-thread apply time budget.
+- Added graceful fallback behavior for limited hardware/runtime support:
+  - if no background workers can be started (single-core auto mode, or thread API unavailable), threaded meshing is disabled cleanly and renderer uses synchronous rebuild path.
+  - if worker startup/health fails at runtime, pool is torn down and renderer falls back to sync meshing safely.
+- Added new thread-mesh tuning in `src/constants.lua`:
+  - `THREAD_MESH.workerCount` (`0` = auto)
+  - `THREAD_MESH.maxWorkers`
+  - `THREAD_MESH.maxInFlight` (`0` = auto based on active worker count)
+- Updated `README.md` feature list to document worker-pool scaling and fallback behavior.
+
 ### Mob Perf Guardrails + Autosave Disabled
 - Tuned default mob pressure in `src/constants.lua`:
   - reduced `maxSheep`/`maxGhosts`.

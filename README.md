@@ -34,6 +34,9 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - Day/night cycle with animated sky color and sun/moon
 - Seeded procedural terrain (height + beaches + sea level) with sparse edit/feature overlays (no eager per-voxel base storage)
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling + mesh cache pruning
+- Threaded chunk meshing worker pool:
+  - Auto-scales worker count from CPU logical cores (`cores - 1`, clamped)
+  - Gracefully falls back to synchronous meshing if thread APIs/hardware support is unavailable
 - Main menu + pause menu with keyboard navigation
 - Single-slot save/load for world block edits (diff-based)
 - Continue restores player position/look, inventory/hotbar state, time-of-day, and survival stats

@@ -858,6 +858,10 @@ function GameState:draw(pass)
 
   local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
   local dirtyQueue = self.renderer:getDirtyQueueSize()
+  local threadCoreCount, threadWorkerCount, threadTargetWorkers, threadActiveMeshingThreads, threadPoolActive = 1, 0, 0, 1, false
+  if self.renderer and self.renderer.getThreadingPerfStats then
+    threadCoreCount, threadWorkerCount, threadTargetWorkers, threadActiveMeshingThreads, threadPoolActive = self.renderer:getThreadingPerfStats()
+  end
   local lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = 0, 0, 0, 1
   if self.world and self.world.getLightingPerfStats then
     lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = self.world:getLightingPerfStats()
@@ -902,6 +906,11 @@ function GameState:draw(pass)
     dirtyQueued = dirtyQueued,
     rebuildMs = rebuildMs,
     rebuildBudgetMs = rebuildBudgetMs,
+    threadCoreCount = threadCoreCount,
+    threadWorkerCount = threadWorkerCount,
+    threadTargetWorkers = threadTargetWorkers,
+    threadActiveMeshingThreads = threadActiveMeshingThreads,
+    threadPoolActive = threadPoolActive,
     pruneScanned = pruneScanned,
     pruneRemoved = pruneRemoved,
     prunePending = prunePendingFlag == 1,

@@ -87,15 +87,17 @@ Constants.RENDER = {
 
 Constants.THREAD_MESH = {
   enabled = true,
+  workerCount = 0, -- 0 = auto (use logical cores - 1, clamped by maxWorkers)
+  maxWorkers = 4,
   haloBlob = true,
   resultBlob = true,
-  maxInFlight = 2,
-  maxApplyMillis = 1.0
+  maxInFlight = 4,
+  maxApplyMillis = 0.6
 }
 
 Constants.REBUILD = {
-  maxPerFrame = 24,
-  maxMillisPerFrame = 2.5,
+  maxPerFrame = 16,
+  maxMillisPerFrame = 1.8,
   -- Releasing many meshes during movement can stall on some drivers.
   -- Keep runtime releases off by default; meshes are still released on shutdown.
   releaseMeshesRuntime = false,

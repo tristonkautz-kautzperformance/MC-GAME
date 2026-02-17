@@ -354,6 +354,20 @@ function HUD:_rebuildHudText(state)
       state.frameMs or 0,
       state.worstFrameMs or 0
     )
+    local coreCount = math.max(1, math.floor(tonumber(state.threadCoreCount) or 1))
+    local activeMeshingThreads = math.max(1, math.floor(tonumber(state.threadActiveMeshingThreads) or 1))
+    local workerCount = math.max(0, math.floor(tonumber(state.threadWorkerCount) or 0))
+    local targetWorkers = math.max(0, math.floor(tonumber(state.threadTargetWorkers) or 0))
+    local threadSuffix = state.threadPoolActive and '' or '  (fallback)'
+    count = count + 1
+    lines[count] = string.format(
+      'CPU: meshing threads %d/%d logical  |  Mesh workers %d/%d%s',
+      activeMeshingThreads,
+      coreCount,
+      workerCount,
+      targetWorkers,
+      threadSuffix
+    )
     count = count + 1
     lines[count] = string.format(
       'World: Chunks %d  |  Rebuilds %d  |  Dirty %d',

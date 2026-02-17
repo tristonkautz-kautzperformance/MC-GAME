@@ -82,6 +82,24 @@ local function isBlobData(value)
     and type(value.getString) == 'function'
 end
 
+local function getLogicalCoreCount()
+  if not (lovr and lovr.system and lovr.system.getCoreCount) then
+    return 1
+  end
+
+  local ok, cores = pcall(lovr.system.getCoreCount)
+  if not ok then
+    return 1
+  end
+
+  cores = tonumber(cores)
+  if not cores or cores < 1 then
+    return 1
+  end
+
+  return math.floor(cores)
+end
+
 function ChunkRenderer.new(constants, world)
   local self = setmetatable({}, ChunkRenderer)
   self.constants = constants
@@ -162,15 +180,29 @@ function ChunkRenderer.new(constants, world)
   self._threadEnabled = threadConfig.enabled == true
   self._threadHaloBlob = threadConfig.haloBlob ~= false
   self._threadResultBlob = threadConfig.resultBlob ~= false
-  self._threadMaxInFlight = math.floor(tonumber(threadConfig.maxInFlight) or 2)
-  if self._threadMaxInFlight < 1 then
-    self._threadMaxInFlight = 1
+  local configuredMaxInFlight = tonumber(threadConfig.maxInFlight)
+  self._threadMaxInFlightAuto = configuredMaxInFlight == nil or configuredMaxInFlight <= 0
+  self._threadMaxInFlight = 2
+  if not self._threadMaxInFlightAuto then
+    self._threadMaxInFlight = math.floor(configuredMaxInFlight)
+    if self._threadMaxInFlight < 1 then
+      self._threadMaxInFlight = 1
+    end
   end
+  self._threadConfiguredWorkerCount = tonumber(threadConfig.workerCount)
+  self._threadMaxWorkers = math.floor(tonumber(threadConfig.maxWorkers) or 4)
+  if self._threadMaxWorkers < 1 then
+    self._threadMaxWorkers = 1
+  end
+  self._threadCoreCount = getLogicalCoreCount()
+  self._threadTargetWorkers = 0
+  self._threadActiveWorkers = 0
+  self._threadWorkerRoundRobin = 1
   self._threadMaxApplyMillis = tonumber(threadConfig.maxApplyMillis) or 1.0
   if self._threadMaxApplyMillis < 0 then
     self._threadMaxApplyMillis = 0
   end
-  self._meshWorker = nil
+  self._meshWorkers = {}
   self._meshWorkerFailed = false
   self._meshWorkerError = nil
   self._chunkBuildVersion = {}
@@ -210,6 +242,15 @@ end
 
 function ChunkRenderer:getDirtyQueueSize()
   return self._dirtyCount or 0
+end
+
+function ChunkRenderer:getThreadingPerfStats()
+  local logicalCores = math.max(1, math.floor(tonumber(self._threadCoreCount) or 1))
+  local activeWorkers = math.max(0, math.floor(tonumber(self._threadActiveWorkers) or 0))
+  local targetWorkers = math.max(0, math.floor(tonumber(self._threadTargetWorkers) or 0))
+  local activeMeshingThreads = activeWorkers + 1 -- workers plus the main thread.
+  local threadedActive = activeWorkers > 0 and self._threadEnabled == true
+  return logicalCores, activeWorkers, targetWorkers, activeMeshingThreads, threadedActive
 end
 
 function ChunkRenderer:isGreedyMeshingEnabled()
@@ -431,19 +472,91 @@ function ChunkRenderer:_packHaloBlob(halo)
   return nil
 end
 
+function ChunkRenderer:_resolveThreadWorkerCount()
+  if not self._threadEnabled then
+    return 0
+  end
+
+  local configured = tonumber(self._threadConfiguredWorkerCount)
+  if configured and configured > 0 then
+    local explicitCount = math.floor(configured)
+    if explicitCount < 1 then
+      explicitCount = 1
+    end
+    return math.min(self._threadMaxWorkers, explicitCount)
+  end
+
+  if self._threadCoreCount <= 1 then
+    return 0
+  end
+  local autoCount = self._threadCoreCount - 1
+  if autoCount < 1 then
+    autoCount = 1
+  end
+  return math.min(self._threadMaxWorkers, autoCount)
+end
+
+function ChunkRenderer:_shutdownMeshWorkers()
+  local workers = self._meshWorkers
+  if not workers then
+    return
+  end
+
+  for i = #workers, 1, -1 do
+    local worker = workers[i]
+    if worker then
+      worker:shutdown()
+    end
+    workers[i] = nil
+  end
+
+  self._threadActiveWorkers = 0
+  self._threadWorkerRoundRobin = 1
+end
+
 function ChunkRenderer:_initMeshWorker()
-  local worker, err = MeshWorker.new('src/render/mesher_thread.lua')
-  if not worker then
-    self._meshWorker = nil
-    self._meshWorkerFailed = true
-    self._meshWorkerError = tostring(err or 'failed_to_start')
+  self:_shutdownMeshWorkers()
+
+  local targetWorkers = self:_resolveThreadWorkerCount()
+  self._threadTargetWorkers = targetWorkers
+  if targetWorkers <= 0 then
+    self._threadEnabled = false
+    self._meshWorkerFailed = false
+    self._meshWorkerError = 'thread_pool_not_needed'
     return false
   end
 
-  self._meshWorker = worker
+  local workers = self._meshWorkers
+  local started = 0
+  for i = 1, targetWorkers do
+    local worker, err = MeshWorker.new('src/render/mesher_thread.lua')
+    if not worker then
+      if started == 0 then
+        self._threadEnabled = false
+        self._meshWorkerFailed = true
+        self._meshWorkerError = tostring(err or 'failed_to_start')
+        return false
+      end
+      self._meshWorkerError = tostring(err or 'worker_pool_partial')
+      break
+    end
+
+    started = started + 1
+    workers[started] = worker
+  end
+
+  self._threadActiveWorkers = started
+  self._threadWorkerRoundRobin = 1
   self._meshWorkerFailed = false
-  self._meshWorkerError = nil
-  return true
+  if started == targetWorkers then
+    self._meshWorkerError = nil
+  end
+
+  if self._threadMaxInFlightAuto then
+    self._threadMaxInFlight = math.max(2, started * 2)
+  end
+
+  return started > 0
 end
 
 function ChunkRenderer:_disableMeshWorker(reason)
@@ -451,12 +564,10 @@ function ChunkRenderer:_disableMeshWorker(reason)
     self._meshWorkerError = tostring(reason)
   end
 
-  if self._meshWorker then
-    self._meshWorker:shutdown()
-    self._meshWorker = nil
-  end
+  self:_shutdownMeshWorkers()
 
   self._threadEnabled = false
+  self._threadTargetWorkers = 0
   self._meshWorkerFailed = true
   self:_releaseAllInFlightHalos()
   self._threadInFlightByKey = {}
@@ -476,15 +587,43 @@ function ChunkRenderer:_isMeshWorkerReady()
   if self._meshWorkerFailed then
     return false
   end
-  local worker = self._meshWorker
-  if not worker then
+  local workerCount = self._threadActiveWorkers or 0
+  if workerCount <= 0 then
     return false
   end
-  if not worker:isAlive() then
-    self:_disableMeshWorker(worker:getError() or 'worker_stopped')
-    return false
+
+  local workers = self._meshWorkers
+  for i = 1, workerCount do
+    local worker = workers[i]
+    if not worker or not worker:isAlive() then
+      local workerError = worker and worker:getError() or 'worker_stopped'
+      self:_disableMeshWorker(workerError)
+      return false
+    end
   end
+
   return true
+end
+
+function ChunkRenderer:_pickMeshWorker()
+  local workerCount = self._threadActiveWorkers or 0
+  if workerCount <= 0 then
+    return nil
+  end
+
+  local nextIndex = self._threadWorkerRoundRobin or 1
+  if nextIndex > workerCount then
+    nextIndex = 1
+  end
+
+  local worker = self._meshWorkers[nextIndex]
+  nextIndex = nextIndex + 1
+  if nextIndex > workerCount then
+    nextIndex = 1
+  end
+  self._threadWorkerRoundRobin = nextIndex
+
+  return worker
 end
 
 function ChunkRenderer:_nextBuildVersion(key)
@@ -655,7 +794,15 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     usesSkyHaloTablePayload = true
   end
 
-  local ok, err = self._meshWorker:push(job)
+  local worker = self:_pickMeshWorker()
+  if not worker then
+    self:_releaseThreadHaloTable(halo)
+    self:_releaseThreadSkyHaloTable(skyHalo)
+    self:_disableMeshWorker('no_active_worker')
+    return 'fallback'
+  end
+
+  local ok, err = worker:push(job)
   if not ok then
     self:_releaseThreadHaloTable(halo)
     self:_releaseThreadSkyHaloTable(skyHalo)
@@ -684,6 +831,12 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
     return 0
   end
 
+  local workerCount = self._threadActiveWorkers or 0
+  if workerCount <= 0 then
+    return 0
+  end
+  local workers = self._meshWorkers
+
   local hasTimer = lovr.timer and lovr.timer.getTime
   local useTimeBudget = hasTimer and maxMillis and maxMillis > 0
   local startTime = 0
@@ -691,23 +844,10 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
     startTime = lovr.timer.getTime()
   end
 
-  local applied = 0
-  while true do
-    if useTimeBudget and applied > 0 then
-      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
-      if elapsedMs >= maxMillis then
-        break
-      end
-    end
-
-    local result = self._meshWorker:pop()
-    if not result then
-      break
-    end
-
+  local function processResult(result)
     if result.type == 'error' then
       self:_disableMeshWorker(result.error or 'mesh_worker_error')
-      break
+      return false
     end
 
     if result.type == 'result' and result.key then
@@ -752,10 +892,51 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
               dist = 0
             })
           end
-          break
+          return false
         end
-        applied = applied + 1
       end
+    end
+
+    return true
+  end
+
+  local applied = 0
+  while true do
+    if useTimeBudget and applied > 0 then
+      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+      if elapsedMs >= maxMillis then
+        break
+      end
+    end
+
+    local hadResult = false
+    for i = 1, workerCount do
+      local worker = workers[i]
+      local result = worker and worker:pop() or nil
+      if result then
+        hadResult = true
+        local continueLoop = processResult(result)
+        if not continueLoop then
+          return applied
+        end
+        if result.type == 'result' and result.key then
+          local latestVersion = self._chunkBuildVersion[result.key]
+          if latestVersion and result.version == latestVersion then
+            applied = applied + 1
+          end
+        end
+
+        if useTimeBudget and applied > 0 then
+          local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
+          if elapsedMs >= maxMillis then
+            return applied
+          end
+        end
+      end
+    end
+
+    if not hadResult then
+      break
     end
   end
 
@@ -768,10 +949,7 @@ function ChunkRenderer:shutdown()
     self._chunkMeshes[key] = nil
   end
 
-  if self._meshWorker then
-    self._meshWorker:shutdown()
-    self._meshWorker = nil
-  end
+  self:_shutdownMeshWorkers()
   self:_releaseAllInFlightHalos()
   self._threadInFlightByKey = {}
   self._threadInFlightHaloByKey = {}

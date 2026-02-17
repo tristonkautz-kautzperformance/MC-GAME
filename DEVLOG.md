@@ -5,6 +5,35 @@
 ### Render Distance vs Simulation Distance Split
 - Added explicit simulation-radius config field in `src/constants.lua` (`CULL.simulationRadiusChunks`).
 - Kept simulation radius locked to 4 chunks in `src/game/GameState.lua` for now, independent from render-distance tuning.
+- Stress-test preset: increased `CULL.drawRadiusChunks` from `4` to `16` while keeping simulation locked at `4`.
+- Decoupled floodfill active-region pruning from render mesh-cache radius in `src/render/ChunkRenderer.lua`:
+  - sky-light prune now uses simulation radius (`simulationRadiusChunks`) instead of mesh prune radius.
+  - prevents floodfill active-region blowups when render radius is pushed very high.
+- Added floodfill outside-region fast path in `src/world/lighting/FloodfillLighting.lua`:
+  - chunks outside active simulation lighting region now solve halo columns without enqueueing flood/dark propagation.
+  - avoids runaway urgent/region queue growth and late-session lighting degradation under high render-distance stress.
+- Updated far-distance floodfill fallback in `src/world/lighting/FloodfillLighting.lua`:
+  - chunks outside active simulation lighting region now skip sky-column solving entirely.
+  - outside-sim chunk halos render with full skylight (no shadows) for a smoother visual transition into in-range floodfill lighting.
+  - removes remaining far-region column-solve cost during high render-distance stress sessions.
+- Prioritized floodfill stability over interim vertical fallback in `src/world/lighting/FloodfillLighting.lua`:
+  - `ensureSkyLightForChunk(...)` now treats any pending sky queue work (columns/dark/flood) as not-ready and defers chunk meshing until queues drain.
+  - `fillSkyLightHalo(...)` now uses temporary full-skylight fallback while sky queues are backlogged or halo columns are not ready, avoiding dark vertical-style pop-in.
+- Added runtime lighting-priority throttling in `src/game/GameState.lua`:
+  - when lighting backlog exists, game now runs an extra `updateSkyLight()` pass before meshing.
+  - chunk rebuild budgets are temporarily reduced while backlog is present (stronger reduction for urgent lighting queues), so near-player lighting catch-up wins over mesh throughput.
+- Added lighting-backlog introspection plumbing:
+  - `ChunkWorld:hasUrgentSkyLightWork()` and `ChunkWorld:hasSkyLightWork()` wrappers.
+  - `FloodfillLighting:hasUrgentSkyWork()` / `hasSkyWork()` implementations.
+  - no-op compatibility stubs in `VerticalLighting`.
+- Updated leaf visuals/material in `src/constants.lua`, `src/render/ChunkRenderer.lua`, and `src/render/mesher_thread.lua`:
+  - leaves now render as fully opaque blocks (`opaque = true`, `alpha = 1`).
+  - added deterministic per-block leaf tint variation during meshing (main-thread and threaded paths) so canopies are not flat single-color.
+  - follow-up perf fix: leaf tint variation now uses coarse canopy cells (x/z quantized) to preserve greedy face merging and avoid heavy mesh-fragmentation spikes.
+  - removed leaf tint variation entirely and restored uniform leaf coloring to keep canopy visuals consistent.
+- Adjusted water lighting behavior in `src/constants.lua`:
+  - water `lightOpacity` changed from `1` to `0` so water no longer attenuates skylight/casts terrain shadowing.
+  - intended to remove inconsistent underwater dark patching on sand/terrain while floodfill is active.
 - Wired simulation chunk window into mob ticking in `src/mobs/MobSystem.lua`:
   - `MobSystem:update(...)` now receives player chunk center + simulation radius.
   - mob AI/attacks/movement are processed only for mobs inside the simulation chunk window.

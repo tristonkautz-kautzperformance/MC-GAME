@@ -980,10 +980,46 @@ function GameState:_updateGame(dt)
   end
 
   self:_updateAutosave(dt)
+  local rebuildMaxPerFrame = self.rebuildMaxPerFrame
+  local rebuildMaxMillisPerFrame = self.rebuildMaxMillisPerFrame
   if self.world and self.world.updateSkyLight then
     self.world:updateSkyLight()
+    local hasUrgentSkyWork = false
+    if self.world.hasUrgentSkyLightWork then
+      hasUrgentSkyWork = self.world:hasUrgentSkyLightWork() == true
+    end
+
+    local hasSkyWork = hasUrgentSkyWork
+    if not hasSkyWork and self.world.hasSkyLightWork then
+      hasSkyWork = self.world:hasSkyLightWork() == true
+    end
+
+    if hasUrgentSkyWork then
+      -- Give lighting extra headroom and temporarily throttle meshing when urgent queues are active.
+      self.world:updateSkyLight()
+      if rebuildMaxPerFrame ~= nil then
+        rebuildMaxPerFrame = math.floor(rebuildMaxPerFrame * 0.25)
+        if rebuildMaxPerFrame < 1 then
+          rebuildMaxPerFrame = 1
+        end
+      end
+      if rebuildMaxMillisPerFrame ~= nil and rebuildMaxMillisPerFrame > 0 then
+        rebuildMaxMillisPerFrame = rebuildMaxMillisPerFrame * 0.5
+      end
+    elseif hasSkyWork then
+      self.world:updateSkyLight()
+      if rebuildMaxPerFrame ~= nil then
+        rebuildMaxPerFrame = math.floor(rebuildMaxPerFrame * 0.5)
+        if rebuildMaxPerFrame < 1 then
+          rebuildMaxPerFrame = 1
+        end
+      end
+      if rebuildMaxMillisPerFrame ~= nil and rebuildMaxMillisPerFrame > 0 then
+        rebuildMaxMillisPerFrame = rebuildMaxMillisPerFrame * 0.75
+      end
+    end
   end
-  self.renderer:rebuildDirty(self.rebuildMaxPerFrame, self.rebuildMaxMillisPerFrame)
+  self.renderer:rebuildDirty(rebuildMaxPerFrame, rebuildMaxMillisPerFrame)
   self.input:beginFrame()
 end
 

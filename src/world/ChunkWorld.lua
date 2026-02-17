@@ -349,6 +349,22 @@ function ChunkWorld:getLightingPerfStats()
   return 0, 0, 0, 1
 end
 
+function ChunkWorld:hasUrgentSkyLightWork()
+  local backend = self._lightingBackend
+  if backend and backend.hasUrgentSkyWork then
+    return backend:hasUrgentSkyWork()
+  end
+  return false
+end
+
+function ChunkWorld:hasSkyLightWork()
+  local backend = self._lightingBackend
+  if backend and backend.hasSkyWork then
+    return backend:hasSkyWork()
+  end
+  return false
+end
+
 function ChunkWorld:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)
   local backend = self._lightingBackend
   if backend and backend.pruneSkyLightChunks then

@@ -164,6 +164,12 @@ function FloodfillLighting:_hasUrgentWork()
     or self.skyFloodUrgentCount > 0
 end
 
+function FloodfillLighting:_hasSkyQueueWork()
+  return self:_hasSkyColumnsQueue()
+    or self:_hasSkyDarkQueue()
+    or self:_hasSkyFloodQueue()
+end
+
 function FloodfillLighting:_setSkyStageFromQueues()
   if self:_hasSkyColumnsQueue() then
     self.skyStage = 'vertical'
@@ -446,6 +452,14 @@ function FloodfillLighting:getPerfStats()
     self._chunkEnsureScaleLast or 1
 end
 
+function FloodfillLighting:hasUrgentSkyWork()
+  return self:_hasUrgentWork()
+end
+
+function FloodfillLighting:hasSkyWork()
+  return self:_hasSkyQueueWork() or self:_hasRegionTasks()
+end
+
 function FloodfillLighting:_enqueueSkyColumn(columnKey, urgent)
   local priority = self.skyColumnsQueueSet[columnKey]
   if priority == nil then
@@ -689,6 +703,13 @@ function FloodfillLighting:_isInsideSkyActiveWorldXZ(x, z)
     and x <= self.skyActiveMaxX
     and z >= self.skyActiveMinZ
     and z <= self.skyActiveMaxZ
+end
+
+function FloodfillLighting:_isChunkInsideSkyActiveRegion(cx, cz)
+  return cx >= self.skyActiveMinCx
+    and cx <= self.skyActiveMaxCx
+    and cz >= self.skyActiveMinCz
+    and cz <= self.skyActiveMaxCz
 end
 
 function FloodfillLighting:_isInsideSkyPropagationWorldXZ(x, z)
@@ -1355,22 +1376,28 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
 
   world:prepareChunk(cx, cy, cz)
 
-  if self:_hasUrgentWork() then
+  local insideActiveRegion = self:_isChunkInsideSkyActiveRegion(cx, cz)
+  if not insideActiveRegion then
+    -- Outside simulation lighting region: skip sky solve work and render full skylight.
+    return true
+  end
+
+  if self:_hasSkyQueueWork() then
     if localOps > 0 then
       self:updateSkyLight(localOps, localMillis)
     end
-    if self:_hasUrgentWork() then
+    if self:_hasSkyQueueWork() then
       return false
     end
   end
 
   self:_ensureSkyHaloColumns(cx, cz, true, false, true)
 
-  if localOps > 0 and self:_hasUrgentWork() then
+  if localOps > 0 and self:_hasSkyQueueWork() then
     self:updateSkyLight(localOps, localMillis)
   end
 
-  if self:_hasUrgentWork() then
+  if self:_hasSkyQueueWork() then
     return false
   end
   return true
@@ -1396,20 +1423,43 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
     return out
   end
 
-  local hadPropBounds = self.skyPropMinX ~= nil
-  local oldMinX = self.skyPropMinX
-  local oldMaxX = self.skyPropMaxX
-  local oldMinZ = self.skyPropMinZ
-  local oldMaxZ = self.skyPropMaxZ
-  self:_clearSkyPropagationBounds()
-  self:_ensureSkyHaloColumns(cx, cz, true, false, false)
-  if hadPropBounds then
-    self.skyPropMinX = oldMinX
-    self.skyPropMaxX = oldMaxX
-    self.skyPropMinZ = oldMinZ
-    self.skyPropMaxZ = oldMaxZ
+  local insideActiveRegion = self:_isChunkInsideSkyActiveRegion(cx, cz)
+  if not insideActiveRegion then
+    local strideZ = haloSize
+    local strideY = haloSize * haloSize
+    local baseOriginX = (cx - 1) * cs
+    local baseOriginY = (cy - 1) * cs
+    local baseOriginZ = (cz - 1) * cs
+
+    for hy = 0, cs + 1 do
+      local wy = baseOriginY + hy
+      local syBase = (hy * strideY) + 1
+
+      for hz = 0, cs + 1 do
+        local wz = baseOriginZ + hz
+        local szBase = syBase + (hz * strideZ)
+
+        for hx = 0, cs + 1 do
+          local wx = baseOriginX + hx
+          local index = szBase + hx
+
+          if wx < 1 or wx > world.sizeX or wz < 1 or wz > world.sizeZ or wy < 1 then
+            out[index] = 0
+          else
+            out[index] = 15
+          end
+        end
+      end
+    end
+
+    for i = required + 1, #out do
+      out[i] = nil
+    end
+    return out
   end
 
+  local queueBacklog = self:_hasSkyQueueWork()
+  local skyColumnsReady = self.skyColumnsReady
   local strideZ = haloSize
   local strideY = haloSize * haloSize
   local baseOriginX = (cx - 1) * cs
@@ -1431,6 +1481,9 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
         if wx < 1 or wx > world.sizeX or wz < 1 or wz > world.sizeZ or wy < 1 then
           out[index] = 0
         elseif wy > world.sizeY then
+          out[index] = 15
+        elseif queueBacklog or not skyColumnsReady[world:_worldColumnKey(wx, wz)] then
+          -- While floodfill queues are pending, prefer a no-shadow fallback over dark interim vertical values.
           out[index] = 15
         else
           out[index] = self:_getSkyLightWorld(wx, wy, wz)

@@ -148,6 +148,7 @@ function ChunkRenderer.new(constants, world)
   self._prunePending = false
   self._pruneCursorKey = nil
   self._pruneKeepRadius = 0
+  self._skyLightKeepRadius = 0
   self._visibleCount = 0
   self._useGreedyMeshing = not (constants.MESH and constants.MESH.greedy == false)
   self._useIndexedMeshing = constants.MESH and constants.MESH.indexed == true
@@ -1027,11 +1028,12 @@ function ChunkRenderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
   end
 
   self._pruneKeepRadius = self:_computePruneKeepRadius()
+  self._skyLightKeepRadius = self:_computeSkyLightKeepRadius()
   self._prunePending = true
   self._pruneCursorKey = nil
 
   if world and world.pruneSkyLightChunks then
-    world:pruneSkyLightChunks(pcx, pcz, self._pruneKeepRadius)
+    world:pruneSkyLightChunks(pcx, pcz, self._skyLightKeepRadius)
   end
 end
 
@@ -1041,6 +1043,20 @@ function ChunkRenderer:_computePruneKeepRadius()
   local alwaysVisiblePadding = tonumber(cull.alwaysVisiblePaddingChunks) or 0
   local meshCachePadding = tonumber(cull.meshCachePaddingChunks) or 0
   local keepRadius = math.floor(drawRadius + alwaysVisiblePadding + meshCachePadding)
+  if keepRadius < 0 then
+    keepRadius = 0
+  end
+  return keepRadius
+end
+
+function ChunkRenderer:_computeSkyLightKeepRadius()
+  local cull = self.constants.CULL or {}
+  local simulationRadius = tonumber(cull.simulationRadiusChunks)
+  if simulationRadius == nil then
+    simulationRadius = tonumber(cull.drawRadiusChunks) or 0
+  end
+
+  local keepRadius = math.floor(simulationRadius)
   if keepRadius < 0 then
     keepRadius = 0
   end
@@ -1355,7 +1371,7 @@ function ChunkRenderer:_shouldDrawFace(block, neighbor)
     return not neighborOpaque, false
   end
 
-  -- Translucent (leaf): only draw faces against air; cull internal leaf faces.
+  -- Translucent blocks: only draw faces against air; cull internal faces.
   if neighbor == block then
     return false, true
   end

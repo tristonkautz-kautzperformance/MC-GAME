@@ -336,6 +336,14 @@ function VerticalLighting:getPerfStats()
   return 0, 0, 0, 1
 end
 
+function VerticalLighting:hasUrgentSkyWork()
+  return false
+end
+
+function VerticalLighting:hasSkyWork()
+  return false
+end
+
 function VerticalLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)
   if not self.enabled then
     return 0

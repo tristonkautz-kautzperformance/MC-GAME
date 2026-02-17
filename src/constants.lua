@@ -67,7 +67,7 @@ Constants.LIGHTING = {
 
 Constants.CULL = {
   enabled = true,
-  drawRadiusChunks = 4,
+  drawRadiusChunks = 16,
   -- Reserved for gameplay tick radius; runtime is currently locked to 4 chunks.
   simulationRadiusChunks = 4,
   fovDegrees = 110,
@@ -210,11 +210,11 @@ Constants.BLOCK_INFO = {
     name = 'Leaf',
     color = { .23, .55, .24 },
     solid = true,
-    opaque = false,
+    opaque = true,
     lightOpacity = Constants.LIGHTING.leafOpacity,
     breakable = true,
     placeable = true,
-    alpha = .92
+    alpha = 1
   },
   [Constants.BLOCK.SAND] = {
     name = 'Sand',
@@ -233,7 +233,7 @@ Constants.BLOCK_INFO = {
     collidable = false,
     render = true,
     opaque = false,
-    lightOpacity = 1,
+    lightOpacity = 0,
     breakable = true,
     placeable = true,
     alpha = .74

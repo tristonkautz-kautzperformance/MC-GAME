@@ -6,6 +6,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 
 - Fixed voxel world size: `1280 x 1280 x 64` (`X x Z x Y`)
 - Block types: grass, dirt, stone, sand, water, bedrock, wood (tree), leaf
+  - Leaf rendering: opaque leaves with uniform color
 - First-person character controller:
   - WASD movement
   - Mouse look
@@ -38,6 +39,9 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - Render and simulation distances are now separated:
   - render distance controls chunk meshing/draw culling.
   - simulation distance controls gameplay ticking (currently locked to 4 chunks).
+  - floodfill lighting active-region tracking follows simulation radius, not render radius.
+  - chunks outside simulation distance render with full skylight (no far-distance shadow solve).
+  - during in-range floodfill backlog, meshing is temporarily throttled and chunks use a no-shadow fallback until lighting catches up.
 - Threaded chunk meshing worker pool:
   - Auto-scales worker count from CPU logical cores (`cores - 1`, clamped)
   - Gracefully falls back to synchronous meshing if thread APIs/hardware support is unavailable

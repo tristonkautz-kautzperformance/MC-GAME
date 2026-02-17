@@ -21,8 +21,8 @@ This file describes the project's intent, tech stack, and engineering constraint
 - From repo root: `lovr .`
 - Pointer lock:
   - Click to capture mouse.
-  - `Tab` toggles lock.
-  - `Esc` unlocks mouse if locked; otherwise opens the pause menu.
+  - `Tab` opens/closes the bag menu.
+  - `Esc` closes bag if open; otherwise unlocks mouse if locked, or opens the pause menu when already unlocked.
 
 ## Current Code Layout
 - `main.lua`: LOVR lifecycle callback forwarding only.

@@ -26,6 +26,17 @@ local function parseNumber(value, fallback)
   return n
 end
 
+local function worldToChunk(value, chunkSize, maxChunks)
+  local chunk = math.floor((tonumber(value) or 0) / chunkSize) + 1
+  if chunk < 1 then
+    return 1
+  end
+  if chunk > maxChunks then
+    return maxChunks
+  end
+  return chunk
+end
+
 local function raySphere(originX, originY, originZ, dirX, dirY, dirZ, centerX, centerY, centerZ, radius)
   local mx = originX - centerX
   local my = originY - centerY
@@ -83,6 +94,9 @@ function MobSystem.new(constants, world, player, stats)
 
   self.mobs = {}
   self.targetMob = nil
+  self._simulationCenterCx = nil
+  self._simulationCenterCz = nil
+  self._simulationRadiusChunks = nil
 
   return self
 end
@@ -105,6 +119,37 @@ end
 
 function MobSystem:_isNight(timeOfDay)
   return self:_computeDaylight(timeOfDay) <= self.nightDaylightThreshold
+end
+
+function MobSystem:_setSimulationWindow(centerCx, centerCz, radiusChunks)
+  local radius = tonumber(radiusChunks)
+  if not radius or radius < 0 then
+    self._simulationCenterCx = nil
+    self._simulationCenterCz = nil
+    self._simulationRadiusChunks = nil
+    return
+  end
+
+  local world = self.world
+  self._simulationCenterCx = clamp(math.floor(tonumber(centerCx) or 1), 1, world.chunksX)
+  self._simulationCenterCz = clamp(math.floor(tonumber(centerCz) or 1), 1, world.chunksZ)
+  self._simulationRadiusChunks = math.floor(radius)
+end
+
+function MobSystem:_isInsideSimulationWindow(worldX, worldZ)
+  local radiusChunks = self._simulationRadiusChunks
+  local centerCx = self._simulationCenterCx
+  local centerCz = self._simulationCenterCz
+  if radiusChunks == nil or centerCx == nil or centerCz == nil then
+    return true
+  end
+
+  local world = self.world
+  local cx = worldToChunk(worldX, world.chunkSize, world.chunksX)
+  local cz = worldToChunk(worldZ, world.chunkSize, world.chunksZ)
+  local dx = math.abs(cx - centerCx)
+  local dz = math.abs(cz - centerCz)
+  return dx <= radiusChunks and dz <= radiusChunks
 end
 
 function MobSystem:_findGroundY(worldX, worldZ)
@@ -252,11 +297,13 @@ function MobSystem:updateTarget(originX, originY, originZ, dirX, dirY, dirZ, rea
 
   for i = 1, #self.mobs do
     local mob = self.mobs[i]
-    local radius = math.max(0.35, mob.size * 0.55)
-    local t = raySphere(originX, originY, originZ, dirX, dirY, dirZ, mob.x, mob.y, mob.z, radius)
-    if t and t <= maxDistance and t < bestDistance then
-      bestDistance = t
-      bestMob = mob
+    if self:_isInsideSimulationWindow(mob.x, mob.z) then
+      local radius = math.max(0.35, mob.size * 0.55)
+      local t = raySphere(originX, originY, originZ, dirX, dirY, dirZ, mob.x, mob.y, mob.z, radius)
+      if t and t <= maxDistance and t < bestDistance then
+        bestDistance = t
+        bestMob = mob
+      end
     end
   end
 
@@ -345,13 +392,16 @@ function MobSystem:_updateAiStep(delta)
       table.remove(self.mobs, i)
       removed = true
     else
+      local insideSimulation = self:_isInsideSimulationWindow(mob.x, mob.z)
       if mob.kind == 'sheep' then
-        self:_updateSheep(mob, delta)
+        if insideSimulation then
+          self:_updateSheep(mob, delta)
+        end
       elseif mob.kind == 'ghost' then
         if not night then
           table.remove(self.mobs, i)
           removed = true
-        else
+        elseif insideSimulation then
           self:_updateGhost(mob, delta)
         end
       end
@@ -368,12 +418,15 @@ function MobSystem:_updateAiStep(delta)
   end
 end
 
-function MobSystem:update(dt, timeOfDay, skipAi)
+function MobSystem:update(dt, timeOfDay, skipAi, simulationCenterCx, simulationCenterCz, simulationRadiusChunks)
   if not self.enabled then
     self.targetMob = nil
     self._aiAccumulator = 0
+    self:_setSimulationWindow(nil, nil, nil)
     return
   end
+
+  self:_setSimulationWindow(simulationCenterCx, simulationCenterCz, simulationRadiusChunks)
 
   local delta = parseNumber(dt, 0)
   if delta <= 0 then

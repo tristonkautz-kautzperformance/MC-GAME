@@ -1,5 +1,40 @@
 # Dev Log
 
+## 2026-02-17
+
+### Render Distance vs Simulation Distance Split
+- Added explicit simulation-radius config field in `src/constants.lua` (`CULL.simulationRadiusChunks`).
+- Kept simulation radius locked to 4 chunks in `src/game/GameState.lua` for now, independent from render-distance tuning.
+- Wired simulation chunk window into mob ticking in `src/mobs/MobSystem.lua`:
+  - `MobSystem:update(...)` now receives player chunk center + simulation radius.
+  - mob AI/attacks/movement are processed only for mobs inside the simulation chunk window.
+  - out-of-simulation mobs remain present but effectively frozen until they re-enter simulation range.
+- Added HUD distance telemetry in `src/ui/HUD.lua` (`Distance: Render <n> | Sim <n>`) for quick runtime verification.
+
+### Bag Menu + Inventory Flow Upgrade
+- Expanded inventory model in `src/inventory.lua`:
+  - split inventory capacity into hotbar + storage (`hotbarCount` + `slotCount`).
+  - hotbar selection/cycling now stays constrained to hotbar slots.
+  - added full-stack bag interactions (`interactSlot`) for pick/place/merge/swap behavior.
+  - added held-stack handling (`getHeldStack`, `stowHeldStack`) so moving stacks is loss-safe when closing UI/saving.
+- Added bag-mode input behavior in `src/input/Input.lua`:
+  - `Tab` now toggles inventory bag mode instead of toggling mouse lock.
+  - while bag is open, movement/look/break/place inputs are suspended.
+  - added bag navigation + interaction intents (arrows/WASD + Enter/Space/left click).
+- Wired bag runtime flow in `src/game/GameState.lua`:
+  - explicit bag open/close state with cursor index tracking.
+  - opening bag unlocks the mouse and routes input to inventory slot movement/interactions.
+  - gameplay update loop pauses world/player interaction while bag is open.
+  - save path now attempts to stow held stacks before serialization.
+- Reworked HUD inventory rendering in `src/ui/HUD.lua`:
+  - preserved existing gameplay hotbar presentation.
+  - added a dedicated bag overlay showing storage grid + hotbar row with cursor highlight.
+  - bag overlay supports full-stack pick/place feedback and held-stack text.
+  - help/tip strings updated for bag controls.
+- Updated docs and project notes:
+  - control/feature updates in `README.md`.
+  - pointer-lock/control note update in `AGENTS.md`.
+
 ## 2026-02-16
 
 ### Frame Spike Tuning Pass (Thread/Apply/Rebuild Budgets)

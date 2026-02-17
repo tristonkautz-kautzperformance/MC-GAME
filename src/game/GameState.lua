@@ -63,6 +63,43 @@ local function worldToChunk(value, chunkSize, maxChunks)
   return clamp(chunk, 1, maxChunks)
 end
 
+local function getInventoryLayout(inventory)
+  local totalSlots = math.max(1, math.floor(tonumber(inventory and inventory.slotCount) or 1))
+  local hotbarCount = totalSlots
+  if inventory and inventory.getHotbarCount then
+    hotbarCount = math.floor(tonumber(inventory:getHotbarCount()) or totalSlots)
+  end
+  hotbarCount = clamp(hotbarCount, 1, totalSlots)
+
+  local storageCount = math.max(0, totalSlots - hotbarCount)
+  local storageRows = math.ceil(storageCount / hotbarCount)
+  return hotbarCount, totalSlots, storageCount, storageRows
+end
+
+local function slotIndexToGrid(index, hotbarCount, storageRows)
+  local slotIndex = math.max(1, math.floor(tonumber(index) or 1))
+  if slotIndex <= hotbarCount then
+    return storageRows + 1, slotIndex
+  end
+
+  local storageOrdinal = slotIndex - hotbarCount
+  local row = math.floor((storageOrdinal - 1) / hotbarCount) + 1
+  local col = ((storageOrdinal - 1) % hotbarCount) + 1
+  return row, col
+end
+
+local function gridToSlotIndex(row, col, hotbarCount, storageCount, storageRows)
+  if row == storageRows + 1 then
+    return col
+  end
+
+  local storageOrdinal = (row - 1) * hotbarCount + col
+  if storageOrdinal < 1 or storageOrdinal > storageCount then
+    return nil
+  end
+  return hotbarCount + storageOrdinal
+end
+
 function GameState.new(constants)
   local self = setmetatable({}, GameState)
   self.constants = constants
@@ -91,6 +128,7 @@ function GameState.new(constants)
   self._autosaveTimer = 0
   self._saveStatusText = nil
   self._saveStatusTimer = 0
+  self._simulationChunkRadius = 4
   self._chunkDirtyRadius = 0
   self._activeMinChunkY = 1
   self._activeMaxChunkY = 1
@@ -112,6 +150,9 @@ function GameState.new(constants)
   self._worstFrameWindowMax = 0
   self._worstFrameWindowTime = 0
   self.relativeMouseReady = false
+  self.inventoryMenuOpen = false
+  self.inventoryMenuCursorIndex = 1
+  self._inventoryMenuReturnLock = false
   self._loaded = false
 
   return self
@@ -221,6 +262,10 @@ function GameState:_saveNow()
     return false, 'missing_session'
   end
 
+  if self.inventory and self.inventory.stowHeldStack then
+    self.inventory:stowHeldStack()
+  end
+
   return self.saveSystem:save(self.world, self.constants, self.player, self.inventory, self.sky, self.stats)
 end
 
@@ -293,6 +338,7 @@ function GameState:_teardownSession()
   self.voxelShader = nil
   self._voxelShaderError = nil
   self._autosaveTimer = 0
+  self._simulationChunkRadius = 4
   self._chunkDirtyRadius = 0
   self._activeMinChunkY = 1
   self._activeMaxChunkY = 1
@@ -300,6 +346,9 @@ function GameState:_teardownSession()
   self._lastPlayerChunkZ = nil
   self._enqueuedCount = 0
   self._enqueuedTimer = 0
+  self.inventoryMenuOpen = false
+  self.inventoryMenuCursorIndex = 1
+  self._inventoryMenuReturnLock = false
 
   if self.mouseLock then
     self.mouseLock:unlock()
@@ -382,7 +431,8 @@ function GameState:_startSession(loadSave)
   self.inventory = Inventory.new(
     self.constants.HOTBAR_DEFAULTS,
     self.constants.INVENTORY_SLOT_COUNT,
-    self.constants.INVENTORY_START_COUNT
+    self.constants.INVENTORY_START_COUNT,
+    self.constants.HOTBAR_SLOT_COUNT
   )
   if savedInventoryState then
     self.inventory:applyState(savedInventoryState)
@@ -393,6 +443,12 @@ function GameState:_startSession(loadSave)
   end
 
   self.input = Input.new(self.mouseLock, self.inventory)
+  if self.input and self.input.setInventoryMenuOpen then
+    self.input:setInventoryMenuOpen(false)
+  end
+  self.inventoryMenuOpen = false
+  self.inventoryMenuCursorIndex = self.inventory:getSelectedIndex()
+  self._inventoryMenuReturnLock = false
   self.interaction = Interaction.new(self.constants, self.world, self.player, self.inventory)
   self.hud = HUD.new(self.constants)
   self.sky = Sky.new(self.constants)
@@ -426,6 +482,12 @@ function GameState:_startSession(loadSave)
     local rebuild = self.constants.REBUILD or {}
     local radius = tonumber(cull.drawRadiusChunks) or 4
     local pad = tonumber(cull.alwaysVisiblePaddingChunks) or 0
+    local simulationRadius = tonumber(cull.simulationRadiusChunks) or 4
+    -- Locked for now: keep simulation chunk radius fixed at 4 chunks.
+    if simulationRadius ~= 4 then
+      simulationRadius = 4
+    end
+    self._simulationChunkRadius = simulationRadius
 
     -- Conservative square coverage (not FOV-based) so the initial view is mostly meshed.
     local r = math.max(0, radius + pad + 1)
@@ -547,6 +609,7 @@ function GameState:_handleMenuAction(action)
   if action == 'resume' then
     if self:_hasSession() then
       self.menu:setStatusText(nil)
+      self:_setInventoryMenuOpen(false, true)
       self.mode = 'game'
     else
       self.menu:setMode('main')
@@ -605,6 +668,95 @@ end
 function GameState:_updateMenu()
   local action = self.menu:consumeAction()
   self:_handleMenuAction(action)
+end
+
+function GameState:_setInventoryMenuOpen(open, skipRelock)
+  local nextState = open and true or false
+  self.inventoryMenuOpen = nextState
+
+  if self.input and self.input.setInventoryMenuOpen then
+    self.input:setInventoryMenuOpen(nextState)
+  end
+
+  if nextState then
+    self._inventoryMenuReturnLock = (self.mouseLock and self.mouseLock.isLocked and self.mouseLock:isLocked()) and true or false
+    if self.inventory and self.inventory.getSelectedIndex then
+      self.inventoryMenuCursorIndex = self.inventory:getSelectedIndex()
+    else
+      self.inventoryMenuCursorIndex = 1
+    end
+    if self.mouseLock then
+      self.mouseLock:unlock()
+    end
+    return
+  end
+
+  local shouldRelock = self._inventoryMenuReturnLock and not skipRelock
+  self._inventoryMenuReturnLock = false
+
+  if self.inventory and self.inventory.stowHeldStack then
+    self.inventory:stowHeldStack()
+  end
+  if shouldRelock and self.mouseLock then
+    self.mouseLock:lock()
+  end
+end
+
+function GameState:_toggleInventoryMenu()
+  if not self.inventory then
+    return
+  end
+  self:_setInventoryMenuOpen(not self.inventoryMenuOpen)
+end
+
+function GameState:_moveInventoryCursor(dx, dy)
+  if not self.inventory then
+    return
+  end
+
+  local hotbarCount, totalSlots, storageCount, storageRows = getInventoryLayout(self.inventory)
+  local totalRows = storageRows + 1
+  local cursorIndex = clamp(math.floor(tonumber(self.inventoryMenuCursorIndex) or 1), 1, totalSlots)
+  local row, col = slotIndexToGrid(cursorIndex, hotbarCount, storageRows)
+
+  local moveX = math.floor(tonumber(dx) or 0)
+  local moveY = math.floor(tonumber(dy) or 0)
+  if moveX == 0 and moveY == 0 then
+    return
+  end
+
+  row = clamp(row + moveY, 1, totalRows)
+  col = clamp(col + moveX, 1, hotbarCount)
+
+  local nextIndex = gridToSlotIndex(row, col, hotbarCount, storageCount, storageRows)
+  if not nextIndex and row <= storageRows then
+    for fallbackCol = hotbarCount, 1, -1 do
+      nextIndex = gridToSlotIndex(row, fallbackCol, hotbarCount, storageCount, storageRows)
+      if nextIndex then
+        break
+      end
+    end
+  end
+
+  if not nextIndex then
+    return
+  end
+
+  self.inventoryMenuCursorIndex = nextIndex
+  if nextIndex <= hotbarCount and self.inventory.setSelectedIndex then
+    self.inventory:setSelectedIndex(nextIndex)
+  end
+end
+
+function GameState:_interactInventoryCursor()
+  if not (self.inventory and self.inventory.interactSlot) then
+    return
+  end
+
+  local _, totalSlots = getInventoryLayout(self.inventory)
+  local cursorIndex = clamp(math.floor(tonumber(self.inventoryMenuCursorIndex) or 1), 1, totalSlots)
+  self.inventoryMenuCursorIndex = cursorIndex
+  self.inventory:interactSlot(cursorIndex)
 end
 
 function GameState:_placePlayerAtRespawn(spawnX, spawnY, spawnZ)
@@ -682,6 +834,41 @@ function GameState:_updateGame(dt)
     self.world:setFrameTiming(self.frameMs, self.worstFrameMs)
   end
 
+  if self.inventoryMenuOpen and self.input.isInventoryMenuOpen and not self.input:isInventoryMenuOpen() then
+    self:_setInventoryMenuOpen(false, true)
+  end
+
+  if self.input:consumeToggleInventoryMenu() then
+    self:_toggleInventoryMenu()
+  end
+
+  if self.input:consumeToggleHelp() then
+    self.showHelp = not self.showHelp
+  end
+
+  if self.input:consumeToggleFullscreen() then
+    self:_toggleFullscreen()
+  end
+
+  if self.input:consumeTogglePerfHud() then
+    self.showPerfHud = not self.showPerfHud
+  end
+
+  if self.inventoryMenuOpen then
+    local moveX, moveY = self.input:consumeInventoryMove()
+    if moveX ~= 0 or moveY ~= 0 then
+      self:_moveInventoryCursor(moveX, moveY)
+    end
+
+    if self.input:consumeInventoryInteract() then
+      self:_interactInventoryCursor()
+    end
+
+    self.input:consumeOpenMenu()
+    self.input:beginFrame()
+    return
+  end
+
   local dx, dy = self.input:getLookDelta()
   if dx ~= 0 or dy ~= 0 then
     self.player:applyLook(dx, dy)
@@ -733,7 +920,14 @@ function GameState:_updateGame(dt)
     end
   end
   if self.mobs then
-    self.mobs:update(dt, self.sky.timeOfDay, skipMobAi)
+    self.mobs:update(
+      dt,
+      self.sky.timeOfDay,
+      skipMobAi,
+      pcx,
+      pcz,
+      self._simulationChunkRadius
+    )
   end
   if self.stats then
     self.stats:update(dt)
@@ -771,19 +965,8 @@ function GameState:_updateGame(dt)
     self.interaction:tryPlace()
   end
 
-  if self.input:consumeToggleHelp() then
-    self.showHelp = not self.showHelp
-  end
-
-  if self.input:consumeToggleFullscreen() then
-    self:_toggleFullscreen()
-  end
-
-  if self.input:consumeTogglePerfHud() then
-    self.showPerfHud = not self.showPerfHud
-  end
-
   if self.input:consumeOpenMenu() then
+    self:_setInventoryMenuOpen(false, true)
     self.mode = 'menu'
     self.menu:setMode('pause')
     if self._saveStatusText and self._saveStatusTimer > 0 then
@@ -854,7 +1037,9 @@ function GameState:draw(pass)
   if self.mobs then
     self.mobs:draw(pass)
   end
-  self.interaction:drawOutline(pass)
+  if not self.inventoryMenuOpen then
+    self.interaction:drawOutline(pass)
+  end
 
   local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
   local dirtyQueue = self.renderer:getDirtyQueueSize()
@@ -871,6 +1056,10 @@ function GameState:draw(pass)
   local blockTargetName = self.interaction:getTargetName()
   local targetName = mobTargetName ~= 'None' and mobTargetName or blockTargetName
   local targetActive = mobTargetName ~= 'None' or self.interaction.targetHit ~= nil
+  if self.inventoryMenuOpen then
+    targetName = 'None'
+    targetActive = false
+  end
 
   self.hud:draw(pass, {
     cameraX = cameraX,
@@ -887,7 +1076,11 @@ function GameState:draw(pass)
     saveStatusTimer = self._saveStatusTimer,
     relativeMouseReady = self.relativeMouseReady,
     meshingMode = self.renderer:getMeshingModeLabel(),
+    renderRadiusChunks = tonumber((self.constants.CULL and self.constants.CULL.drawRadiusChunks) or 0) or 0,
+    simulationRadiusChunks = tonumber(self._simulationChunkRadius) or 4,
     inventory = self.inventory,
+    inventoryMenuOpen = self.inventoryMenuOpen,
+    inventoryMenuCursor = self.inventoryMenuCursorIndex,
     health = stats and stats.health or 20,
     maxHealth = stats and stats.maxHealth or 20,
     hunger = stats and stats.hunger or 20,
@@ -972,6 +1165,9 @@ end
 function GameState:onFocus(focused)
   if self.mode == 'game' and self.input then
     self.input:onFocus(focused)
+    if not focused and self.inventoryMenuOpen then
+      self:_setInventoryMenuOpen(false, true)
+    end
     return
   end
 

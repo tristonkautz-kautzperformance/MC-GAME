@@ -15,8 +15,9 @@ Simple Minecraft-style prototype in Lua using LOVR.
   - Break blocks (except bedrock)
   - Place selected block from inventory
 - Inventory / hotbar UI:
-  - 8 slots
+  - 8-slot hotbar + bag storage
   - Number keys and mouse wheel selection
+  - Tab bag menu with full-stack move/swap across storage + hotbar
 - Basic survival stats scaffold:
   - Health and hunger values feed the HUD
   - Hunger drains over time
@@ -34,6 +35,9 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - Day/night cycle with animated sky color and sun/moon
 - Seeded procedural terrain (height + beaches + sea level) with sparse edit/feature overlays (no eager per-voxel base storage)
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling + mesh cache pruning
+- Render and simulation distances are now separated:
+  - render distance controls chunk meshing/draw culling.
+  - simulation distance controls gameplay ticking (currently locked to 4 chunks).
 - Threaded chunk meshing worker pool:
   - Auto-scales worker count from CPU logical cores (`cores - 1`, clamped)
   - Gracefully falls back to synchronous meshing if thread APIs/hardware support is unavailable
@@ -52,11 +56,13 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - `Right Mouse`: place selected block (when captured)
 - `Mouse Wheel`: cycle hotbar
 - `1-8`: select hotbar slot
-- `Tab`: toggle mouse capture
+- `Tab`: open/close bag menu (restores previous capture state when closed)
+- `Arrows` / `WASD` (bag open): move bag cursor
+- `Enter` / `Space` / `Left Mouse` (bag open): pick/place full stack
 - `F1`: toggle help text
 - `F3`: toggle performance overlay (FPS + frame/chunk stats)
 - `F11`: toggle fullscreen (restarts app)
-- `Esc`: unlock mouse if captured; if already unlocked, open pause menu
+- `Esc`: close bag if open; otherwise unlock mouse if captured; if already unlocked, open pause menu
 - `Up/Down` or `W/S`: menu navigation
 - `Enter`: menu select / confirm
 

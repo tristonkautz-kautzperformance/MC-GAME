@@ -19,11 +19,40 @@ local function clamp(value, minValue, maxValue)
   return value
 end
 
-function Inventory.new(defaultBlocks, slotCount, startCount)
+local function slotHasStack(slot)
+  return slot and slot.block and slot.count and slot.count > 0
+end
+
+local function clearSlot(slot)
+  if not slot then
+    return
+  end
+  slot.block = nil
+  slot.count = 0
+end
+
+function Inventory.new(defaultBlocks, slotCount, startCount, hotbarCount)
   local self = setmetatable({}, Inventory)
-  self.slotCount = slotCount or 8
+  local totalSlots = parseInteger(slotCount) or 8
+  if totalSlots < 1 then
+    totalSlots = 1
+  end
+  self.slotCount = totalSlots
+
+  local derivedHotbarCount = parseInteger(hotbarCount)
+  if not derivedHotbarCount then
+    if type(defaultBlocks) == 'table' and #defaultBlocks > 0 then
+      derivedHotbarCount = #defaultBlocks
+    else
+      derivedHotbarCount = totalSlots
+    end
+  end
+  self.hotbarCount = clamp(derivedHotbarCount, 1, self.slotCount)
+
   self.selected = 1
   self.slots = {}
+  self.heldBlock = nil
+  self.heldCount = 0
 
   for i = 1, self.slotCount do
     local entry = defaultBlocks and defaultBlocks[i] or nil
@@ -43,6 +72,13 @@ function Inventory.new(defaultBlocks, slotCount, startCount)
       end
     end
 
+    block = parseInteger(block)
+    count = parseInteger(count) or 0
+    if not block or block <= 0 or count <= 0 then
+      block = nil
+      count = 0
+    end
+
     self.slots[i] = {
       block = block,
       count = count
@@ -52,12 +88,20 @@ function Inventory.new(defaultBlocks, slotCount, startCount)
   return self
 end
 
+function Inventory:getHotbarCount()
+  return self.hotbarCount
+end
+
+function Inventory:getStorageCount()
+  return math.max(0, self.slotCount - self.hotbarCount)
+end
+
 function Inventory:getSelectedIndex()
   return self.selected
 end
 
 function Inventory:setSelectedIndex(index)
-  if index >= 1 and index <= self.slotCount then
+  if index >= 1 and index <= self.hotbarCount then
     self.selected = index
   end
 end
@@ -69,8 +113,8 @@ function Inventory:cycle(delta)
 
   local index = self.selected + (delta > 0 and 1 or -1)
   if index < 1 then
-    index = self.slotCount
-  elseif index > self.slotCount then
+    index = self.hotbarCount
+  elseif index > self.hotbarCount then
     index = 1
   end
 
@@ -89,6 +133,28 @@ function Inventory:getSelectedBlock()
   return slot.block
 end
 
+function Inventory:hasHeldStack()
+  return self.heldBlock ~= nil and self.heldCount > 0
+end
+
+function Inventory:getHeldStack(out)
+  if not self:hasHeldStack() then
+    return nil
+  end
+
+  if type(out) ~= 'table' then
+    out = {}
+  end
+  out.block = self.heldBlock
+  out.count = self.heldCount
+  return out
+end
+
+function Inventory:_clearHeldStack()
+  self.heldBlock = nil
+  self.heldCount = 0
+end
+
 function Inventory:consumeSelected(amount)
   amount = amount or 1
   local slot = self.slots[self.selected]
@@ -98,27 +164,28 @@ function Inventory:consumeSelected(amount)
 
   slot.count = slot.count - amount
   if slot.count <= 0 then
-    slot.count = 0
+    clearSlot(slot)
   end
   return true
 end
 
 function Inventory:canAdd(block, amount)
   amount = amount or 1
+  block = parseInteger(block)
   if not block or amount <= 0 then
     return false
   end
 
   for i = 1, self.slotCount do
     local slot = self.slots[i]
-    if slot.block == block then
+    if slotHasStack(slot) and slot.block == block then
       return true
     end
   end
 
   for i = 1, self.slotCount do
     local slot = self.slots[i]
-    if not slot.block or slot.count == 0 then
+    if not slotHasStack(slot) then
       return true
     end
   end
@@ -128,13 +195,14 @@ end
 
 function Inventory:add(block, amount)
   amount = amount or 1
+  block = parseInteger(block)
   if not block or amount <= 0 then
     return false
   end
 
   for i = 1, self.slotCount do
     local slot = self.slots[i]
-    if slot.block == block then
+    if slotHasStack(slot) and slot.block == block then
       slot.count = slot.count + amount
       return true
     end
@@ -142,7 +210,7 @@ function Inventory:add(block, amount)
 
   for i = 1, self.slotCount do
     local slot = self.slots[i]
-    if not slot.block or slot.count == 0 then
+    if not slotHasStack(slot) then
       slot.block = block
       slot.count = amount
       return true
@@ -152,12 +220,94 @@ function Inventory:add(block, amount)
   return false
 end
 
+function Inventory:interactSlot(index)
+  local slot = self.slots[index]
+  if not slot then
+    return false
+  end
+
+  if not self:hasHeldStack() then
+    if not slotHasStack(slot) then
+      return false
+    end
+
+    self.heldBlock = slot.block
+    self.heldCount = slot.count
+    clearSlot(slot)
+    return true
+  end
+
+  if not slotHasStack(slot) then
+    slot.block = self.heldBlock
+    slot.count = self.heldCount
+    self:_clearHeldStack()
+    return true
+  end
+
+  if slot.block == self.heldBlock then
+    slot.count = slot.count + self.heldCount
+    self:_clearHeldStack()
+    return true
+  end
+
+  local swapBlock = slot.block
+  local swapCount = slot.count
+  slot.block = self.heldBlock
+  slot.count = self.heldCount
+  self.heldBlock = swapBlock
+  self.heldCount = swapCount
+  return true
+end
+
+function Inventory:stowHeldStack()
+  if not self:hasHeldStack() then
+    return true
+  end
+
+  for i = 1, self.slotCount do
+    local slot = self.slots[i]
+    if slotHasStack(slot) and slot.block == self.heldBlock then
+      slot.count = slot.count + self.heldCount
+      self:_clearHeldStack()
+      return true
+    end
+  end
+
+  for i = 1, self.slotCount do
+    local slot = self.slots[i]
+    if not slotHasStack(slot) then
+      slot.block = self.heldBlock
+      slot.count = self.heldCount
+      self:_clearHeldStack()
+      return true
+    end
+  end
+
+  local fallbackIndex = clamp(self.selected, 1, self.slotCount)
+  local slot = self.slots[fallbackIndex]
+  if not slotHasStack(slot) then
+    slot.block = self.heldBlock
+    slot.count = self.heldCount
+    self:_clearHeldStack()
+    return true
+  end
+
+  local swapBlock = slot.block
+  local swapCount = slot.count
+  slot.block = self.heldBlock
+  slot.count = self.heldCount
+  self.heldBlock = swapBlock
+  self.heldCount = swapCount
+  return false
+end
+
 function Inventory:getState(out)
   if type(out) ~= 'table' then
     out = {}
   end
 
   out.slotCount = self.slotCount
+  out.hotbarCount = self.hotbarCount
   out.selected = self.selected
 
   local slotsOut = out.slots
@@ -170,7 +320,7 @@ function Inventory:getState(out)
     local slot = self.slots[i]
     local blockId = 0
     local count = 0
-    if slot and slot.block and slot.count and slot.count > 0 then
+    if slotHasStack(slot) then
       blockId = parseInteger(slot.block) or 0
       count = parseInteger(slot.count) or 0
       if blockId <= 0 or count <= 0 then
@@ -222,7 +372,8 @@ function Inventory:applyState(state)
   end
 
   local selected = parseInteger(state.selected) or self.selected
-  self.selected = clamp(selected, 1, self.slotCount)
+  self.selected = clamp(selected, 1, self.hotbarCount)
+  self:_clearHeldStack()
   return true
 end
 

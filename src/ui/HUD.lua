@@ -29,6 +29,23 @@ local function resetVec3(v, x, y, z)
   end
 end
 
+local function getInventoryCounts(inventory, fallbackHotbar)
+  local defaultHotbar = math.max(1, math.floor(tonumber(fallbackHotbar) or 8))
+  local totalSlots = defaultHotbar
+  if inventory and type(inventory.slotCount) == 'number' then
+    totalSlots = math.max(1, math.floor(inventory.slotCount))
+  end
+
+  local hotbarCount = defaultHotbar
+  if inventory and inventory.getHotbarCount then
+    hotbarCount = math.floor(tonumber(inventory:getHotbarCount()) or defaultHotbar)
+  end
+  hotbarCount = clamp(hotbarCount, 1, totalSlots)
+
+  local storageCount = math.max(0, totalSlots - hotbarCount)
+  return hotbarCount, totalSlots, storageCount
+end
+
 function HUD.new(constants)
   local self = setmetatable({}, HUD)
   self.constants = constants
@@ -49,10 +66,11 @@ function HUD.new(constants)
 
   self._helpText = table.concat({
     'WASD move  Space jump  LMB attack/break  RMB place',
-    'Wheel/1-8 select  Click capture  Tab lock',
+    'Wheel/1-8 select  Click capture  Tab bag',
+    'Bag: Arrows/WASD move  Enter/Click move stack  Esc/Tab close',
     'F3 perf HUD  F11 fullscreen  Esc unlock/menu  F1 help'
   }, '\n')
-  self._tipText = 'F1 help  |  F3 perf HUD'
+  self._tipText = 'F1 help  |  F3 perf HUD  |  Tab bag'
   return self
 end
 
@@ -184,10 +202,8 @@ end
 
 function HUD:_drawHotbar(pass, orientation, baseX, baseY, baseZ, right, up, forward, state)
   local inventory = state.inventory
-  local slotCount = self.constants.INVENTORY_SLOT_COUNT or 8
-  if inventory and type(inventory.slotCount) == 'number' then
-    slotCount = inventory.slotCount
-  end
+  local defaultHotbar = self.constants.HOTBAR_SLOT_COUNT or self.constants.INVENTORY_SLOT_COUNT or 8
+  local slotCount = getInventoryCounts(inventory, defaultHotbar)
   slotCount = math.max(1, math.floor(slotCount))
 
   local slotSize = 0.095
@@ -309,6 +325,191 @@ function HUD:_drawHotbar(pass, orientation, baseX, baseY, baseZ, right, up, forw
   return panelWidth, panelY, panelHeight
 end
 
+function HUD:_drawBagMenu(pass, orientation, baseX, baseY, baseZ, right, up, forward, state)
+  local inventory = state.inventory
+  if not inventory then
+    return
+  end
+
+  local defaultHotbar = self.constants.HOTBAR_SLOT_COUNT or self.constants.INVENTORY_SLOT_COUNT or 8
+  local hotbarCount, slotCount, storageCount = getInventoryCounts(inventory, defaultHotbar)
+  local storageRows = math.ceil(storageCount / hotbarCount)
+  local sectionGap = (storageRows > 0) and 0.040 or 0
+
+  local slotSize = 0.086
+  local slotGap = 0.010
+  local panelPad = 0.022
+  local titleHeight = 0.070
+  local hintHeight = 0.038
+
+  local rowCount = storageRows + 1
+  local gridWidth = hotbarCount * slotSize + (hotbarCount - 1) * slotGap
+  local gridHeight = rowCount * slotSize + (rowCount - 1) * slotGap + sectionGap
+  local panelWidth = gridWidth + panelPad * 2
+  local panelHeight = gridHeight + panelPad * 2 + titleHeight + hintHeight
+  local panelY = -0.065
+
+  self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, 0, 1.90, 1.14, 0.02, 0.02, 0.03, 0.58, 0.0006)
+  self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, panelY, panelWidth + 0.010, panelHeight + 0.010, 0.18, 0.21, 0.26, 0.58, 0.0002)
+  self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, panelY, panelWidth, panelHeight, 0.05, 0.06, 0.07, 0.92, 0.0001)
+
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Bag', 0, panelY + panelHeight * 0.5 - panelPad - 0.020, 0.032, 0.94, 0.96, 0.98, 0.98)
+
+  local selected = inventory and inventory.getSelectedIndex and inventory:getSelectedIndex() or 1
+  selected = clamp(selected, 1, hotbarCount)
+  local cursorIndex = math.floor(tonumber(state.inventoryMenuCursor) or selected)
+  cursorIndex = clamp(cursorIndex, 1, slotCount)
+
+  local startX = -gridWidth * 0.5 + slotSize * 0.5
+  local firstRowY = panelY + panelHeight * 0.5 - panelPad - titleHeight - slotSize * 0.5
+
+  local function drawSlot(slotIndex, x, y, showNumber)
+    local isCursor = slotIndex == cursorIndex
+    local isSelected = slotIndex == selected
+
+    if isCursor then
+      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize + 0.012, slotSize + 0.012, 0.98, 0.89, 0.52, 0.30, -0.0002)
+    end
+    if isSelected then
+      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize + 0.006, slotSize + 0.006, 0.66, 0.82, 0.98, 0.22, -0.0001)
+    end
+
+    local slot = inventory:getSlot(slotIndex)
+    local hasStack = slot and slot.block and slot.count and slot.count > 0
+    local bgValue = showNumber and 0.17 or 0.13
+    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize, slotSize, bgValue, bgValue, bgValue + 0.01, 0.97, 0)
+
+    if hasStack then
+      local info = self.constants.BLOCK_INFO[slot.block]
+      if info and info.color then
+        local color = info.color
+        self:_plane(
+          pass,
+          orientation,
+          baseX,
+          baseY,
+          baseZ,
+          right,
+          up,
+          forward,
+          x,
+          y,
+          slotSize * 0.62,
+          slotSize * 0.62,
+          sanitizeNumber(color[1], 0.6),
+          sanitizeNumber(color[2], 0.6),
+          sanitizeNumber(color[3], 0.6),
+          sanitizeNumber(info.alpha, 1),
+          -0.0003
+        )
+      else
+        self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize * 0.55, slotSize * 0.55, 0.08, 0.08, 0.09, 0.92, -0.0003)
+      end
+
+      if slot.count > 1 then
+        self:_text(
+          pass,
+          orientation,
+          baseX,
+          baseY,
+          baseZ,
+          right,
+          up,
+          forward,
+          tostring(slot.count),
+          x + slotSize * 0.35,
+          y - slotSize * 0.34,
+          0.018,
+          0.96,
+          0.96,
+          0.93,
+          0.98,
+          'right',
+          'bottom'
+        )
+      end
+    else
+      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize * 0.55, slotSize * 0.55, 0.08, 0.08, 0.09, 0.92, -0.0003)
+    end
+
+    if showNumber then
+      self:_text(
+        pass,
+        orientation,
+        baseX,
+        baseY,
+        baseZ,
+        right,
+        up,
+        forward,
+        tostring(slotIndex),
+        x - slotSize * 0.35,
+        y + slotSize * 0.37,
+        0.0135,
+        0.66,
+        0.71,
+        0.76,
+        0.88,
+        'left',
+        'top'
+      )
+    end
+  end
+
+  if storageRows > 0 then
+    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Storage', 0, firstRowY + slotSize * 0.78, 0.018, 0.90, 0.92, 0.95, 0.92)
+  end
+
+  for row = 1, storageRows do
+    local slotY = firstRowY - (row - 1) * (slotSize + slotGap)
+    for col = 1, hotbarCount do
+      local storageOrdinal = (row - 1) * hotbarCount + col
+      local slotIndex = hotbarCount + storageOrdinal
+      if slotIndex <= slotCount then
+        local slotX = startX + (col - 1) * (slotSize + slotGap)
+        drawSlot(slotIndex, slotX, slotY, false)
+      end
+    end
+  end
+
+  local hotbarY = firstRowY - storageRows * (slotSize + slotGap) - sectionGap
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Hotbar', 0, hotbarY + slotSize * 0.78, 0.018, 0.90, 0.92, 0.95, 0.92)
+  for i = 1, hotbarCount do
+    local slotX = startX + (i - 1) * (slotSize + slotGap)
+    drawSlot(i, slotX, hotbarY, true)
+  end
+
+  local held = inventory and inventory.getHeldStack and inventory:getHeldStack() or nil
+  if held and held.block and held.count and held.count > 0 then
+    local heldInfo = self.constants.BLOCK_INFO[held.block]
+    local heldName = heldInfo and heldInfo.name or 'Unknown'
+    local heldText = string.format('Holding: %s x%d', heldName, held.count)
+    local heldX = panelWidth * 0.24
+    local heldY = panelY + panelHeight * 0.5 - panelPad - 0.022
+    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, heldX, heldY, panelWidth * 0.44, 0.040, 0.11, 0.12, 0.15, 0.86, 0)
+    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, heldText, heldX, heldY, 0.016, 0.97, 0.90, 0.66, 0.98, 'center', 'middle')
+  end
+
+  self:_text(
+    pass,
+    orientation,
+    baseX,
+    baseY,
+    baseZ,
+    right,
+    up,
+    forward,
+    'Arrows/WASD move  Enter/Click move stack  Tab/Esc close',
+    0,
+    panelY - panelHeight * 0.5 + panelPad + 0.010,
+    0.014,
+    0.80,
+    0.84,
+    0.90,
+    0.90
+  )
+end
+
 function HUD:_drawVitals(pass, orientation, baseX, baseY, baseZ, right, up, forward, state, hotbarWidth, hotbarY, hotbarHeight)
   local health = sanitizeNumber(state.health, 20)
   local maxHealth = sanitizeNumber(state.maxHealth, 20)
@@ -342,7 +543,15 @@ function HUD:_rebuildHudText(state)
   count = count + 1
   lines[count] = string.format('Mouse: %s  |  Relative: %s', state.mouseStatusText or 'Unknown', state.relativeMouseReady and 'Yes' or 'No')
   count = count + 1
+  lines[count] = string.format('Bag: %s', state.inventoryMenuOpen and 'Open' or 'Closed')
+  count = count + 1
   lines[count] = string.format('Mesh: %s', state.meshingMode or 'Unknown')
+  count = count + 1
+  lines[count] = string.format(
+    'Distance: Render %d  |  Sim %d',
+    math.floor(tonumber(state.renderRadiusChunks) or 0),
+    math.floor(tonumber(state.simulationRadiusChunks) or 0)
+  )
   count = count + 1
   lines[count] = string.format('Light: %s  |  Shader: %s', state.lightingMode or 'off', state.shaderStatusText or 'Unknown')
 
@@ -467,16 +676,20 @@ function HUD:draw(pass, state)
   pass:push('state')
   pass:setDepthWrite(false)
 
-  self:_drawCrosshair(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state.targetActive)
+  if state.inventoryMenuOpen then
+    self:_drawBagMenu(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state)
+  else
+    self:_drawCrosshair(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state.targetActive)
 
-  local targetName = state.targetName or 'None'
-  if targetName ~= 'None' then
-    self:_plane(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, 0, 0.102, 0.27, 0.047, 0.05, 0.06, 0.07, 0.72, 0.0002)
-    self:_text(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, targetName, 0, 0.102, 0.022, 0.96, 0.96, 0.95, 0.96)
+    local targetName = state.targetName or 'None'
+    if targetName ~= 'None' then
+      self:_plane(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, 0, 0.102, 0.27, 0.047, 0.05, 0.06, 0.07, 0.72, 0.0002)
+      self:_text(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, targetName, 0, 0.102, 0.022, 0.96, 0.96, 0.95, 0.96)
+    end
+
+    local hotbarWidth, hotbarY, hotbarHeight = self:_drawHotbar(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state)
+    self:_drawVitals(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state, hotbarWidth, hotbarY, hotbarHeight)
   end
-
-  local hotbarWidth, hotbarY, hotbarHeight = self:_drawHotbar(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state)
-  self:_drawVitals(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state, hotbarWidth, hotbarY, hotbarHeight)
 
   local debugText = self._hudText
   if debugText ~= '' then
@@ -538,7 +751,7 @@ function HUD:draw(pass, state)
       'top',
       helpW - 0.020
     )
-  else
+  elseif not state.inventoryMenuOpen then
     self:_text(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, self._tipText, -0.30, -0.236, 0.016, 0.80, 0.84, 0.88, 0.92, 'left', 'middle')
   end
 

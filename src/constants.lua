@@ -68,6 +68,8 @@ Constants.LIGHTING = {
 Constants.CULL = {
   enabled = true,
   drawRadiusChunks = 4,
+  -- Reserved for gameplay tick radius; runtime is currently locked to 4 chunks.
+  simulationRadiusChunks = 4,
   fovDegrees = 110,
   fovPaddingDegrees = 8,
   horizontalOnly = true,
@@ -248,7 +250,9 @@ Constants.BLOCK_INFO = {
   }
 }
 
-Constants.INVENTORY_SLOT_COUNT = 8
+Constants.HOTBAR_SLOT_COUNT = 8
+Constants.INVENTORY_STORAGE_SLOT_COUNT = 24
+Constants.INVENTORY_SLOT_COUNT = Constants.HOTBAR_SLOT_COUNT + Constants.INVENTORY_STORAGE_SLOT_COUNT
 Constants.INVENTORY_START_COUNT = 48
 Constants.HOTBAR_DEFAULTS = {
   { block = Constants.ITEM.SWORD, count = 1 },

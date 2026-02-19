@@ -522,16 +522,10 @@ function FloodfillLighting:_dequeueSkyColumn()
 end
 
 function FloodfillLighting:_clearSkyColumnsQueue()
-  local queue = self.skyColumnsQueue
-  for i = self.skyColumnsQueueHead, self.skyColumnsQueueTail do
-    queue[i] = nil
-  end
+  self.skyColumnsQueue = {}
+  self.skyColumnsQueueSet = {}
   self.skyColumnsQueueHead = 1
   self.skyColumnsQueueTail = 0
-
-  for columnKey in pairs(self.skyColumnsQueueSet) do
-    self.skyColumnsQueueSet[columnKey] = nil
-  end
   self.skyColumnsUrgentCount = 0
 end
 
@@ -597,16 +591,10 @@ function FloodfillLighting:_dequeueSkyFlood()
 end
 
 function FloodfillLighting:_clearSkyFloodQueue()
-  local queue = self.skyFloodQueue
-  for i = self.skyFloodQueueHead, self.skyFloodQueueTail do
-    queue[i] = nil
-  end
+  self.skyFloodQueue = {}
+  self.skyFloodQueueSet = {}
   self.skyFloodQueueHead = 1
   self.skyFloodQueueTail = 0
-
-  for worldIndex in pairs(self.skyFloodQueueSet) do
-    self.skyFloodQueueSet[worldIndex] = nil
-  end
   self.skyFloodUrgentCount = 0
 end
 
@@ -682,19 +670,11 @@ function FloodfillLighting:_dequeueSkyDark()
 end
 
 function FloodfillLighting:_clearSkyDarkQueue()
-  local queue = self.skyDarkQueue
-  for i = self.skyDarkQueueHead, self.skyDarkQueueTail do
-    queue[i] = nil
-  end
+  self.skyDarkQueue = {}
+  self.skyDarkQueueLevels = {}
+  self.skyDarkQueuePriority = {}
   self.skyDarkQueueHead = 1
   self.skyDarkQueueTail = 0
-
-  for worldIndex in pairs(self.skyDarkQueueLevels) do
-    self.skyDarkQueueLevels[worldIndex] = nil
-  end
-  for worldIndex in pairs(self.skyDarkQueuePriority) do
-    self.skyDarkQueuePriority[worldIndex] = nil
-  end
   self.skyDarkUrgentCount = 0
 end
 

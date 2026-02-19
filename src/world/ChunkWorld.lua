@@ -45,6 +45,18 @@ local function smoothstep(t)
   return t * t * (3 - 2 * t)
 end
 
+local function rayIntBound(s, ds)
+  -- Find smallest positive t such that s + t*ds is an integer.
+  if ds == 0 then
+    return math.huge
+  end
+  local sIsInteger = (math.floor(s) == s)
+  if ds > 0 then
+    return ((sIsInteger and s or (math.floor(s) + 1)) - s) / ds
+  end
+  return (s - (sIsInteger and s or math.floor(s))) / -ds
+end
+
 local function hashToUnit(seed, x, z)
   local n = math.sin(
     (x + seed * 0.00131) * 127.1
@@ -118,6 +130,9 @@ function ChunkWorld.new(constants)
   self._featureChunks = {}
   self._featureColumnsPrepared = {}
   self._editCount = 0
+  self._editRevision = 0
+  self._haloEditChunks = {}
+  self._haloFeatureChunks = {}
 
   self._genSeaLevel = 20
   self._genBaseHeight = 22
@@ -741,6 +756,112 @@ function ChunkWorld:fillBlockHalo(cx, cy, cz, out)
   local baseOriginY = (cy - 1) * cs
   local baseOriginZ = (cz - 1) * cs
 
+  local isInterior = cx > 1 and cx < chunksX
+    and cy > 1 and cy < chunksY
+    and cz > 1 and cz < chunksZ
+
+  if isInterior then
+    local editRefs = self._haloEditChunks
+    local featureRefs = self._haloFeatureChunks
+    local refCount = 0
+
+    for sy = -1, 1 do
+      local scy = cy + sy
+      local layerBase = (scy - 1) * chunksPerLayer
+      for sz = -1, 1 do
+        local scz = cz + sz
+        local rowBase = layerBase + (scz - 1) * chunksX
+        for sx = -1, 1 do
+          refCount = refCount + 1
+          local chunkKey = (cx + sx) + rowBase
+          editRefs[refCount] = self._editChunks[chunkKey]
+          featureRefs[refCount] = self._featureChunks[chunkKey]
+        end
+      end
+    end
+
+    local getBaseBlock = self._getBaseBlock
+    for hy = 0, cs + 1 do
+      local syOffset, sly
+      if hy == 0 then
+        syOffset = 0
+        sly = cs
+      elseif hy == cs + 1 then
+        syOffset = 2
+        sly = 1
+      else
+        syOffset = 1
+        sly = hy
+      end
+
+      local wy = baseOriginY + hy
+      local syBase = (hy * strideY) + 1
+      local srcY = syOffset * 9
+      local lyBase = (sly - 1) * cs2
+
+      for hz = 0, cs + 1 do
+        local szOffset, slz
+        if hz == 0 then
+          szOffset = 0
+          slz = cs
+        elseif hz == cs + 1 then
+          szOffset = 2
+          slz = 1
+        else
+          szOffset = 1
+          slz = hz
+        end
+
+        local wz = baseOriginZ + hz
+        local szBase = syBase + (hz * strideZ)
+        local srcYZ = srcY + szOffset * 3
+        local lzBase = lyBase + (slz - 1) * cs
+
+        for hx = 0, cs + 1 do
+          local sxOffset, slx
+          if hx == 0 then
+            sxOffset = 0
+            slx = cs
+          elseif hx == cs + 1 then
+            sxOffset = 2
+            slx = 1
+          else
+            sxOffset = 1
+            slx = hx
+          end
+
+          local srcIndex = srcYZ + sxOffset + 1
+          local localIndex = lzBase + slx
+          local index = szBase + hx
+
+          local value = nil
+          local editChunk = editRefs[srcIndex]
+          if editChunk then
+            value = editChunk[localIndex]
+          end
+          if value == nil then
+            local featureChunk = featureRefs[srcIndex]
+            if featureChunk then
+              value = featureChunk[localIndex]
+            end
+            if value == nil then
+              local wx = baseOriginX + hx
+              value = getBaseBlock(self, wx, wy, wz)
+            end
+          end
+
+          out[index] = value
+        end
+      end
+    end
+
+    local requiredFast = haloSize * haloSize * haloSize
+    for i = requiredFast + 1, #out do
+      out[i] = nil
+    end
+    return out
+  end
+
   for hy = 0, cs + 1 do
     local scy, sly
     if hy == 0 then
@@ -873,6 +994,7 @@ function ChunkWorld:set(x, y, z, value)
   if oldOpacity ~= newOpacity then
     self:_onSkyOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpacity)
   end
+  self._editRevision = self._editRevision + 1
   return true
 end
 
@@ -964,6 +1086,7 @@ function ChunkWorld:applyEditsBulk(edits, count)
               opacityMaxZ = z
             end
           end
+          self._editRevision = self._editRevision + 1
           applied = applied + 1
         end
       end
@@ -1200,6 +1323,7 @@ function ChunkWorld:generate()
   self._featureColumnsPrepared = {}
   self._terrainColumnData = {}
   self._editCount = 0
+  self._editRevision = 0
   self:_resetSkyLightData()
 end
 
@@ -1305,6 +1429,10 @@ function ChunkWorld:getEditCount()
   return self._editCount
 end
 
+function ChunkWorld:getEditRevision()
+  return self._editRevision or 0
+end
+
 function ChunkWorld:collectEdits(out)
   if not out then
     return 0
@@ -1351,7 +1479,7 @@ function ChunkWorld:collectEdits(out)
   return count
 end
 
-function ChunkWorld:raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDistance)
+function ChunkWorld:raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDistance, outHit)
   maxDistance = maxDistance or 6.0
 
   local len = math.sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ)
@@ -1369,22 +1497,9 @@ function ChunkWorld:raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDist
   local stepY = dirY >= 0 and 1 or -1
   local stepZ = dirZ >= 0 and 1 or -1
 
-  local function intBound(s, ds)
-    -- Find smallest positive t such that s + t*ds is an integer.
-    if ds == 0 then
-      return math.huge
-    end
-    local sIsInteger = (math.floor(s) == s)
-    if ds > 0 then
-      return ((sIsInteger and s or (math.floor(s) + 1)) - s) / ds
-    else
-      return (s - (sIsInteger and s or math.floor(s))) / -ds
-    end
-  end
-
-  local tMaxX = intBound(originX, dirX)
-  local tMaxY = intBound(originY, dirY)
-  local tMaxZ = intBound(originZ, dirZ)
+  local tMaxX = rayIntBound(originX, dirX)
+  local tMaxY = rayIntBound(originY, dirY)
+  local tMaxZ = rayIntBound(originZ, dirZ)
 
   local tDeltaX = (dirX == 0) and math.huge or (1 / math.abs(dirX))
   local tDeltaY = (dirY == 0) and math.huge or (1 / math.abs(dirY))
@@ -1397,11 +1512,15 @@ function ChunkWorld:raycast(originX, originY, originZ, dirX, dirY, dirZ, maxDist
     if self:isInside(x, y, z) then
       local block = self:get(x, y, z)
       if block ~= self.constants.BLOCK.AIR then
-        return {
-          x = x, y = y, z = z,
-          previousX = prevX, previousY = prevY, previousZ = prevZ,
-          block = block
-        }
+        local hit = outHit or {}
+        hit.x = x
+        hit.y = y
+        hit.z = z
+        hit.previousX = prevX
+        hit.previousY = prevY
+        hit.previousZ = prevZ
+        hit.block = block
+        return hit
       end
     end
 

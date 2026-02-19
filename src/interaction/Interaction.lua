@@ -8,13 +8,14 @@ function Interaction.new(constants, world, player, inventory)
   self.player = player
   self.inventory = inventory
   self.targetHit = nil
+  self._targetHitScratch = {}
   return self
 end
 
 function Interaction:updateTarget()
   local cameraX, cameraY, cameraZ = self.player:getCameraPosition()
   local lookX, lookY, lookZ = self.player:getLookVector()
-  self.targetHit = self.world:raycast(cameraX, cameraY, cameraZ, lookX, lookY, lookZ, self.player.reach)
+  self.targetHit = self.world:raycast(cameraX, cameraY, cameraZ, lookX, lookY, lookZ, self.player.reach, self._targetHitScratch)
   return self.targetHit
 end
 

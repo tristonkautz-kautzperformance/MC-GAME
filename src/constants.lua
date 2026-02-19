@@ -84,7 +84,9 @@ Constants.MESH = {
 
 Constants.RENDER = {
   cullOpaque = true,
-  cullAlpha = false
+  cullAlpha = false,
+  -- Keep opaque ordering unsorted by default to reduce CPU sort cost at high chunk counts.
+  sortOpaqueFrontToBack = false
 }
 
 Constants.THREAD_MESH = {

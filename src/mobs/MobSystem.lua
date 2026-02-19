@@ -26,17 +26,6 @@ local function parseNumber(value, fallback)
   return n
 end
 
-local function worldToChunk(value, chunkSize, maxChunks)
-  local chunk = math.floor((tonumber(value) or 0) / chunkSize) + 1
-  if chunk < 1 then
-    return 1
-  end
-  if chunk > maxChunks then
-    return maxChunks
-  end
-  return chunk
-end
-
 local function raySphere(originX, originY, originZ, dirX, dirY, dirZ, centerX, centerY, centerZ, radius)
   local mx = originX - centerX
   local my = originY - centerY
@@ -93,15 +82,34 @@ function MobSystem.new(constants, world, player, stats)
   self._nextId = 1
 
   self.mobs = {}
+  self._sheepCount = 0
+  self._ghostCount = 0
   self.targetMob = nil
   self._simulationCenterCx = nil
   self._simulationCenterCz = nil
   self._simulationRadiusChunks = nil
+  self._simulationMinCx = nil
+  self._simulationMaxCx = nil
+  self._simulationMinCz = nil
+  self._simulationMaxCz = nil
+  self._simulationMinX = nil
+  self._simulationMaxX = nil
+  self._simulationMinZ = nil
+  self._simulationMaxZ = nil
+  self._groundCacheY = {}
+  self._groundCacheRevision = {}
 
   return self
 end
 
 function MobSystem:_countByKind(kind)
+  if kind == 'sheep' then
+    return self._sheepCount or 0
+  end
+  if kind == 'ghost' then
+    return self._ghostCount or 0
+  end
+
   local count = 0
   for i = 1, #self.mobs do
     local mob = self.mobs[i]
@@ -121,51 +129,159 @@ function MobSystem:_isNight(timeOfDay)
   return self:_computeDaylight(timeOfDay) <= self.nightDaylightThreshold
 end
 
+function MobSystem:_adjustKindCount(kind, delta)
+  local amount = math.floor(tonumber(delta) or 0)
+  if amount == 0 then
+    return
+  end
+
+  if kind == 'sheep' then
+    self._sheepCount = math.max(0, (self._sheepCount or 0) + amount)
+  elseif kind == 'ghost' then
+    self._ghostCount = math.max(0, (self._ghostCount or 0) + amount)
+  end
+end
+
+function MobSystem:_removeMobAt(index)
+  local mobs = self.mobs
+  local lastIndex = #mobs
+  if index < 1 or index > lastIndex then
+    return nil
+  end
+
+  local removed = mobs[index]
+  local lastMob = mobs[lastIndex]
+  mobs[lastIndex] = nil
+  if index < lastIndex then
+    mobs[index] = lastMob
+  end
+
+  if removed then
+    if self.targetMob == removed then
+      self.targetMob = nil
+    end
+    self:_adjustKindCount(removed.kind, -1)
+  end
+  return removed
+end
+
 function MobSystem:_setSimulationWindow(centerCx, centerCz, radiusChunks)
   local radius = tonumber(radiusChunks)
   if not radius or radius < 0 then
     self._simulationCenterCx = nil
     self._simulationCenterCz = nil
     self._simulationRadiusChunks = nil
+    self._simulationMinCx = nil
+    self._simulationMaxCx = nil
+    self._simulationMinCz = nil
+    self._simulationMaxCz = nil
+    self._simulationMinX = nil
+    self._simulationMaxX = nil
+    self._simulationMinZ = nil
+    self._simulationMaxZ = nil
     return
   end
 
   local world = self.world
-  self._simulationCenterCx = clamp(math.floor(tonumber(centerCx) or 1), 1, world.chunksX)
-  self._simulationCenterCz = clamp(math.floor(tonumber(centerCz) or 1), 1, world.chunksZ)
-  self._simulationRadiusChunks = math.floor(radius)
+  local centerChunkX = clamp(math.floor(tonumber(centerCx) or 1), 1, world.chunksX)
+  local centerChunkZ = clamp(math.floor(tonumber(centerCz) or 1), 1, world.chunksZ)
+  local radiusChunksInt = math.floor(radius)
+
+  local minChunkX = clamp(centerChunkX - radiusChunksInt, 1, world.chunksX)
+  local maxChunkX = clamp(centerChunkX + radiusChunksInt, 1, world.chunksX)
+  local minChunkZ = clamp(centerChunkZ - radiusChunksInt, 1, world.chunksZ)
+  local maxChunkZ = clamp(centerChunkZ + radiusChunksInt, 1, world.chunksZ)
+  local chunkSize = world.chunkSize
+
+  self._simulationCenterCx = centerChunkX
+  self._simulationCenterCz = centerChunkZ
+  self._simulationRadiusChunks = radiusChunksInt
+  self._simulationMinCx = minChunkX
+  self._simulationMaxCx = maxChunkX
+  self._simulationMinCz = minChunkZ
+  self._simulationMaxCz = maxChunkZ
+  self._simulationMinX = (minChunkX - 1) * chunkSize
+  self._simulationMaxX = maxChunkX * chunkSize
+  self._simulationMinZ = (minChunkZ - 1) * chunkSize
+  self._simulationMaxZ = maxChunkZ * chunkSize
 end
 
 function MobSystem:_isInsideSimulationWindow(worldX, worldZ)
-  local radiusChunks = self._simulationRadiusChunks
-  local centerCx = self._simulationCenterCx
-  local centerCz = self._simulationCenterCz
-  if radiusChunks == nil or centerCx == nil or centerCz == nil then
+  local minX = self._simulationMinX
+  if minX == nil then
     return true
   end
 
-  local world = self.world
-  local cx = worldToChunk(worldX, world.chunkSize, world.chunksX)
-  local cz = worldToChunk(worldZ, world.chunkSize, world.chunksZ)
-  local dx = math.abs(cx - centerCx)
-  local dz = math.abs(cz - centerCz)
-  return dx <= radiusChunks and dz <= radiusChunks
-end
-
-function MobSystem:_findGroundY(worldX, worldZ)
-  local ix = math.floor(worldX) + 1
-  local iz = math.floor(worldZ) + 1
-  if not self.world:isInside(ix, 2, iz) then
-    return nil
+  local x = tonumber(worldX) or 0
+  if x < minX or x >= (self._simulationMaxX or 0) then
+    return false
   end
 
-  for y = self.world.sizeY - 1, 2, -1 do
-    if self.world:isSolidAt(ix, y, iz) and not self.world:isSolidAt(ix, y + 1, iz) then
-      return y
+  local z = tonumber(worldZ) or 0
+  if z < (self._simulationMinZ or 0) or z >= (self._simulationMaxZ or 0) then
+    return false
+  end
+
+  return true
+end
+
+function MobSystem:_getWorldEditRevision()
+  local world = self.world
+  if not world then
+    return 0
+  end
+
+  if world.getEditRevision then
+    local revision = tonumber(world:getEditRevision())
+    if revision then
+      return revision
     end
   end
 
-  return nil
+  if world.getEditCount then
+    return tonumber(world:getEditCount()) or 0
+  end
+
+  return 0
+end
+
+function MobSystem:_findGroundY(worldX, worldZ)
+  local world = self.world
+  local ix = math.floor(worldX) + 1
+  local iz = math.floor(worldZ) + 1
+  if not world:isInside(ix, 2, iz) then
+    return nil
+  end
+
+  if world.prepareChunk then
+    local chunkSize = world.chunkSize
+    local cx = math.floor((ix - 1) / chunkSize) + 1
+    local cz = math.floor((iz - 1) / chunkSize) + 1
+    world:prepareChunk(cx, 1, cz)
+  end
+
+  local key = ix + (iz - 1) * world.sizeX
+  local revision = self:_getWorldEditRevision()
+  local cachedRevision = self._groundCacheRevision[key]
+  if cachedRevision == revision then
+    local cachedY = self._groundCacheY[key]
+    if cachedY == false then
+      return nil
+    end
+    return cachedY
+  end
+
+  local foundY = nil
+  for y = world.sizeY - 1, 2, -1 do
+    if world:isSolidAt(ix, y, iz) and not world:isSolidAt(ix, y + 1, iz) then
+      foundY = y
+      break
+    end
+  end
+
+  self._groundCacheRevision[key] = revision
+  self._groundCacheY[key] = foundY or false
+  return foundY
 end
 
 function MobSystem:_createSheep(x, y, z)
@@ -225,6 +341,7 @@ function MobSystem:_spawn(kind)
         if mob then
           self._nextId = self._nextId + 1
           self.mobs[#self.mobs + 1] = mob
+          self:_adjustKindCount(mob.kind, 1)
           return true
         end
       end
@@ -257,13 +374,13 @@ function MobSystem:_updateSheep(mob, dt)
   mob.y = groundY + mob.size * 0.5
 end
 
-function MobSystem:_updateGhost(mob, dt)
-  local playerX, playerY, playerZ = self.player:getCameraPosition()
+function MobSystem:_updateGhost(mob, dt, playerX, playerY, playerZ)
   local dx = playerX - mob.x
   local dz = playerZ - mob.z
-  local distXZ = math.sqrt(dx * dx + dz * dz)
+  local distXZSq = dx * dx + dz * dz
 
-  if distXZ > 1e-5 then
+  if distXZSq > 1e-10 then
+    local distXZ = math.sqrt(distXZSq)
     local step = math.min(distXZ, mob.speed * dt)
     mob.x = mob.x + (dx / distXZ) * step
     mob.z = mob.z + (dz / distXZ) * step
@@ -276,8 +393,9 @@ function MobSystem:_updateGhost(mob, dt)
   mob.y = (mob.baseY or mob.y) + math.sin(self._time * 2.2 + (mob.bobPhase or 0)) * 0.16
 
   local dy = (playerY - 0.7) - mob.y
-  local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-  if dist <= self.ghostAttackRange and mob.attackCooldown <= 0 then
+  local attackRange = self.ghostAttackRange
+  local distSq = dx * dx + dy * dy + dz * dz
+  if distSq <= attackRange * attackRange and mob.attackCooldown <= 0 then
     if self.stats and self.stats.applyDamage then
       self.stats:applyDamage(self.ghostAttackDamage)
     end
@@ -345,9 +463,13 @@ function MobSystem:getTargetName()
 end
 
 function MobSystem:onPlayerRespawn()
-  for i = #self.mobs, 1, -1 do
-    if self.mobs[i].kind == 'ghost' then
-      table.remove(self.mobs, i)
+  local i = 1
+  while i <= #self.mobs do
+    local mob = self.mobs[i]
+    if mob and mob.kind == 'ghost' then
+      self:_removeMobAt(i)
+    else
+      i = i + 1
     end
   end
   self.targetMob = nil
@@ -355,15 +477,17 @@ function MobSystem:onPlayerRespawn()
 end
 
 function MobSystem:_decayTimers(delta)
-  for i = #self.mobs, 1, -1 do
+  local i = 1
+  while i <= #self.mobs do
     local mob = self.mobs[i]
     if mob.dead then
-      table.remove(self.mobs, i)
+      self:_removeMobAt(i)
     else
       mob.hurtTimer = math.max(0, (mob.hurtTimer or 0) - delta)
       if mob.kind == 'ghost' then
         mob.attackCooldown = math.max(0, (mob.attackCooldown or 0) - delta)
       end
+      i = i + 1
     end
   end
 end
@@ -371,25 +495,26 @@ end
 function MobSystem:_updateAiStep(delta)
   local night = self:_isNight(self._timeOfDay)
   self._sheepTimer = self._sheepTimer + delta
-  if self._sheepTimer >= self.sheepSpawnInterval and self:_countByKind('sheep') < self.maxSheep then
+  if self._sheepTimer >= self.sheepSpawnInterval and (self._sheepCount or 0) < self.maxSheep then
     self._sheepTimer = 0
     self:_spawn('sheep')
   end
 
   self._ghostTimer = self._ghostTimer + delta
-  if night and self._ghostTimer >= self.ghostSpawnInterval and self:_countByKind('ghost') < self.maxGhosts then
+  if night and self._ghostTimer >= self.ghostSpawnInterval and (self._ghostCount or 0) < self.maxGhosts then
     self._ghostTimer = 0
     self:_spawn('ghost')
   end
 
-  local playerX, _, playerZ = self.player:getCameraPosition()
+  local playerX, playerY, playerZ = self.player:getCameraPosition()
   local despawnDistance2 = self.despawnDistance * self.despawnDistance
 
-  for i = #self.mobs, 1, -1 do
+  local i = 1
+  while i <= #self.mobs do
     local mob = self.mobs[i]
     local removed = false
     if mob.dead then
-      table.remove(self.mobs, i)
+      self:_removeMobAt(i)
       removed = true
     else
       local insideSimulation = self:_isInsideSimulationWindow(mob.x, mob.z)
@@ -399,10 +524,10 @@ function MobSystem:_updateAiStep(delta)
         end
       elseif mob.kind == 'ghost' then
         if not night then
-          table.remove(self.mobs, i)
+          self:_removeMobAt(i)
           removed = true
         elseif insideSimulation then
-          self:_updateGhost(mob, delta)
+          self:_updateGhost(mob, delta, playerX, playerY, playerZ)
         end
       end
 
@@ -410,10 +535,14 @@ function MobSystem:_updateAiStep(delta)
         local dx = mob.x - playerX
         local dz = mob.z - playerZ
         if dx * dx + dz * dz > despawnDistance2 then
-          table.remove(self.mobs, i)
+          self:_removeMobAt(i)
           removed = true
         end
       end
+    end
+
+    if not removed then
+      i = i + 1
     end
   end
 end

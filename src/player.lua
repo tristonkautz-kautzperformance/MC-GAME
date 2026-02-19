@@ -2,6 +2,8 @@ local Player = {}
 Player.__index = Player
 
 local EPSILON = 1e-4
+local MOVE_AXIS_COARSE_STEP = 0.24
+local MOVE_AXIS_BLOCKED_STEP = 0.08
 
 local function clamp(value, minValue, maxValue)
   if value < minValue then
@@ -84,11 +86,26 @@ function Player:_collides(world)
   local endY = math.floor(maxY - EPSILON) + 1
   local startZ = math.floor(minZ + EPSILON) + 1
   local endZ = math.floor(maxZ - EPSILON) + 1
+  local getBlock = world.get
+  local blockInfo = world.constants and world.constants.BLOCK_INFO or nil
 
   for x = startX, endX do
     for y = startY, endY do
       for z = startZ, endZ do
-        if world:isSolidAt(x, y, z) then
+        if getBlock and blockInfo then
+          local block = getBlock(world, x, y, z)
+          local info = blockInfo[block]
+          if info then
+            local collidable = info.collidable
+            if collidable ~= nil then
+              if collidable then
+                return true
+              end
+            elseif info.solid then
+              return true
+            end
+          end
+        elseif world:isSolidAt(x, y, z) then
           return true
         end
       end
@@ -103,16 +120,33 @@ function Player:_moveAxis(world, axis, amount)
     return false
   end
 
-  local steps = math.max(1, math.ceil(math.abs(amount) / .08))
-  local step = amount / steps
+  local direction = amount >= 0 and 1 or -1
+  local remaining = math.abs(amount)
+  local coarseStep = MOVE_AXIS_COARSE_STEP
+  local blockedStepLimit = MOVE_AXIS_BLOCKED_STEP
 
-  for _ = 1, steps do
+  while remaining > 1e-6 do
+    local stepMagnitude = math.min(remaining, coarseStep)
+    local step = direction * stepMagnitude
+
     self[axis] = self[axis] + step
-
     if self:_collides(world) then
       self[axis] = self[axis] - step
+
+      local microSteps = math.max(1, math.ceil(stepMagnitude / blockedStepLimit))
+      local microStep = step / microSteps
+      for _ = 1, microSteps do
+        self[axis] = self[axis] + microStep
+        if self:_collides(world) then
+          self[axis] = self[axis] - microStep
+          return true
+        end
+      end
+
       return true
     end
+
+    remaining = remaining - stepMagnitude
   end
 
   return false

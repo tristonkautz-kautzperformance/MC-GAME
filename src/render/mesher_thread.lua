@@ -44,6 +44,14 @@ local indexPackU16Capacity = 0
 local indexPackU32Buffer = nil
 local indexPackU32Capacity = 0
 local greedyMaskScratch = {}
+local pooledVerticesOpaque = {}
+local pooledVerticesAlpha = {}
+local pooledIndicesOpaque = {}
+local pooledIndicesAlpha = {}
+local pooledPrevOpaqueVertexCount = 0
+local pooledPrevAlphaVertexCount = 0
+local pooledPrevOpaqueIndexCount = 0
+local pooledPrevAlphaIndexCount = 0
 
 local function ensureVertexPackBuffer(floatCount)
   if not ffi then
@@ -323,6 +331,21 @@ local function decodeHaloBlob(blob, scratch)
     return nil
   end
 
+  if ffi and blob.getPointer then
+    local okPtr, pointer = pcall(function()
+      return blob:getPointer()
+    end)
+    if okPtr and pointer then
+      local okCast, bytes = pcall(function()
+        return ffi.cast('const uint8_t*', pointer)
+      end)
+      if okCast and bytes then
+        -- Offset once so we can keep existing 1-based Lua indexing math in hot loops.
+        return bytes - 1
+      end
+    end
+  end
+
   local blobString = nil
   if blob.getString then
     local ok, value = pcall(function()
@@ -394,10 +417,10 @@ local function buildChunkNaive(job)
     error('missing_sky_halo_payload')
   end
 
-  local verticesOpaque = {}
-  local verticesAlpha = {}
-  local indicesOpaque = {}
-  local indicesAlpha = {}
+  local verticesOpaque = pooledVerticesOpaque
+  local verticesAlpha = pooledVerticesAlpha
+  local indicesOpaque = pooledIndicesOpaque
+  local indicesAlpha = pooledIndicesAlpha
   local opaqueCount = 0
   local alphaCount = 0
   local indexOpaqueCount = 0
@@ -440,31 +463,53 @@ local function buildChunkNaive(job)
             local count = isOpaqueBlock and opaqueCount or alphaCount
             local indexCount = isOpaqueBlock and indexOpaqueCount or indexAlphaCount
 
-            local function emit(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, sky)
+            if shouldDrawFace(block, halo[index - 1], blockInfo, airBlock) then
+              local sky = skyHalo[index - 1] or 0
               if useIndexed then
-                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, a, sky)
               else
-                count = emitQuad(out, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
+                count = emitQuad(out, count, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, r, g, b, a, sky)
               end
             end
-
-            if shouldDrawFace(block, halo[index - 1], blockInfo, airBlock) then
-              emit(x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, -1, 0, 0, skyHalo[index - 1] or 0)
-            end
             if shouldDrawFace(block, halo[index + 1], blockInfo, airBlock) then
-              emit(x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, skyHalo[index + 1] or 0)
+              local sky = skyHalo[index + 1] or 0
+              if useIndexed then
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, a, sky)
+              else
+                count = emitQuad(out, count, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, 1, 0, 0, r, g, b, a, sky)
+              end
             end
             if shouldDrawFace(block, halo[index - strideY], blockInfo, airBlock) then
-              emit(x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, skyHalo[index - strideY] or 0)
+              local sky = skyHalo[index - strideY] or 0
+              if useIndexed then
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b, a, sky)
+              else
+                count = emitQuad(out, count, x0, y0, z0, x1, y0, z0, x1, y0, z1, x0, y0, z1, 0, -1, 0, r, g, b, a, sky)
+              end
             end
             if shouldDrawFace(block, halo[index + strideY], blockInfo, airBlock) then
-              emit(x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, skyHalo[index + strideY] or 0)
+              local sky = skyHalo[index + strideY] or 0
+              if useIndexed then
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b, a, sky)
+              else
+                count = emitQuad(out, count, x0, y1, z1, x1, y1, z1, x1, y1, z0, x0, y1, z0, 0, 1, 0, r, g, b, a, sky)
+              end
             end
             if shouldDrawFace(block, halo[index - strideZ], blockInfo, airBlock) then
-              emit(x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, skyHalo[index - strideZ] or 0)
+              local sky = skyHalo[index - strideZ] or 0
+              if useIndexed then
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, r, g, b, a, sky)
+              else
+                count = emitQuad(out, count, x0, y0, z0, x0, y1, z0, x1, y1, z0, x1, y0, z0, 0, 0, -1, r, g, b, a, sky)
+              end
             end
             if shouldDrawFace(block, halo[index + strideZ], blockInfo, airBlock) then
-              emit(x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, skyHalo[index + strideZ] or 0)
+              local sky = skyHalo[index + strideZ] or 0
+              if useIndexed then
+                count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, r, g, b, a, sky)
+              else
+                count = emitQuad(out, count, x1, y0, z1, x1, y1, z1, x0, y1, z1, x0, y0, z1, 0, 0, 1, r, g, b, a, sky)
+              end
             end
 
             if isOpaqueBlock then
@@ -479,6 +524,32 @@ local function buildChunkNaive(job)
       end
     end
   end
+
+  if opaqueCount < pooledPrevOpaqueVertexCount then
+    for i = opaqueCount + 1, pooledPrevOpaqueVertexCount do
+      verticesOpaque[i] = nil
+    end
+  end
+  if alphaCount < pooledPrevAlphaVertexCount then
+    for i = alphaCount + 1, pooledPrevAlphaVertexCount do
+      verticesAlpha[i] = nil
+    end
+  end
+  if indexOpaqueCount < pooledPrevOpaqueIndexCount then
+    for i = indexOpaqueCount + 1, pooledPrevOpaqueIndexCount do
+      indicesOpaque[i] = nil
+    end
+  end
+  if indexAlphaCount < pooledPrevAlphaIndexCount then
+    for i = indexAlphaCount + 1, pooledPrevAlphaIndexCount do
+      indicesAlpha[i] = nil
+    end
+  end
+
+  pooledPrevOpaqueVertexCount = opaqueCount
+  pooledPrevAlphaVertexCount = alphaCount
+  pooledPrevOpaqueIndexCount = indexOpaqueCount
+  pooledPrevAlphaIndexCount = indexAlphaCount
 
   return verticesOpaque, verticesAlpha, opaqueCount, alphaCount, indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount
 end
@@ -497,10 +568,10 @@ local function buildChunkGreedy(job)
     error('missing_sky_halo_payload')
   end
 
-  local verticesOpaque = {}
-  local verticesAlpha = {}
-  local indicesOpaque = {}
-  local indicesAlpha = {}
+  local verticesOpaque = pooledVerticesOpaque
+  local verticesAlpha = pooledVerticesAlpha
+  local indicesOpaque = pooledIndicesOpaque
+  local indicesAlpha = pooledIndicesAlpha
   local opaqueCount = 0
   local alphaCount = 0
   local indexOpaqueCount = 0
@@ -531,56 +602,72 @@ local function buildChunkGreedy(job)
     local count = isOpaqueBlock and opaqueCount or alphaCount
     local indexCount = isOpaqueBlock and indexOpaqueCount or indexAlphaCount
 
-    local function emit(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz)
-      if useIndexed then
-        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
-      else
-        count = emitQuad(out, count, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, r, g, b, a, sky)
-      end
-    end
-
     if direction == DIR_NEG_X then
       local x = slice - 1
       local y0 = v - 1
       local y1 = y0 + height
       local z0 = u - 1
       local z1 = z0 + width
-      emit(x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0)
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a, sky)
+      else
+        count = emitQuad(out, count, x, y0, z0, x, y0, z1, x, y1, z1, x, y1, z0, -1, 0, 0, r, g, b, a, sky)
+      end
     elseif direction == DIR_POS_X then
       local x = slice
       local y0 = v - 1
       local y1 = y0 + height
       local z0 = u - 1
       local z1 = z0 + width
-      emit(x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0)
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a, sky)
+      else
+        count = emitQuad(out, count, x, y0, z1, x, y0, z0, x, y1, z0, x, y1, z1, 1, 0, 0, r, g, b, a, sky)
+      end
     elseif direction == DIR_NEG_Y then
       local y = slice - 1
       local x0 = u - 1
       local x1 = x0 + width
       local z0 = v - 1
       local z1 = z0 + height
-      emit(x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0)
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a, sky)
+      else
+        count = emitQuad(out, count, x0, y, z0, x1, y, z0, x1, y, z1, x0, y, z1, 0, -1, 0, r, g, b, a, sky)
+      end
     elseif direction == DIR_POS_Y then
       local y = slice
       local x0 = u - 1
       local x1 = x0 + width
       local z0 = v - 1
       local z1 = z0 + height
-      emit(x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0)
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a, sky)
+      else
+        count = emitQuad(out, count, x0, y, z1, x1, y, z1, x1, y, z0, x0, y, z0, 0, 1, 0, r, g, b, a, sky)
+      end
     elseif direction == DIR_NEG_Z then
       local z = slice - 1
       local x0 = u - 1
       local x1 = x0 + width
       local y0 = v - 1
       local y1 = y0 + height
-      emit(x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1)
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a, sky)
+      else
+        count = emitQuad(out, count, x0, y0, z, x0, y1, z, x1, y1, z, x1, y0, z, 0, 0, -1, r, g, b, a, sky)
+      end
     else
       local z = slice
       local x0 = u - 1
       local x1 = x0 + width
       local y0 = v - 1
       local y1 = y0 + height
-      emit(x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1)
+      if useIndexed then
+        count, indexCount = emitQuadIndexed(out, count, outIndices, indexCount, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a, sky)
+      else
+        count = emitQuad(out, count, x1, y0, z, x1, y1, z, x0, y1, z, x0, y0, z, 0, 0, 1, r, g, b, a, sky)
+      end
     end
 
     if isOpaqueBlock then
@@ -671,6 +758,32 @@ local function buildChunkGreedy(job)
       end
     end
   end
+
+  if opaqueCount < pooledPrevOpaqueVertexCount then
+    for i = opaqueCount + 1, pooledPrevOpaqueVertexCount do
+      verticesOpaque[i] = nil
+    end
+  end
+  if alphaCount < pooledPrevAlphaVertexCount then
+    for i = alphaCount + 1, pooledPrevAlphaVertexCount do
+      verticesAlpha[i] = nil
+    end
+  end
+  if indexOpaqueCount < pooledPrevOpaqueIndexCount then
+    for i = indexOpaqueCount + 1, pooledPrevOpaqueIndexCount do
+      indicesOpaque[i] = nil
+    end
+  end
+  if indexAlphaCount < pooledPrevAlphaIndexCount then
+    for i = indexAlphaCount + 1, pooledPrevAlphaIndexCount do
+      indicesAlpha[i] = nil
+    end
+  end
+
+  pooledPrevOpaqueVertexCount = opaqueCount
+  pooledPrevAlphaVertexCount = alphaCount
+  pooledPrevOpaqueIndexCount = indexOpaqueCount
+  pooledPrevAlphaIndexCount = indexAlphaCount
 
   return verticesOpaque, verticesAlpha, opaqueCount, alphaCount, indicesOpaque, indicesAlpha, indexOpaqueCount, indexAlphaCount
 end

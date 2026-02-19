@@ -2,6 +2,10 @@ local ChunkRenderer = {}
 ChunkRenderer.__index = ChunkRenderer
 
 local MeshWorker = require 'src.render.MeshWorker'
+local hasFfi, ffi = pcall(require, 'ffi')
+if not hasFfi then
+  ffi = nil
+end
 
 local VERTEX_FORMAT = {
   { 'VertexPosition', 'vec3' },
@@ -75,6 +79,19 @@ local DIR_NEG_Z = 5
 local DIR_POS_Z = 6
 local HALO_BLOB_PACK_CHUNK = 256
 local tableUnpack = (table and table.unpack) or unpack
+local haloPackBuffer = nil
+local haloPackCapacity = 0
+
+local function ensureHaloPackBuffer(byteCount)
+  if not ffi then
+    return nil
+  end
+  if haloPackCapacity < byteCount then
+    haloPackBuffer = ffi.new('uint8_t[?]', byteCount)
+    haloPackCapacity = byteCount
+  end
+  return haloPackBuffer
+end
 
 local function isBlobData(value)
   return type(value) == 'userdata'
@@ -168,6 +185,7 @@ function ChunkRenderer.new(constants, world)
   self._indexCountOpaque = 0
   self._indexCountAlpha = 0
   self._drawForward = lovr.math.newVec3(0, 0, -1)
+  self._cullFrame = {}
   self._opaqueScratch = {}
   self._opaqueScratchCount = 0
   self._alphaScratch = {}
@@ -176,6 +194,7 @@ function ChunkRenderer.new(constants, world)
   local renderConfig = constants.RENDER or {}
   self._cullOpaque = renderConfig.cullOpaque ~= false
   self._cullAlpha = renderConfig.cullAlpha == true
+  self._sortOpaqueFrontToBack = renderConfig.sortOpaqueFrontToBack == true
 
   local threadConfig = constants.THREAD_MESH or {}
   self._threadEnabled = threadConfig.enabled == true
@@ -415,12 +434,44 @@ function ChunkRenderer:_packHaloBlob(halo)
   if not self._threadHaloBlob then
     return nil
   end
-  if not tableUnpack then
-    return nil
-  end
 
   local data = lovr.data
   if not data or not data.newBlob then
+    return nil
+  end
+
+  local haloCount = #halo
+  if haloCount <= 0 then
+    return nil
+  end
+
+  if ffi then
+    local buffer = ensureHaloPackBuffer(haloCount)
+    if buffer then
+      for i = 1, haloCount do
+        local value = halo[i] or 0
+        if value < 0 then
+          value = 0
+        elseif value > 255 then
+          value = 255
+        end
+        buffer[i - 1] = value
+      end
+
+      local packed = ffi.string(buffer, haloCount)
+      local ok, blob = pcall(data.newBlob, packed, 'thread_halo')
+      if ok and blob then
+        return blob
+      end
+
+      ok, blob = pcall(data.newBlob, packed)
+      if ok and blob then
+        return blob
+      end
+    end
+  end
+
+  if not tableUnpack then
     return nil
   end
 
@@ -429,7 +480,7 @@ function ChunkRenderer:_packHaloBlob(halo)
   local byteCount = 0
   local partCount = 0
 
-  for i = 1, #halo do
+  for i = 1, haloCount do
     byteCount = byteCount + 1
     bytes[byteCount] = halo[i] or 0
 
@@ -987,11 +1038,49 @@ local function clamp(value, minValue, maxValue)
 end
 
 local function alphaSortBackToFront(a, b)
-  return a._alphaDistSq > b._alphaDistSq
+  return a._sortDistSq > b._sortDistSq
 end
 
 local function opaqueSortFrontToBack(a, b)
-  return a._opaqueDistSq < b._opaqueDistSq
+  return a._sortDistSq < b._sortDistSq
+end
+
+local function buildCullFrame(renderer, cameraX, cameraY, cameraZ, forwardX, forwardY, forwardZ)
+  local cull = renderer.constants.CULL or {}
+  local frame = renderer._cullFrame
+  frame.enabled = cull.enabled and true or false
+  if not frame.enabled then
+    return frame
+  end
+
+  local horizontalOnly = cull.horizontalOnly and true or false
+  frame.horizontalOnly = horizontalOnly
+  frame.radiusWorld = (tonumber(cull.drawRadiusChunks) or 999) * renderer.chunkSize
+  frame.padWorld = (tonumber(cull.alwaysVisiblePaddingChunks) or 0) * renderer.chunkSize
+
+  local fovDegrees = tonumber(cull.fovDegrees)
+  frame.useFov = fovDegrees ~= nil
+  if not frame.useFov then
+    frame.forwardValid = false
+    return frame
+  end
+
+  frame.fovBaseRadians = math.rad(fovDegrees) * 0.5 + math.rad(tonumber(cull.fovPaddingDegrees) or 0)
+  local fx = forwardX
+  local fy = horizontalOnly and 0 or forwardY
+  local fz = forwardZ
+  local flSq = fx * fx + fy * fy + fz * fz
+  if flSq <= 1e-8 then
+    frame.forwardValid = false
+    return frame
+  end
+
+  local invFl = 1 / math.sqrt(flSq)
+  frame.forwardX = fx * invFl
+  frame.forwardY = fy * invFl
+  frame.forwardZ = fz * invFl
+  frame.forwardValid = true
+  return frame
 end
 
 function ChunkRenderer:setPriorityOriginWorld(cameraX, cameraY, cameraZ)
@@ -2005,13 +2094,12 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
   return rebuilt
 end
 
-function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forwardX, forwardY, forwardZ)
-  local cull = self.constants.CULL or {}
-  if not cull.enabled then
+function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFrame)
+  if not cullFrame.enabled then
     return true
   end
 
-  local horizontalOnly = cull.horizontalOnly and true or false
+  local horizontalOnly = cullFrame.horizontalOnly
   local chunkRadius = horizontalOnly and (entry.radiusHorizontal or entry.radius or 0) or (entry.radius or 0)
 
   local dx = entry.centerX - cameraX
@@ -2019,47 +2107,41 @@ function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward
   local dz = entry.centerZ - cameraZ
 
   -- Radius culling uses sphere-extended range to avoid dropping chunks whose center is just beyond range.
-  local radiusChunks = cull.drawRadiusChunks or 999
-  local radiusWorld = radiusChunks * self.chunkSize
-  local maxRange = radiusWorld + chunkRadius
-  local radiusSq = maxRange * maxRange
-
+  local maxRange = cullFrame.radiusWorld + chunkRadius
   local distSq = dx * dx + dy * dy + dz * dz
-  if distSq > radiusSq then
+  if distSq > maxRange * maxRange then
     return false
   end
 
   -- Optional FOV culling, expanded by the chunk's angular radius for conservative behavior.
-  local fovDegrees = cull.fovDegrees
-  if not fovDegrees then
+  if not cullFrame.useFov then
     return true
   end
 
-  local pad = (cull.alwaysVisiblePaddingChunks or 0) * self.chunkSize + chunkRadius
+  local pad = cullFrame.padWorld + chunkRadius
   if distSq <= pad * pad then
     return true
   end
 
-  local fx = forwardX
-  local fy = horizontalOnly and 0 or forwardY
-  local fz = forwardZ
-  local fl = math.sqrt(fx * fx + fy * fy + fz * fz)
-  if fl < 1e-4 then
+  if not cullFrame.forwardValid then
     return true
   end
-  fx, fy, fz = fx / fl, fy / fl, fz / fl
 
   local dl = math.sqrt(distSq)
   if dl < 1e-4 then
     return true
   end
-  dx, dy, dz = dx / dl, dy / dl, dz / dl
+  local invDl = 1 / dl
 
-  local dot = clamp(fx * dx + fy * dy + fz * dz, -1, 1)
-  local halfFov = math.rad(fovDegrees) * 0.5
+  local dot = clamp(
+    cullFrame.forwardX * (dx * invDl)
+      + cullFrame.forwardY * (dy * invDl)
+      + cullFrame.forwardZ * (dz * invDl),
+    -1,
+    1
+  )
   local chunkAngle = math.asin(clamp(chunkRadius / dl, 0, 1))
-  local fovPadding = math.rad(cull.fovPaddingDegrees or 0)
-  local maxAngle = halfFov + chunkAngle + fovPadding
+  local maxAngle = cullFrame.fovBaseRadians + chunkAngle
 
   if maxAngle >= math.pi then
     return true
@@ -2076,6 +2158,7 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
     forward.x, forward.y, forward.z = 0, 0, -1
   end
   forward:rotate(cameraOrientation)
+  local cullFrame = buildCullFrame(self, cameraX, cameraY, cameraZ, forward.x, forward.y, forward.z)
 
   self._visibleCount = 0
 
@@ -2094,23 +2177,22 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
   -- Gather visible opaque + alpha entries in one pass.
   for _, entry in pairs(self._chunkMeshes) do
     if entry.opaque or entry.alpha then
-      if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, forward.x, forward.y, forward.z) then
+      if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFrame) then
         self._visibleCount = self._visibleCount + 1
 
         local dx = entry.centerX - cameraX
         local dy = entry.centerY - cameraY
         local dz = entry.centerZ - cameraZ
         local distSq = dx * dx + dy * dy + dz * dz
+        entry._sortDistSq = distSq
 
         if entry.opaque then
           opaqueCount = opaqueCount + 1
           opaqueScratch[opaqueCount] = entry
-          entry._opaqueDistSq = distSq
         end
         if entry.alpha then
           alphaCount = alphaCount + 1
           alphaScratch[alphaCount] = entry
-          entry._alphaDistSq = distSq
         end
       end
     end
@@ -2126,7 +2208,7 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
   end
   self._alphaScratchCount = alphaCount
 
-  if opaqueCount > 1 then
+  if self._sortOpaqueFrontToBack and opaqueCount > 1 then
     table.sort(opaqueScratch, opaqueSortFrontToBack)
   end
 

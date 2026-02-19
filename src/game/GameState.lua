@@ -139,6 +139,10 @@ function GameState.new(constants)
   self._enqueuedTimer = 0
   self._enqueuedShowSeconds = 0.5
   self._cameraPosition = nil
+  self._hudState = {}
+  self._shaderStatusText = nil
+  self._shaderStatusSkySubtract = nil
+  self._shaderStatusError = nil
   self._mobSkipDirtyQueueAbove = 0
 
   self.showHelp = false
@@ -195,6 +199,26 @@ function GameState:_updateFrameTiming(dt)
     self._worstFrameWindowTime = self._worstFrameWindowTime - 1.0
     self._worstFrameWindowMax = frameMs
   end
+end
+
+function GameState:_getShaderStatusText()
+  if self.voxelShader then
+    local skySubtract = self.voxelShader:getSkySubtract()
+    if self._shaderStatusText == nil or self._shaderStatusSkySubtract ~= skySubtract then
+      self._shaderStatusSkySubtract = skySubtract
+      self._shaderStatusError = nil
+      self._shaderStatusText = 'On (SkySub ' .. tostring(skySubtract) .. ')'
+    end
+    return self._shaderStatusText
+  end
+
+  local errorText = tostring(self._voxelShaderError or 'unavailable')
+  if self._shaderStatusText == nil or self._shaderStatusError ~= errorText then
+    self._shaderStatusSkySubtract = nil
+    self._shaderStatusError = errorText
+    self._shaderStatusText = 'Off: ' .. errorText
+  end
+  return self._shaderStatusText
 end
 
 function GameState:_getSaveStatusDuration()
@@ -337,6 +361,9 @@ function GameState:_teardownSession()
   self.renderer = nil
   self.voxelShader = nil
   self._voxelShaderError = nil
+  self._shaderStatusText = nil
+  self._shaderStatusSkySubtract = nil
+  self._shaderStatusError = nil
   self._autosaveTimer = 0
   self._simulationChunkRadius = 4
   self._chunkDirtyRadius = 0
@@ -1092,64 +1119,65 @@ function GameState:draw(pass)
   local blockTargetName = self.interaction:getTargetName()
   local targetName = mobTargetName ~= 'None' and mobTargetName or blockTargetName
   local targetActive = mobTargetName ~= 'None' or self.interaction.targetHit ~= nil
+  local shaderStatusText = self:_getShaderStatusText()
   if self.inventoryMenuOpen then
     targetName = 'None'
     targetActive = false
   end
 
-  self.hud:draw(pass, {
-    cameraX = cameraX,
-    cameraY = cameraY,
-    cameraZ = cameraZ,
-    cameraOrientation = cameraOrientation,
-    timeOfDay = self.sky.timeOfDay,
-    targetName = targetName,
-    targetActive = targetActive,
-    mouseStatusText = self.mouseLock:getStatusText(),
-    lightingMode = (self.constants.LIGHTING and self.constants.LIGHTING.mode) or 'off',
-    shaderStatusText = self.voxelShader and string.format('On (SkySub %d)', self.voxelShader:getSkySubtract()) or ('Off: ' .. tostring(self._voxelShaderError or 'unavailable')),
-    saveStatusText = self._saveStatusText,
-    saveStatusTimer = self._saveStatusTimer,
-    relativeMouseReady = self.relativeMouseReady,
-    meshingMode = self.renderer:getMeshingModeLabel(),
-    renderRadiusChunks = tonumber((self.constants.CULL and self.constants.CULL.drawRadiusChunks) or 0) or 0,
-    simulationRadiusChunks = tonumber(self._simulationChunkRadius) or 4,
-    inventory = self.inventory,
-    inventoryMenuOpen = self.inventoryMenuOpen,
-    inventoryMenuCursor = self.inventoryMenuCursorIndex,
-    health = stats and stats.health or 20,
-    maxHealth = stats and stats.maxHealth or 20,
-    hunger = stats and stats.hunger or 20,
-    maxHunger = stats and stats.maxHunger or 20,
-    experience = stats and stats.experience or 0,
-    level = stats and stats.level or 0,
-    showHelp = self.showHelp,
-    showPerfHud = self.showPerfHud,
-    fps = fps,
-    frameMs = self.frameMs,
-    worstFrameMs = self.worstFrameMs,
-    visibleChunks = visibleCount,
-    rebuilds = rebuilds,
-    dirtyQueue = dirtyQueue,
-    dirtyDrained = dirtyDrained,
-    dirtyQueued = dirtyQueued,
-    rebuildMs = rebuildMs,
-    rebuildBudgetMs = rebuildBudgetMs,
-    threadCoreCount = threadCoreCount,
-    threadWorkerCount = threadWorkerCount,
-    threadTargetWorkers = threadTargetWorkers,
-    threadActiveMeshingThreads = threadActiveMeshingThreads,
-    threadPoolActive = threadPoolActive,
-    pruneScanned = pruneScanned,
-    pruneRemoved = pruneRemoved,
-    prunePending = prunePendingFlag == 1,
-    lightStripOps = lightStripOps,
-    lightStripPending = lightStripPending,
-    lightStripTasks = lightStripTasks,
-    chunkEnsureScale = chunkEnsureScale,
-    enqueuedCount = self._enqueuedCount,
-    enqueuedTimer = self._enqueuedTimer
-  })
+  local hudState = self._hudState
+  hudState.cameraX = cameraX
+  hudState.cameraY = cameraY
+  hudState.cameraZ = cameraZ
+  hudState.cameraOrientation = cameraOrientation
+  hudState.timeOfDay = self.sky.timeOfDay
+  hudState.targetName = targetName
+  hudState.targetActive = targetActive
+  hudState.mouseStatusText = self.mouseLock:getStatusText()
+  hudState.lightingMode = (self.constants.LIGHTING and self.constants.LIGHTING.mode) or 'off'
+  hudState.shaderStatusText = shaderStatusText
+  hudState.saveStatusText = self._saveStatusText
+  hudState.saveStatusTimer = self._saveStatusTimer
+  hudState.relativeMouseReady = self.relativeMouseReady
+  hudState.meshingMode = self.renderer:getMeshingModeLabel()
+  hudState.renderRadiusChunks = tonumber((self.constants.CULL and self.constants.CULL.drawRadiusChunks) or 0) or 0
+  hudState.simulationRadiusChunks = tonumber(self._simulationChunkRadius) or 4
+  hudState.inventory = self.inventory
+  hudState.inventoryMenuOpen = self.inventoryMenuOpen
+  hudState.inventoryMenuCursor = self.inventoryMenuCursorIndex
+  hudState.health = stats and stats.health or 20
+  hudState.maxHealth = stats and stats.maxHealth or 20
+  hudState.hunger = stats and stats.hunger or 20
+  hudState.maxHunger = stats and stats.maxHunger or 20
+  hudState.experience = stats and stats.experience or 0
+  hudState.level = stats and stats.level or 0
+  hudState.showHelp = self.showHelp
+  hudState.showPerfHud = self.showPerfHud
+  hudState.fps = fps
+  hudState.frameMs = self.frameMs
+  hudState.worstFrameMs = self.worstFrameMs
+  hudState.visibleChunks = visibleCount
+  hudState.rebuilds = rebuilds
+  hudState.dirtyQueue = dirtyQueue
+  hudState.dirtyDrained = dirtyDrained
+  hudState.dirtyQueued = dirtyQueued
+  hudState.rebuildMs = rebuildMs
+  hudState.rebuildBudgetMs = rebuildBudgetMs
+  hudState.threadCoreCount = threadCoreCount
+  hudState.threadWorkerCount = threadWorkerCount
+  hudState.threadTargetWorkers = threadTargetWorkers
+  hudState.threadActiveMeshingThreads = threadActiveMeshingThreads
+  hudState.threadPoolActive = threadPoolActive
+  hudState.pruneScanned = pruneScanned
+  hudState.pruneRemoved = pruneRemoved
+  hudState.prunePending = prunePendingFlag == 1
+  hudState.lightStripOps = lightStripOps
+  hudState.lightStripPending = lightStripPending
+  hudState.lightStripTasks = lightStripTasks
+  hudState.chunkEnsureScale = chunkEnsureScale
+  hudState.enqueuedCount = self._enqueuedCount
+  hudState.enqueuedTimer = self._enqueuedTimer
+  self.hud:draw(pass, hudState)
 end
 
 function GameState:_toggleFullscreen()

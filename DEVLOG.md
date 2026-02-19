@@ -64,6 +64,53 @@
   - control/feature updates in `README.md`.
   - pointer-lock/control note update in `AGENTS.md`.
 
+### Perf Audit: Top 3 Hot-Path Fixes
+- Optimized render culling/sorting path in `src/render/ChunkRenderer.lua`:
+  - precomputes cull parameters once per draw call via a reusable cull-frame scratch table.
+  - removes repeated per-entry cull config math and forward-vector normalization work.
+  - unifies chunk sort key to one cached distance field.
+  - adds `Constants.RENDER.sortOpaqueFrontToBack` (default `false`) to skip opaque sorting CPU cost unless explicitly enabled.
+- Optimized thread halo payload packing/unpacking:
+  - `ChunkRenderer:_packHaloBlob(...)` now uses an ffi `uint8_t` buffer + `ffi.string(...)` fast path before falling back to chunked `string.char(...)` packing.
+  - `src/render/mesher_thread.lua` halo decode now first attempts direct blob pointer access (`getPointer` + ffi cast) to avoid per-byte Lua table decode when available.
+- Reduced worker-side mesher allocations in `src/render/mesher_thread.lua`:
+  - switched naive and greedy builders to reuse pooled vertex/index arrays across jobs.
+  - removed inner emit closures in hot loops and inlined face emission branches.
+  - trims pooled tails each build to keep returned counts and buffers accurate.
+
+### Perf Audit: Items 4-8
+- Optimized mob removal/census in `src/mobs/MobSystem.lua`:
+  - replaced repeated `table.remove(...)` hot-loop paths with O(1) swap-remove helper (`_removeMobAt`).
+  - added incremental sheep/ghost counters so spawn caps no longer require full list scans each AI step.
+- Optimized mob simulation-window checks in `src/mobs/MobSystem.lua`:
+  - precomputes simulation chunk/world bounds when the window updates.
+  - runtime inside-window checks now use direct world-space bounds tests instead of per-mob chunk conversion math.
+- Reduced per-frame HUD state allocation in `src/game/GameState.lua`:
+  - draw path now reuses a persistent `_hudState` table instead of constructing a new large state table each frame.
+  - added cached shader-status string builder (`_getShaderStatusText`) to avoid repeated format/allocation churn.
+- Optimized raycast allocation path in `src/world/ChunkWorld.lua` and `src/interaction/Interaction.lua`:
+  - moved ray `intBound` helper out of `ChunkWorld:raycast(...)` to avoid per-call closure creation.
+  - `raycast` now supports writing into a caller-provided hit table; interaction system now reuses a persistent hit scratch table.
+- Optimized player collision hot path in `src/player.lua`:
+  - `Player:_collides(...)` now performs inline block-collidable checks (using cached block info/getter locals) instead of calling `world:isSolidAt(...)` for every sampled voxel.
+
+### Perf Audit: Items 9-13
+- Added mob ground-height caching with edit-aware invalidation in `src/mobs/MobSystem.lua` and `src/world/ChunkWorld.lua`:
+  - mob ground probes now cache per world column.
+  - cache invalidation keys off new monotonic `ChunkWorld` edit revision (`getEditRevision`), incremented on effective block changes.
+- Optimized ghost AI math in `src/mobs/MobSystem.lua`:
+  - hoisted player camera position fetch to once per AI step and passed it into ghost updates.
+  - changed ghost attack range check from sqrt distance to squared-distance comparison.
+- Added interior fast path for chunk halo fill in `src/world/ChunkWorld.lua`:
+  - `fillBlockHalo(...)` now prefetches neighboring chunk edit/feature refs for non-boundary chunks.
+  - avoids per-voxel boundary tests and reduces hot-loop lookup overhead on the common interior case.
+- Reduced floodfill queue-clear spikes in `src/world/lighting/FloodfillLighting.lua`:
+  - replaced large clear loops with table swaps for sky-column/flood/dark queues and set maps.
+  - avoids O(n) key clearing passes during queue reset points.
+- Optimized axis movement collision stepping in `src/player.lua`:
+  - `_moveAxis(...)` now uses a coarser step pass with micro-step fallback only when blocked.
+  - reduces collision-check count during free movement while preserving blocked-axis resolution behavior.
+
 ## 2026-02-16
 
 ### Frame Spike Tuning Pass (Thread/Apply/Rebuild Budgets)

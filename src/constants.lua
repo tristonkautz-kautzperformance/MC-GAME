@@ -49,12 +49,22 @@ Constants.LIGHTING = {
   regionStripMillisPerFrame = 0.35,
   urgentOpsPerFrame = 12288,
   urgentMillisPerFrame = 1.75,
-  chunkEnsureOps = 768,
+  -- Limit queue stale-scan work per dequeue call to avoid rare long light-stage spikes.
+  dequeueScanLimitPerCall = 512,
+  -- Spread expensive sky-column recompute over multiple light ops.
+  columnRecomputeRowsPerSlice = 8,
+  columnRecomputeSliceMillis = 0.20,
+  -- Hard ceiling on sky-flood ops in a single updateSkyLight pass (0 disables cap).
+  floodOpsCapPerPass = 192,
+  -- A/B spike diagnostic: cap sky-light update passes per frame.
+  maxPassesPerFrame = 2,
+  chunkEnsureOps = 384,
   chunkEnsureMillis = 0.2,
+  chunkEnsurePasses = 2,
   chunkEnsureSpikeSoftMs = 12,
   chunkEnsureSpikeHardMs = 20,
   chunkEnsureSpikeSoftScale = 0.5,
-  chunkEnsureSpikeHardScale = 0.2,
+  chunkEnsureSpikeHardScale = 0.35,
   startupWarmupOpsPerFrame = 32768,
   startupWarmupMillisPerFrame = 4.0,
   editRelightRadiusBlocks = 15,
@@ -86,7 +96,9 @@ Constants.RENDER = {
   cullOpaque = true,
   cullAlpha = false,
   -- Keep opaque ordering unsorted by default to reduce CPU sort cost at high chunk counts.
-  sortOpaqueFrontToBack = false
+  sortOpaqueFrontToBack = false,
+  -- Resort alpha chunk order only after moving this many world units (0 = every movement delta).
+  alphaOrderResortStep = 1.0
 }
 
 Constants.THREAD_MESH = {
@@ -95,13 +107,18 @@ Constants.THREAD_MESH = {
   maxWorkers = 4,
   haloBlob = true,
   resultBlob = true,
-  maxInFlight = 4,
+  -- Limit expensive per-chunk main-thread prep before dispatching worker jobs.
+  maxQueuePrepPerFrame = 1,
+  maxQueuePrepMillis = 0.8,
+  maxInFlight = 2,
+  -- Cap how many worker results are applied on the main thread each frame.
+  maxApplyResultsPerFrame = 1,
   maxApplyMillis = 0.6
 }
 
 Constants.REBUILD = {
-  maxPerFrame = 16,
-  maxMillisPerFrame = 1.8,
+  maxPerFrame = 10,
+  maxMillisPerFrame = 1.2,
   -- Releasing many meshes during movement can stall on some drivers.
   -- Keep runtime releases off by default; meshes are still released on shutdown.
   releaseMeshesRuntime = false,
@@ -274,8 +291,9 @@ Constants.COMBAT = {
 
 Constants.MOBS = {
   enabled = true,
-  maxSheep = 2,
-  maxGhosts = 1,
+  -- Keep mob systems wired, but disable current mob spawns for now.
+  maxSheep = 0,
+  maxGhosts = 0,
   sheepSpawnIntervalSeconds = 14,
   ghostSpawnIntervalSeconds = 20,
   spawnMinDistance = 10,

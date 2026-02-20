@@ -579,6 +579,49 @@ function HUD:_rebuildHudText(state)
     )
     count = count + 1
     lines[count] = string.format(
+      'Thread: Prep %d (%.2f ms, defer %d)  |  Apply %d (%.2f ms)',
+      math.floor(tonumber(state.threadQueuePrepOps) or 0),
+      tonumber(state.threadQueuePrepMs) or 0,
+      math.floor(tonumber(state.threadQueuePrepDeferred) or 0),
+      math.floor(tonumber(state.threadApplyResults) or 0),
+      tonumber(state.threadApplyMs) or 0
+    )
+    count = count + 1
+    lines[count] = string.format(
+      'PrepMs: Ens %.2f Blk %.2f Sky %.2f Pack %.2f Push %.2f',
+      tonumber(state.threadPrepEnsureMs) or 0,
+      tonumber(state.threadPrepBlockHaloMs) or 0,
+      tonumber(state.threadPrepSkyHaloMs) or 0,
+      tonumber(state.threadPrepPackMs) or 0,
+      tonumber(state.threadPrepPushMs) or 0
+    )
+    count = count + 1
+    lines[count] = string.format(
+      'StageU: Total %.2f (W %.2f)  Sim %.2f (W %.2f)',
+      tonumber(state.stageUpdateTotalMs) or 0,
+      tonumber(state.stageUpdateTotalWorstMs) or 0,
+      tonumber(state.stageUpdateSimMs) or 0,
+      tonumber(state.stageUpdateSimWorstMs) or 0
+    )
+    count = count + 1
+    lines[count] = string.format(
+      'StageU: Light %.2f (W %.2f) Pass %d  Rebuild %.2f (W %.2f)',
+      tonumber(state.stageUpdateLightMs) or 0,
+      tonumber(state.stageUpdateLightWorstMs) or 0,
+      math.floor(tonumber(state.skyLightPasses) or 0),
+      tonumber(state.stageUpdateRebuildMs) or 0,
+      tonumber(state.stageUpdateRebuildWorstMs) or 0
+    )
+    count = count + 1
+    lines[count] = string.format(
+      'StageD: World %.2f (W %.2f)  Render %.2f (W %.2f)',
+      tonumber(state.stageDrawWorldMs) or 0,
+      tonumber(state.stageDrawWorldWorstMs) or 0,
+      tonumber(state.stageDrawRendererMs) or 0,
+      tonumber(state.stageDrawRendererWorstMs) or 0
+    )
+    count = count + 1
+    lines[count] = string.format(
       'World: Chunks %d  |  Rebuilds %d  |  Dirty %d',
       state.visibleChunks or 0,
       state.rebuilds or 0,
@@ -621,6 +664,49 @@ function HUD:_rebuildHudText(state)
         math.floor(tonumber(state.lightStripPending) or 0),
         math.floor(tonumber(state.lightStripTasks) or 0),
         ensureSuffix
+      )
+      count = count + 1
+      lines[count] = string.format(
+        'LPerf: U %.2f (W %.2f)  R %.2f (W %.2f)  Ops C/D/F %d/%d/%d',
+        tonumber(state.lightUpdateMs) or 0,
+        tonumber(state.lightUpdateWorstMs) or 0,
+        tonumber(state.lightRegionMs) or 0,
+        tonumber(state.lightRegionWorstMs) or 0,
+        math.floor(tonumber(state.lightColumnOps) or 0),
+        math.floor(tonumber(state.lightDarkOps) or 0),
+        math.floor(tonumber(state.lightFloodOps) or 0)
+      )
+      count = count + 1
+      lines[count] = string.format(
+        'LEns: Calls %d  U %.2f  Ops C/D/F %d/%d/%d',
+        math.floor(tonumber(state.lightEnsureCalls) or 0),
+        tonumber(state.lightEnsureUpdateMs) or 0,
+        math.floor(tonumber(state.lightEnsureColumnOps) or 0),
+        math.floor(tonumber(state.lightEnsureDarkOps) or 0),
+        math.floor(tonumber(state.lightEnsureFloodOps) or 0)
+      )
+      count = count + 1
+      lines[count] = string.format(
+        'LSkip: C/D/F %d/%d/%d  Cap %d/%d/%d  FCap %d',
+        math.floor(tonumber(state.lightQueueSkipColumns) or 0),
+        math.floor(tonumber(state.lightQueueSkipDark) or 0),
+        math.floor(tonumber(state.lightQueueSkipFlood) or 0),
+        math.floor(tonumber(state.lightQueueCapColumns) or 0),
+        math.floor(tonumber(state.lightQueueCapDark) or 0),
+        math.floor(tonumber(state.lightQueueCapFlood) or 0),
+        math.floor(tonumber(state.lightFloodCapHits) or 0)
+      )
+      count = count + 1
+      lines[count] = string.format(
+        'LMax: C %.2f (W %.2f) D %.2f (W %.2f) F %.2f (W %.2f)  Partial %d (W %d)',
+        tonumber(state.lightMaxColumnMs) or 0,
+        tonumber(state.lightMaxColumnWorstMs) or 0,
+        tonumber(state.lightMaxDarkMs) or 0,
+        tonumber(state.lightMaxDarkWorstMs) or 0,
+        tonumber(state.lightMaxFloodMs) or 0,
+        tonumber(state.lightMaxFloodWorstMs) or 0,
+        math.floor(tonumber(state.lightColumnPartialOps) or 0),
+        math.floor(tonumber(state.lightColumnPartialOpsWorst) or 0)
       )
     end
     if (state.enqueuedTimer or 0) > 0 then
@@ -693,10 +779,34 @@ function HUD:draw(pass, state)
 
   local debugText = self._hudText
   if debugText ~= '' then
-    local panelW = 0.57
-    local panelH = 0.024 + self._hudLineCount * 0.028
-    local panelX = -0.70
-    local panelY = 0.500
+    local lineCount = math.max(1, math.floor(tonumber(self._hudLineCount) or 1))
+    local showPerfHud = state.showPerfHud ~= false
+
+    local panelW = showPerfHud and 0.90 or 0.62
+    panelW = panelW + math.min(0.06, math.max(0, (lineCount - 16) * 0.01))
+    panelW = clamp(panelW, 0.62, 0.96)
+
+    local textScale = showPerfHud and 0.0155 or 0.0175
+    local lineHeight = textScale * 1.44
+    local panelPadY = 0.014
+    local panelH = panelPadY * 2 + lineCount * lineHeight
+
+    local panelTop = 0.705
+    local panelBottomLimit = -0.66
+    local maxPanelH = panelTop - panelBottomLimit
+    if panelH > maxPanelH then
+      lineHeight = math.max(0.0150, (maxPanelH - panelPadY * 2) / lineCount)
+      textScale = math.max(0.0110, math.min(textScale, lineHeight / 1.44))
+      panelH = panelPadY * 2 + lineCount * lineHeight
+    end
+
+    local panelLeft = -0.985
+    local panelX = panelLeft + panelW * 0.5
+    local panelY = panelTop - panelH * 0.5
+    if panelY - panelH * 0.5 < panelBottomLimit then
+      panelY = panelBottomLimit + panelH * 0.5
+    end
+
     self:_plane(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, panelX, panelY, panelW + 0.008, panelH + 0.008, 0.15, 0.18, 0.22, 0.32, 0.0002)
     self:_plane(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, panelX, panelY, panelW, panelH, 0.05, 0.06, 0.07, 0.74, 0.0001)
 
@@ -711,15 +821,15 @@ function HUD:draw(pass, state)
       forward,
       debugText,
       panelX - panelW * 0.5 + 0.012,
-      panelY + panelH * 0.5 - 0.012,
-      0.018,
+      panelY + panelH * 0.5 - panelPadY + 0.002,
+      textScale,
       0.93,
       0.95,
       0.96,
       0.97,
       'left',
       'top',
-      panelW - 0.020
+      0
     )
   end
 

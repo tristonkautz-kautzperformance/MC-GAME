@@ -100,6 +100,22 @@ local function gridToSlotIndex(row, col, hotbarCount, storageCount, storageRows)
   return hotbarCount + storageOrdinal
 end
 
+local function newStagePerfEntry()
+  return {
+    frameMs = 0,
+    worstMs = 0,
+    windowMax = 0,
+    windowTime = 0
+  }
+end
+
+local function getTimerNow()
+  if lovr.timer and lovr.timer.getTime then
+    return lovr.timer.getTime()
+  end
+  return nil
+end
+
 function GameState.new(constants)
   local self = setmetatable({}, GameState)
   self.constants = constants
@@ -153,6 +169,15 @@ function GameState.new(constants)
   self.worstFrameMs = 0
   self._worstFrameWindowMax = 0
   self._worstFrameWindowTime = 0
+  self._stagePerf = {
+    updateTotal = newStagePerfEntry(),
+    updateSim = newStagePerfEntry(),
+    updateLight = newStagePerfEntry(),
+    updateRebuild = newStagePerfEntry(),
+    drawWorld = newStagePerfEntry(),
+    drawRenderer = newStagePerfEntry()
+  }
+  self._skyLightPassesLastFrame = 0
   self.relativeMouseReady = false
   self.inventoryMenuOpen = false
   self.inventoryMenuCursorIndex = 1
@@ -199,6 +224,74 @@ function GameState:_updateFrameTiming(dt)
     self._worstFrameWindowTime = self._worstFrameWindowTime - 1.0
     self._worstFrameWindowMax = frameMs
   end
+end
+
+function GameState:_recordStagePerf(name, stageMs, dt)
+  local stages = self._stagePerf
+  if not stages then
+    self._stagePerf = {}
+    stages = self._stagePerf
+  end
+
+  local entry = stages[name]
+  if not entry then
+    entry = newStagePerfEntry()
+    stages[name] = entry
+  end
+
+  local ms = tonumber(stageMs) or 0
+  if ms < 0 then
+    ms = 0
+  end
+
+  entry.frameMs = ms
+  if ms > entry.windowMax then
+    entry.windowMax = ms
+  end
+  entry.worstMs = entry.windowMax
+
+  local delta = tonumber(dt) or 0
+  if delta < 0 then
+    delta = 0
+  end
+  entry.windowTime = entry.windowTime + delta
+  if entry.windowTime >= 1.0 then
+    entry.windowTime = entry.windowTime - 1.0
+    entry.windowMax = ms
+  end
+end
+
+function GameState:_getStagePerf(name)
+  local stages = self._stagePerf
+  local entry = stages and stages[name]
+  if not entry then
+    return 0, 0
+  end
+
+  return tonumber(entry.frameMs) or 0, tonumber(entry.worstMs) or 0
+end
+
+function GameState:_recordUpdateStageMetrics(dt, updateStartTime, simMs, lightMs, rebuildMs)
+  local totalMs = 0
+  local now = getTimerNow()
+  if now and updateStartTime then
+    totalMs = (now - updateStartTime) * 1000
+  end
+
+  self:_recordStagePerf('updateSim', simMs or 0, dt)
+  self:_recordStagePerf('updateLight', lightMs or 0, dt)
+  self:_recordStagePerf('updateRebuild', rebuildMs or 0, dt)
+  self:_recordStagePerf('updateTotal', totalMs, dt)
+end
+
+function GameState:_recordDrawStageMetrics(drawWorldMs, drawRendererMs)
+  local dt = (tonumber(self.frameMs) or 0) * 0.001
+  if dt <= 0 then
+    dt = 1 / 60
+  end
+
+  self:_recordStagePerf('drawWorld', drawWorldMs or 0, dt)
+  self:_recordStagePerf('drawRenderer', drawRendererMs or 0, dt)
 end
 
 function GameState:_getShaderStatusText()
@@ -848,10 +941,18 @@ function GameState:_handleDeathRespawn()
 end
 
 function GameState:_updateGame(dt)
+  local updateStartTime = getTimerNow()
+  local simMs = 0
+  local lightMs = 0
+  local rebuildCallMs = 0
+  local simStartTime = nil
+
   if not self:_hasSession() or not self.input then
     self.mode = 'menu'
     self.menu:setMode('main')
     self:_refreshSaveState()
+    self._skyLightPassesLastFrame = 0
+    self:_recordUpdateStageMetrics(dt, updateStartTime, simMs, lightMs, rebuildCallMs)
     return
   end
 
@@ -893,8 +994,11 @@ function GameState:_updateGame(dt)
 
     self.input:consumeOpenMenu()
     self.input:beginFrame()
+    self._skyLightPassesLastFrame = 0
+    self:_recordUpdateStageMetrics(dt, updateStartTime, simMs, lightMs, rebuildCallMs)
     return
   end
+  simStartTime = getTimerNow()
 
   local dx, dy = self.input:getLookDelta()
   if dx ~= 0 or dy ~= 0 then
@@ -964,6 +1068,12 @@ function GameState:_updateGame(dt)
     local respawnCameraX, respawnCameraY, respawnCameraZ = self.player:getCameraPosition()
     self.renderer:setPriorityOriginWorld(respawnCameraX, respawnCameraY, respawnCameraZ)
     self.input:beginFrame()
+    local simEndTime = getTimerNow()
+    if simStartTime and simEndTime then
+      simMs = (simEndTime - simStartTime) * 1000
+    end
+    self._skyLightPassesLastFrame = 0
+    self:_recordUpdateStageMetrics(dt, updateStartTime, simMs, lightMs, rebuildCallMs)
     return
   end
 
@@ -1003,14 +1113,35 @@ function GameState:_updateGame(dt)
     end
     self.input:onFocus(false)
     self.input:beginFrame()
+    local simEndTime = getTimerNow()
+    if simStartTime and simEndTime then
+      simMs = (simEndTime - simStartTime) * 1000
+    end
+    self._skyLightPassesLastFrame = 0
+    self:_recordUpdateStageMetrics(dt, updateStartTime, simMs, lightMs, rebuildCallMs)
     return
+  end
+
+  local simEndTime = getTimerNow()
+  if simStartTime and simEndTime then
+    simMs = (simEndTime - simStartTime) * 1000
   end
 
   self:_updateAutosave(dt)
   local rebuildMaxPerFrame = self.rebuildMaxPerFrame
   local rebuildMaxMillisPerFrame = self.rebuildMaxMillisPerFrame
+  local skyLightPasses = 0
+  local lightStartTime = getTimerNow()
   if self.world and self.world.updateSkyLight then
-    self.world:updateSkyLight()
+    local lightingConfig = self.constants.LIGHTING or {}
+    local maxSkyLightPasses = math.floor(tonumber(lightingConfig.maxPassesPerFrame) or 1)
+    if maxSkyLightPasses < 1 then
+      maxSkyLightPasses = 1
+    end
+
+    self.world:updateSkyLight(nil, nil, 'main')
+    skyLightPasses = skyLightPasses + 1
+
     local hasUrgentSkyWork = false
     if self.world.hasUrgentSkyLightWork then
       hasUrgentSkyWork = self.world:hasUrgentSkyLightWork() == true
@@ -1023,7 +1154,10 @@ function GameState:_updateGame(dt)
 
     if hasUrgentSkyWork then
       -- Give lighting extra headroom and temporarily throttle meshing when urgent queues are active.
-      self.world:updateSkyLight()
+      if skyLightPasses < maxSkyLightPasses then
+        self.world:updateSkyLight(nil, nil, 'main')
+        skyLightPasses = skyLightPasses + 1
+      end
       if rebuildMaxPerFrame ~= nil then
         rebuildMaxPerFrame = math.floor(rebuildMaxPerFrame * 0.25)
         if rebuildMaxPerFrame < 1 then
@@ -1034,7 +1168,10 @@ function GameState:_updateGame(dt)
         rebuildMaxMillisPerFrame = rebuildMaxMillisPerFrame * 0.5
       end
     elseif hasSkyWork then
-      self.world:updateSkyLight()
+      if skyLightPasses < maxSkyLightPasses then
+        self.world:updateSkyLight(nil, nil, 'main')
+        skyLightPasses = skyLightPasses + 1
+      end
       if rebuildMaxPerFrame ~= nil then
         rebuildMaxPerFrame = math.floor(rebuildMaxPerFrame * 0.5)
         if rebuildMaxPerFrame < 1 then
@@ -1046,8 +1183,22 @@ function GameState:_updateGame(dt)
       end
     end
   end
+
+  local lightEndTime = getTimerNow()
+  if lightStartTime and lightEndTime then
+    lightMs = (lightEndTime - lightStartTime) * 1000
+  end
+  self._skyLightPassesLastFrame = skyLightPasses
+
+  local rebuildStartTime = getTimerNow()
   self.renderer:rebuildDirty(rebuildMaxPerFrame, rebuildMaxMillisPerFrame)
+  local rebuildEndTime = getTimerNow()
+  if rebuildStartTime and rebuildEndTime then
+    rebuildCallMs = (rebuildEndTime - rebuildStartTime) * 1000
+  end
+
   self.input:beginFrame()
+  self:_recordUpdateStageMetrics(dt, updateStartTime, simMs, lightMs, rebuildCallMs)
 end
 
 function GameState:update(dt)
@@ -1072,6 +1223,7 @@ function GameState:draw(pass)
 
   if self.mode == 'menu' then
     self.menu:draw(pass)
+    self:_recordDrawStageMetrics(0, 0)
     return
   end
 
@@ -1079,6 +1231,7 @@ function GameState:draw(pass)
     self.menu:setMode('main')
     self.mode = 'menu'
     self.menu:draw(pass)
+    self:_recordDrawStageMetrics(0, 0)
     return
   end
 
@@ -1095,8 +1248,17 @@ function GameState:draw(pass)
   self._cameraPosition:set(cameraX, cameraY, cameraZ)
   pass:setViewPose(1, self._cameraPosition, cameraOrientation)
 
+  local drawWorldMs = 0
+  local drawRendererMs = 0
+  local drawWorldStartTime = getTimerNow()
+
   self.sky:draw(pass)
+  local drawRendererStartTime = getTimerNow()
   self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, self.voxelShader, self.sky.timeOfDay)
+  local drawRendererEndTime = getTimerNow()
+  if drawRendererStartTime and drawRendererEndTime then
+    drawRendererMs = (drawRendererEndTime - drawRendererStartTime) * 1000
+  end
   if self.mobs then
     self.mobs:draw(pass)
   end
@@ -1104,15 +1266,46 @@ function GameState:draw(pass)
     self.interaction:drawOutline(pass)
   end
 
+  local drawWorldEndTime = getTimerNow()
+  if drawWorldStartTime and drawWorldEndTime then
+    drawWorldMs = (drawWorldEndTime - drawWorldStartTime) * 1000
+  end
+  self:_recordDrawStageMetrics(drawWorldMs, drawRendererMs)
+
   local visibleCount, rebuilds, dirtyDrained, dirtyQueued, rebuildMs, rebuildBudgetMs, pruneScanned, pruneRemoved, prunePendingFlag = self.renderer:getLastFrameStats()
   local dirtyQueue = self.renderer:getDirtyQueueSize()
   local threadCoreCount, threadWorkerCount, threadTargetWorkers, threadActiveMeshingThreads, threadPoolActive = 1, 0, 0, 1, false
   if self.renderer and self.renderer.getThreadingPerfStats then
     threadCoreCount, threadWorkerCount, threadTargetWorkers, threadActiveMeshingThreads, threadPoolActive = self.renderer:getThreadingPerfStats()
   end
+  local threadQueuePrepOps, threadQueuePrepMs, threadQueuePrepDeferred, threadApplyResults, threadApplyMs = 0, 0, 0, 0, 0
+  local threadPrepEnsureMs, threadPrepBlockHaloMs, threadPrepSkyHaloMs, threadPrepPackMs, threadPrepPushMs = 0, 0, 0, 0, 0
+  if self.renderer and self.renderer.getThreadingFrameStats then
+    threadQueuePrepOps, threadQueuePrepMs, threadQueuePrepDeferred, threadApplyResults, threadApplyMs,
+      threadPrepEnsureMs, threadPrepBlockHaloMs, threadPrepSkyHaloMs, threadPrepPackMs, threadPrepPushMs = self.renderer:getThreadingFrameStats()
+  end
   local lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = 0, 0, 0, 1
+  local lightUpdateMs, lightRegionMs = 0, 0
+  local lightColumnOps, lightDarkOps, lightFloodOps = 0, 0, 0
+  local lightQueueSkipColumns, lightQueueSkipDark, lightQueueSkipFlood = 0, 0, 0
+  local lightQueueCapColumns, lightQueueCapDark, lightQueueCapFlood = 0, 0, 0
+  local lightColumnPartialOps, lightMaxColumnMs, lightMaxDarkMs, lightMaxFloodMs = 0, 0, 0, 0
+  local lightUpdateWorstMs, lightRegionWorstMs = 0, 0
+  local lightMaxColumnWorstMs, lightMaxDarkWorstMs, lightMaxFloodWorstMs = 0, 0, 0
+  local lightColumnPartialOpsWorst, lightFloodCapHits = 0, 0
+  local lightEnsureCalls, lightEnsureUpdateMs = 0, 0
+  local lightEnsureColumnOps, lightEnsureDarkOps, lightEnsureFloodOps = 0, 0, 0
   if self.world and self.world.getLightingPerfStats then
-    lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale = self.world:getLightingPerfStats()
+    lightStripOps, lightStripPending, lightStripTasks, chunkEnsureScale,
+      lightUpdateMs, lightRegionMs, lightColumnOps, lightDarkOps, lightFloodOps,
+      lightQueueSkipColumns, lightQueueSkipDark, lightQueueSkipFlood,
+      lightQueueCapColumns, lightQueueCapDark, lightQueueCapFlood,
+      lightColumnPartialOps, lightMaxColumnMs, lightMaxDarkMs, lightMaxFloodMs,
+      lightUpdateWorstMs, lightRegionWorstMs,
+      lightMaxColumnWorstMs, lightMaxDarkWorstMs, lightMaxFloodWorstMs,
+      lightColumnPartialOpsWorst, lightFloodCapHits,
+      lightEnsureCalls, lightEnsureUpdateMs,
+      lightEnsureColumnOps, lightEnsureDarkOps, lightEnsureFloodOps = self.world:getLightingPerfStats()
   end
   local stats = self.stats
   local mobTargetName = self.mobs and self.mobs:getTargetName() or 'None'
@@ -1120,6 +1313,12 @@ function GameState:draw(pass)
   local targetName = mobTargetName ~= 'None' and mobTargetName or blockTargetName
   local targetActive = mobTargetName ~= 'None' or self.interaction.targetHit ~= nil
   local shaderStatusText = self:_getShaderStatusText()
+  local updateTotalMs, updateTotalWorstMs = self:_getStagePerf('updateTotal')
+  local updateSimMs, updateSimWorstMs = self:_getStagePerf('updateSim')
+  local updateLightMs, updateLightWorstMs = self:_getStagePerf('updateLight')
+  local updateRebuildMs, updateRebuildWorstMs = self:_getStagePerf('updateRebuild')
+  local drawWorldStageMs, drawWorldWorstMs = self:_getStagePerf('drawWorld')
+  local drawRendererStageMs, drawRendererWorstMs = self:_getStagePerf('drawRenderer')
   if self.inventoryMenuOpen then
     targetName = 'None'
     targetActive = false
@@ -1163,11 +1362,34 @@ function GameState:draw(pass)
   hudState.dirtyQueued = dirtyQueued
   hudState.rebuildMs = rebuildMs
   hudState.rebuildBudgetMs = rebuildBudgetMs
+  hudState.stageUpdateTotalMs = updateTotalMs
+  hudState.stageUpdateTotalWorstMs = updateTotalWorstMs
+  hudState.stageUpdateSimMs = updateSimMs
+  hudState.stageUpdateSimWorstMs = updateSimWorstMs
+  hudState.stageUpdateLightMs = updateLightMs
+  hudState.stageUpdateLightWorstMs = updateLightWorstMs
+  hudState.stageUpdateRebuildMs = updateRebuildMs
+  hudState.stageUpdateRebuildWorstMs = updateRebuildWorstMs
+  hudState.stageDrawWorldMs = drawWorldStageMs
+  hudState.stageDrawWorldWorstMs = drawWorldWorstMs
+  hudState.stageDrawRendererMs = drawRendererStageMs
+  hudState.stageDrawRendererWorstMs = drawRendererWorstMs
+  hudState.skyLightPasses = self._skyLightPassesLastFrame or 0
   hudState.threadCoreCount = threadCoreCount
   hudState.threadWorkerCount = threadWorkerCount
   hudState.threadTargetWorkers = threadTargetWorkers
   hudState.threadActiveMeshingThreads = threadActiveMeshingThreads
   hudState.threadPoolActive = threadPoolActive
+  hudState.threadQueuePrepOps = threadQueuePrepOps
+  hudState.threadQueuePrepMs = threadQueuePrepMs
+  hudState.threadQueuePrepDeferred = threadQueuePrepDeferred
+  hudState.threadApplyResults = threadApplyResults
+  hudState.threadApplyMs = threadApplyMs
+  hudState.threadPrepEnsureMs = threadPrepEnsureMs
+  hudState.threadPrepBlockHaloMs = threadPrepBlockHaloMs
+  hudState.threadPrepSkyHaloMs = threadPrepSkyHaloMs
+  hudState.threadPrepPackMs = threadPrepPackMs
+  hudState.threadPrepPushMs = threadPrepPushMs
   hudState.pruneScanned = pruneScanned
   hudState.pruneRemoved = pruneRemoved
   hudState.prunePending = prunePendingFlag == 1
@@ -1175,6 +1397,33 @@ function GameState:draw(pass)
   hudState.lightStripPending = lightStripPending
   hudState.lightStripTasks = lightStripTasks
   hudState.chunkEnsureScale = chunkEnsureScale
+  hudState.lightUpdateMs = lightUpdateMs
+  hudState.lightRegionMs = lightRegionMs
+  hudState.lightColumnOps = lightColumnOps
+  hudState.lightDarkOps = lightDarkOps
+  hudState.lightFloodOps = lightFloodOps
+  hudState.lightQueueSkipColumns = lightQueueSkipColumns
+  hudState.lightQueueSkipDark = lightQueueSkipDark
+  hudState.lightQueueSkipFlood = lightQueueSkipFlood
+  hudState.lightQueueCapColumns = lightQueueCapColumns
+  hudState.lightQueueCapDark = lightQueueCapDark
+  hudState.lightQueueCapFlood = lightQueueCapFlood
+  hudState.lightColumnPartialOps = lightColumnPartialOps
+  hudState.lightMaxColumnMs = lightMaxColumnMs
+  hudState.lightMaxDarkMs = lightMaxDarkMs
+  hudState.lightMaxFloodMs = lightMaxFloodMs
+  hudState.lightUpdateWorstMs = lightUpdateWorstMs
+  hudState.lightRegionWorstMs = lightRegionWorstMs
+  hudState.lightMaxColumnWorstMs = lightMaxColumnWorstMs
+  hudState.lightMaxDarkWorstMs = lightMaxDarkWorstMs
+  hudState.lightMaxFloodWorstMs = lightMaxFloodWorstMs
+  hudState.lightColumnPartialOpsWorst = lightColumnPartialOpsWorst
+  hudState.lightFloodCapHits = lightFloodCapHits
+  hudState.lightEnsureCalls = lightEnsureCalls
+  hudState.lightEnsureUpdateMs = lightEnsureUpdateMs
+  hudState.lightEnsureColumnOps = lightEnsureColumnOps
+  hudState.lightEnsureDarkOps = lightEnsureDarkOps
+  hudState.lightEnsureFloodOps = lightEnsureFloodOps
   hudState.enqueuedCount = self._enqueuedCount
   hudState.enqueuedTimer = self._enqueuedTimer
   self.hud:draw(pass, hudState)

@@ -341,10 +341,10 @@ function ChunkWorld:fillSkyLightHalo(cx, cy, cz, out)
   return nil
 end
 
-function ChunkWorld:updateSkyLight(maxOps, maxMillis)
+function ChunkWorld:updateSkyLight(maxOps, maxMillis, sourceTag)
   local backend = self._lightingBackend
   if backend and backend.updateSkyLight then
-    return backend:updateSkyLight(maxOps, maxMillis)
+    return backend:updateSkyLight(maxOps, maxMillis, sourceTag)
   end
   return 0
 end
@@ -361,7 +361,7 @@ function ChunkWorld:getLightingPerfStats()
   if backend and backend.getPerfStats then
     return backend:getPerfStats()
   end
-  return 0, 0, 0, 1
+  return 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 end
 
 function ChunkWorld:hasUrgentSkyLightWork()
@@ -1176,13 +1176,13 @@ function ChunkWorld:drainDirtyChunkKeys(out)
   for key in pairs(self._dirty) do
     count = count + 1
     out[count] = key
+    self._dirty[key] = nil
   end
 
   for i = count + 1, #out do
     out[i] = nil
   end
 
-  self._dirty = {}
   return count
 end
 

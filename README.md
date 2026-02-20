@@ -25,14 +25,13 @@ Simple Minecraft-style prototype in Lua using LOVR.
   - Health regeneration is enabled only above a hunger threshold
   - On death (health reaches 0), player respawns at world spawn with full health/hunger
   - Respawn grants a short damage-immunity window to avoid instant death loops
-- Lightweight mobs:
-  - Sheep (passive ambient mobs)
-  - Ghost (hostile mob) spawns at night only and damages player on contact
-  - Spawn caps are intentionally low for early perf safety
+- Lightweight mob systems (temporarily disabled in gameplay):
+  - Sheep and Ghost implementations remain in code for future use
+  - Default spawn caps are set to `0`, so no mobs spawn right now
   - Mob AI runs on a fixed tick and is temporarily skipped during heavy chunk-rebuild backlog
 - Combat starter:
   - Added Sword item to hotbar
-  - Left click attacks targeted mobs; sword deals higher damage than hand hits
+  - Left click attacks targeted mobs (when enabled); sword deals higher damage than hand hits
 - Day/night cycle with animated sky color and sun/moon
 - Seeded procedural terrain (height + beaches + sea level) with sparse edit/feature overlays (no eager per-voxel base storage)
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling + mesh cache pruning
@@ -56,7 +55,7 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - `WASD`: move
 - `Mouse`: look (when captured)
 - `Space`: jump
-- `Left Mouse`: click to capture mouse, then attack mob / break block
+- `Left Mouse`: click to capture mouse, then attack / break block
 - `Right Mouse`: place selected block (when captured)
 - `Mouse Wheel`: cycle hotbar
 - `1-8`: select hotbar slot

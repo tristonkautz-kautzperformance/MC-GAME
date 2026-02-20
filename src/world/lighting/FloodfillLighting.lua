@@ -16,6 +16,15 @@ local function asBool(v)
   return v and true or false
 end
 
+local function newLightPerfEntry()
+  return {
+    frame = 0,
+    worst = 0,
+    windowMax = 0,
+    windowTime = 0
+  }
+end
+
 function FloodfillLighting.new(world, options)
   local self = setmetatable({}, FloodfillLighting)
   self.world = world
@@ -39,6 +48,7 @@ function FloodfillLighting:reset()
   self.skyColumnsQueueHead = 1
   self.skyColumnsQueueTail = 0
   self.skyColumnsUrgentCount = 0
+  self.skyColumnProgress = {}
 
   self.skyFloodQueue = {}
   self.skyFloodQueueSet = {}
@@ -89,6 +99,93 @@ function FloodfillLighting:reset()
   self._frameMsHint = 0
   self._worstFrameMsHint = 0
   self._chunkEnsureScaleLast = 1
+  self._dequeueScanLimitCurrent = 0
+  self._lightUpdateMsLast = 0
+  self._lightRegionMsLast = 0
+  self._lightColumnOpsLast = 0
+  self._lightDarkOpsLast = 0
+  self._lightFloodOpsLast = 0
+  self._lightQueueSkipColumnsLast = 0
+  self._lightQueueSkipDarkLast = 0
+  self._lightQueueSkipFloodLast = 0
+  self._lightQueueCapColumnsLast = 0
+  self._lightQueueCapDarkLast = 0
+  self._lightQueueCapFloodLast = 0
+  self._lightColumnPartialOpsLast = 0
+  self._lightMaxColumnMsLast = 0
+  self._lightMaxDarkMsLast = 0
+  self._lightMaxFloodMsLast = 0
+  self._lightUpdateWorstMsLast = 0
+  self._lightRegionWorstMsLast = 0
+  self._lightMaxColumnWorstMsLast = 0
+  self._lightMaxDarkWorstMsLast = 0
+  self._lightMaxFloodWorstMsLast = 0
+  self._lightColumnPartialOpsWorstLast = 0
+  self._lightFloodCapHitsLast = 0
+  self._lightEnsureCallsLast = 0
+  self._lightEnsureUpdateMsLast = 0
+  self._lightEnsureColumnOpsLast = 0
+  self._lightEnsureDarkOpsLast = 0
+  self._lightEnsureFloodOpsLast = 0
+  self._lightPerf = {
+    updateMs = newLightPerfEntry(),
+    regionMs = newLightPerfEntry(),
+    maxColumnMs = newLightPerfEntry(),
+    maxDarkMs = newLightPerfEntry(),
+    maxFloodMs = newLightPerfEntry(),
+    partialOps = newLightPerfEntry()
+  }
+  self._lightPerfFrameToken = 0
+  self._lightPerfLastRecordedToken = -1
+  self:_resetLightFrameMetrics()
+end
+
+function FloodfillLighting:_resetLightFrameMetrics()
+  self._lightMainUpdateMsFrame = 0
+  self._lightMainRegionMsFrame = 0
+  self._lightMainColumnOpsFrame = 0
+  self._lightMainDarkOpsFrame = 0
+  self._lightMainFloodOpsFrame = 0
+  self._lightMainQueueSkipColumnsFrame = 0
+  self._lightMainQueueSkipDarkFrame = 0
+  self._lightMainQueueSkipFloodFrame = 0
+  self._lightMainQueueCapColumnsFrame = 0
+  self._lightMainQueueCapDarkFrame = 0
+  self._lightMainQueueCapFloodFrame = 0
+  self._lightMainColumnPartialOpsFrame = 0
+  self._lightMainMaxColumnMsFrame = 0
+  self._lightMainMaxDarkMsFrame = 0
+  self._lightMainMaxFloodMsFrame = 0
+  self._lightMainFloodCapHitsFrame = 0
+
+  self._lightEnsureCallsFrame = 0
+  self._lightEnsureUpdateMsFrame = 0
+  self._lightEnsureColumnOpsFrame = 0
+  self._lightEnsureDarkOpsFrame = 0
+  self._lightEnsureFloodOpsFrame = 0
+
+  self._lightUpdateMsLast = 0
+  self._lightRegionMsLast = 0
+  self._lightColumnOpsLast = 0
+  self._lightDarkOpsLast = 0
+  self._lightFloodOpsLast = 0
+  self._lightQueueSkipColumnsLast = 0
+  self._lightQueueSkipDarkLast = 0
+  self._lightQueueSkipFloodLast = 0
+  self._lightQueueCapColumnsLast = 0
+  self._lightQueueCapDarkLast = 0
+  self._lightQueueCapFloodLast = 0
+  self._lightColumnPartialOpsLast = 0
+  self._lightMaxColumnMsLast = 0
+  self._lightMaxDarkMsLast = 0
+  self._lightMaxFloodMsLast = 0
+  self._lightFloodCapHitsLast = 0
+
+  self._lightEnsureCallsLast = 0
+  self._lightEnsureUpdateMsLast = 0
+  self._lightEnsureColumnOpsLast = 0
+  self._lightEnsureDarkOpsLast = 0
+  self._lightEnsureFloodOpsLast = 0
 end
 
 function FloodfillLighting:_getBlockLightOpacity(block)
@@ -386,7 +483,7 @@ function FloodfillLighting:_processRegionTasks(maxOps, maxMillis)
     if opsLimit and opsLimit > 0 and processed >= opsLimit then
       break
     end
-    if useTimeBudget and processed > 0 then
+    if useTimeBudget then
       local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
       if elapsedMs >= millisLimit then
         break
@@ -405,6 +502,7 @@ function FloodfillLighting:_processRegionTasks(maxOps, maxMillis)
         if self:_isInsideSkyActiveWorldXZ(x, task.z) then
           local columnKey = world:_worldColumnKey(x, task.z)
           self.skyColumnsReady[columnKey] = nil
+          self.skyColumnProgress[columnKey] = nil
           self:_enqueueSkyColumn(columnKey, task.urgent)
         end
         task.x = x + 1
@@ -413,7 +511,9 @@ function FloodfillLighting:_processRegionTasks(maxOps, maxMillis)
     elseif task.kind == 'remove_ready_row' then
       local x = task.x
       if x and x <= task.x1 then
-        self.skyColumnsReady[world:_worldColumnKey(x, task.z)] = nil
+        local columnKey = world:_worldColumnKey(x, task.z)
+        self.skyColumnsReady[columnKey] = nil
+        self.skyColumnProgress[columnKey] = nil
         task.x = x + 1
         stepDone = true
       end
@@ -443,13 +543,205 @@ end
 function FloodfillLighting:setFrameTiming(frameMs, worstFrameMs)
   self._frameMsHint = tonumber(frameMs) or 0
   self._worstFrameMsHint = tonumber(worstFrameMs) or self._frameMsHint
+  self._lightPerfFrameToken = (self._lightPerfFrameToken or 0) + 1
+  self:_resetLightFrameMetrics()
+end
+
+function FloodfillLighting:_recordLightPerf(name, value, dt)
+  local perf = self._lightPerf
+  if not perf then
+    perf = {}
+    self._lightPerf = perf
+  end
+
+  local entry = perf[name]
+  if not entry then
+    entry = newLightPerfEntry()
+    perf[name] = entry
+  end
+
+  local sample = tonumber(value) or 0
+  if sample < 0 then
+    sample = 0
+  end
+
+  if dt > 0 then
+    entry.frame = sample
+  elseif sample > (tonumber(entry.frame) or 0) then
+    entry.frame = sample
+  end
+  if sample > entry.windowMax then
+    entry.windowMax = sample
+  end
+  entry.worst = entry.windowMax
+
+  local delta = tonumber(dt) or 0
+  if delta < 0 then
+    delta = 0
+  end
+  entry.windowTime = entry.windowTime + delta
+  if entry.windowTime >= 1.0 then
+    entry.windowTime = entry.windowTime - 1.0
+    entry.windowMax = sample
+  end
+end
+
+function FloodfillLighting:_getLightPerf(name)
+  local perf = self._lightPerf
+  local entry = perf and perf[name]
+  if not entry then
+    return 0, 0
+  end
+  return tonumber(entry.frame) or 0, tonumber(entry.worst) or 0
+end
+
+function FloodfillLighting:_recordLightPerfFrame(updateMs, regionMs, maxColumnMs, maxDarkMs, maxFloodMs, partialOps)
+  local dt = 0
+  local frameToken = self._lightPerfFrameToken or 0
+  if self._lightPerfLastRecordedToken ~= frameToken then
+    dt = (tonumber(self._frameMsHint) or 0) * 0.001
+    if dt <= 0 then
+      dt = 1 / 60
+    end
+    self._lightPerfLastRecordedToken = frameToken
+  end
+
+  self:_recordLightPerf('updateMs', updateMs or 0, dt)
+  self:_recordLightPerf('regionMs', regionMs or 0, dt)
+  self:_recordLightPerf('maxColumnMs', maxColumnMs or 0, dt)
+  self:_recordLightPerf('maxDarkMs', maxDarkMs or 0, dt)
+  self:_recordLightPerf('maxFloodMs', maxFloodMs or 0, dt)
+  self:_recordLightPerf('partialOps', partialOps or 0, dt)
+
+  local _, updateWorst = self:_getLightPerf('updateMs')
+  local _, regionWorst = self:_getLightPerf('regionMs')
+  local _, columnWorst = self:_getLightPerf('maxColumnMs')
+  local _, darkWorst = self:_getLightPerf('maxDarkMs')
+  local _, floodWorst = self:_getLightPerf('maxFloodMs')
+  local _, partialWorst = self:_getLightPerf('partialOps')
+  self._lightUpdateWorstMsLast = updateWorst
+  self._lightRegionWorstMsLast = regionWorst
+  self._lightMaxColumnWorstMsLast = columnWorst
+  self._lightMaxDarkWorstMsLast = darkWorst
+  self._lightMaxFloodWorstMsLast = floodWorst
+  self._lightColumnPartialOpsWorstLast = partialWorst
+end
+
+function FloodfillLighting:_accumulateLightCallMetrics(sourceTag, updateMs, regionMs, columnOps, darkOps, floodOps, queueSkipColumns, queueSkipDark, queueSkipFlood, queueCapColumns, queueCapDark, queueCapFlood, columnPartialOps, maxColumnMs, maxDarkMs, maxFloodMs, floodCapHits)
+  local source = sourceTag == 'main' and 'main' or 'ensure'
+
+  updateMs = tonumber(updateMs) or 0
+  regionMs = tonumber(regionMs) or 0
+  columnOps = math.floor(tonumber(columnOps) or 0)
+  darkOps = math.floor(tonumber(darkOps) or 0)
+  floodOps = math.floor(tonumber(floodOps) or 0)
+  queueSkipColumns = math.floor(tonumber(queueSkipColumns) or 0)
+  queueSkipDark = math.floor(tonumber(queueSkipDark) or 0)
+  queueSkipFlood = math.floor(tonumber(queueSkipFlood) or 0)
+  queueCapColumns = math.floor(tonumber(queueCapColumns) or 0)
+  queueCapDark = math.floor(tonumber(queueCapDark) or 0)
+  queueCapFlood = math.floor(tonumber(queueCapFlood) or 0)
+  columnPartialOps = math.floor(tonumber(columnPartialOps) or 0)
+  maxColumnMs = tonumber(maxColumnMs) or 0
+  maxDarkMs = tonumber(maxDarkMs) or 0
+  maxFloodMs = tonumber(maxFloodMs) or 0
+  floodCapHits = math.floor(tonumber(floodCapHits) or 0)
+
+  if source == 'main' then
+    self._lightMainUpdateMsFrame = self._lightMainUpdateMsFrame + updateMs
+    self._lightMainRegionMsFrame = self._lightMainRegionMsFrame + regionMs
+    self._lightMainColumnOpsFrame = self._lightMainColumnOpsFrame + columnOps
+    self._lightMainDarkOpsFrame = self._lightMainDarkOpsFrame + darkOps
+    self._lightMainFloodOpsFrame = self._lightMainFloodOpsFrame + floodOps
+    self._lightMainQueueSkipColumnsFrame = self._lightMainQueueSkipColumnsFrame + queueSkipColumns
+    self._lightMainQueueSkipDarkFrame = self._lightMainQueueSkipDarkFrame + queueSkipDark
+    self._lightMainQueueSkipFloodFrame = self._lightMainQueueSkipFloodFrame + queueSkipFlood
+    self._lightMainQueueCapColumnsFrame = self._lightMainQueueCapColumnsFrame + queueCapColumns
+    self._lightMainQueueCapDarkFrame = self._lightMainQueueCapDarkFrame + queueCapDark
+    self._lightMainQueueCapFloodFrame = self._lightMainQueueCapFloodFrame + queueCapFlood
+    self._lightMainColumnPartialOpsFrame = self._lightMainColumnPartialOpsFrame + columnPartialOps
+    self._lightMainFloodCapHitsFrame = self._lightMainFloodCapHitsFrame + floodCapHits
+    if maxColumnMs > self._lightMainMaxColumnMsFrame then
+      self._lightMainMaxColumnMsFrame = maxColumnMs
+    end
+    if maxDarkMs > self._lightMainMaxDarkMsFrame then
+      self._lightMainMaxDarkMsFrame = maxDarkMs
+    end
+    if maxFloodMs > self._lightMainMaxFloodMsFrame then
+      self._lightMainMaxFloodMsFrame = maxFloodMs
+    end
+
+    self._lightUpdateMsLast = self._lightMainUpdateMsFrame
+    self._lightRegionMsLast = self._lightMainRegionMsFrame
+    self._lightColumnOpsLast = self._lightMainColumnOpsFrame
+    self._lightDarkOpsLast = self._lightMainDarkOpsFrame
+    self._lightFloodOpsLast = self._lightMainFloodOpsFrame
+    self._lightQueueSkipColumnsLast = self._lightMainQueueSkipColumnsFrame
+    self._lightQueueSkipDarkLast = self._lightMainQueueSkipDarkFrame
+    self._lightQueueSkipFloodLast = self._lightMainQueueSkipFloodFrame
+    self._lightQueueCapColumnsLast = self._lightMainQueueCapColumnsFrame
+    self._lightQueueCapDarkLast = self._lightMainQueueCapDarkFrame
+    self._lightQueueCapFloodLast = self._lightMainQueueCapFloodFrame
+    self._lightColumnPartialOpsLast = self._lightMainColumnPartialOpsFrame
+    self._lightMaxColumnMsLast = self._lightMainMaxColumnMsFrame
+    self._lightMaxDarkMsLast = self._lightMainMaxDarkMsFrame
+    self._lightMaxFloodMsLast = self._lightMainMaxFloodMsFrame
+    self._lightFloodCapHitsLast = self._lightMainFloodCapHitsFrame
+    self:_recordLightPerfFrame(
+      self._lightUpdateMsLast,
+      self._lightRegionMsLast,
+      self._lightMaxColumnMsLast,
+      self._lightMaxDarkMsLast,
+      self._lightMaxFloodMsLast,
+      self._lightColumnPartialOpsLast
+    )
+    return
+  end
+
+  self._lightEnsureCallsFrame = self._lightEnsureCallsFrame + 1
+  self._lightEnsureUpdateMsFrame = self._lightEnsureUpdateMsFrame + updateMs
+  self._lightEnsureColumnOpsFrame = self._lightEnsureColumnOpsFrame + columnOps
+  self._lightEnsureDarkOpsFrame = self._lightEnsureDarkOpsFrame + darkOps
+  self._lightEnsureFloodOpsFrame = self._lightEnsureFloodOpsFrame + floodOps
+  self._lightEnsureCallsLast = self._lightEnsureCallsFrame
+  self._lightEnsureUpdateMsLast = self._lightEnsureUpdateMsFrame
+  self._lightEnsureColumnOpsLast = self._lightEnsureColumnOpsFrame
+  self._lightEnsureDarkOpsLast = self._lightEnsureDarkOpsFrame
+  self._lightEnsureFloodOpsLast = self._lightEnsureFloodOpsFrame
 end
 
 function FloodfillLighting:getPerfStats()
   return self.skyRegionOpsProcessedLast or 0,
     self.skyRegionOpsPending or 0,
     self.skyRegionTaskCount or 0,
-    self._chunkEnsureScaleLast or 1
+    self._chunkEnsureScaleLast or 1,
+    self._lightUpdateMsLast or 0,
+    self._lightRegionMsLast or 0,
+    self._lightColumnOpsLast or 0,
+    self._lightDarkOpsLast or 0,
+    self._lightFloodOpsLast or 0,
+    self._lightQueueSkipColumnsLast or 0,
+    self._lightQueueSkipDarkLast or 0,
+    self._lightQueueSkipFloodLast or 0,
+    self._lightQueueCapColumnsLast or 0,
+    self._lightQueueCapDarkLast or 0,
+    self._lightQueueCapFloodLast or 0,
+    self._lightColumnPartialOpsLast or 0,
+    self._lightMaxColumnMsLast or 0,
+    self._lightMaxDarkMsLast or 0,
+    self._lightMaxFloodMsLast or 0,
+    self._lightUpdateWorstMsLast or 0,
+    self._lightRegionWorstMsLast or 0,
+    self._lightMaxColumnWorstMsLast or 0,
+    self._lightMaxDarkWorstMsLast or 0,
+    self._lightMaxFloodWorstMsLast or 0,
+    self._lightColumnPartialOpsWorstLast or 0,
+    self._lightFloodCapHitsLast or 0,
+    self._lightEnsureCallsLast or 0,
+    self._lightEnsureUpdateMsLast or 0,
+    self._lightEnsureColumnOpsLast or 0,
+    self._lightEnsureDarkOpsLast or 0,
+    self._lightEnsureFloodOpsLast or 0
 end
 
 function FloodfillLighting:hasUrgentSkyWork()
@@ -493,12 +785,16 @@ end
 function FloodfillLighting:_dequeueSkyColumn()
   local queue = self.skyColumnsQueue
   local set = self.skyColumnsQueueSet
+  local scanLimit = self._dequeueScanLimitCurrent or 0
+  local scanned = 0
+  local skipped = 0
 
   while self.skyColumnsQueueHead <= self.skyColumnsQueueTail do
     local head = self.skyColumnsQueueHead
     local columnKey = queue[head]
     queue[head] = nil
     self.skyColumnsQueueHead = head + 1
+    scanned = scanned + 1
 
     if columnKey ~= nil then
       local priority = set[columnKey]
@@ -511,14 +807,19 @@ function FloodfillLighting:_dequeueSkyColumn()
           self.skyColumnsQueueHead = 1
           self.skyColumnsQueueTail = 0
         end
-        return columnKey, priority == 1
+        return columnKey, priority == 1, skipped, false
       end
+    end
+
+    skipped = skipped + 1
+    if scanLimit > 0 and scanned >= scanLimit then
+      return nil, false, skipped, true
     end
   end
 
   self.skyColumnsQueueHead = 1
   self.skyColumnsQueueTail = 0
-  return nil, false
+  return nil, false, skipped, false
 end
 
 function FloodfillLighting:_clearSkyColumnsQueue()
@@ -527,6 +828,7 @@ function FloodfillLighting:_clearSkyColumnsQueue()
   self.skyColumnsQueueHead = 1
   self.skyColumnsQueueTail = 0
   self.skyColumnsUrgentCount = 0
+  self.skyColumnProgress = {}
 end
 
 function FloodfillLighting:_enqueueSkyFlood(worldIndex, urgent)
@@ -562,12 +864,16 @@ end
 function FloodfillLighting:_dequeueSkyFlood()
   local queue = self.skyFloodQueue
   local set = self.skyFloodQueueSet
+  local scanLimit = self._dequeueScanLimitCurrent or 0
+  local scanned = 0
+  local skipped = 0
 
   while self.skyFloodQueueHead <= self.skyFloodQueueTail do
     local head = self.skyFloodQueueHead
     local worldIndex = queue[head]
     queue[head] = nil
     self.skyFloodQueueHead = head + 1
+    scanned = scanned + 1
 
     if worldIndex ~= nil then
       local priority = set[worldIndex]
@@ -580,14 +886,19 @@ function FloodfillLighting:_dequeueSkyFlood()
           self.skyFloodQueueHead = 1
           self.skyFloodQueueTail = 0
         end
-        return worldIndex, priority == 1
+        return worldIndex, priority == 1, skipped, false
       end
+    end
+
+    skipped = skipped + 1
+    if scanLimit > 0 and scanned >= scanLimit then
+      return nil, false, skipped, true
     end
   end
 
   self.skyFloodQueueHead = 1
   self.skyFloodQueueTail = 0
-  return nil, false
+  return nil, false, skipped, false
 end
 
 function FloodfillLighting:_clearSkyFloodQueue()
@@ -639,12 +950,16 @@ function FloodfillLighting:_dequeueSkyDark()
   local queue = self.skyDarkQueue
   local levels = self.skyDarkQueueLevels
   local priorities = self.skyDarkQueuePriority
+  local scanLimit = self._dequeueScanLimitCurrent or 0
+  local scanned = 0
+  local skipped = 0
 
   while self.skyDarkQueueHead <= self.skyDarkQueueTail do
     local head = self.skyDarkQueueHead
     local worldIndex = queue[head]
     queue[head] = nil
     self.skyDarkQueueHead = head + 1
+    scanned = scanned + 1
 
     if worldIndex ~= nil then
       local removedLight = levels[worldIndex]
@@ -659,14 +974,19 @@ function FloodfillLighting:_dequeueSkyDark()
           self.skyDarkQueueHead = 1
           self.skyDarkQueueTail = 0
         end
-        return worldIndex, removedLight, priority == 1
+        return worldIndex, removedLight, priority == 1, skipped, false
       end
+    end
+
+    skipped = skipped + 1
+    if scanLimit > 0 and scanned >= scanLimit then
+      return nil, nil, false, skipped, true
     end
   end
 
   self.skyDarkQueueHead = 1
   self.skyDarkQueueTail = 0
-  return nil, nil, false
+  return nil, nil, false, skipped, false
 end
 
 function FloodfillLighting:_clearSkyDarkQueue()
@@ -903,6 +1223,96 @@ function FloodfillLighting:_recomputeSkyColumn(x, z, enqueueFlood, markDirty, se
   return true
 end
 
+function FloodfillLighting:_recomputeSkyColumnSlice(columnKey, x, z, enqueueFlood, markDirty, seedUrgent, maxRows, maxMillis)
+  local world = self.world
+  if x < 1 or x > world.sizeX or z < 1 or z > world.sizeZ then
+    self.skyColumnProgress[columnKey] = nil
+    return true
+  end
+
+  local progressMap = self.skyColumnProgress
+  local progress = progressMap[columnKey]
+  local y = world.sizeY
+  local light = 15
+  if progress then
+    y = math.floor(tonumber(progress.y) or y)
+    light = math.floor(tonumber(progress.light) or light)
+  end
+  if y > world.sizeY then
+    y = world.sizeY
+  elseif y < 1 then
+    y = 1
+  end
+  if light < 0 then
+    light = 0
+  elseif light > 15 then
+    light = 15
+  end
+
+  local rowsLimit = math.floor(tonumber(maxRows) or 0)
+  if rowsLimit < 1 then
+    rowsLimit = 1
+  end
+
+  local hasTimer = lovr and lovr.timer and lovr.timer.getTime
+  local millisLimit = tonumber(maxMillis) or 0
+  local useTimeLimit = hasTimer and millisLimit > 0
+  local startTime = 0
+  if useTimeLimit then
+    startTime = lovr.timer.getTime()
+  end
+
+  local processedRows = 0
+  while y >= 1 do
+    local oldLight = self:_getSkyLightWorld(x, y, z)
+    local block = world:get(x, y, z)
+    local opacity = self:_getBlockLightOpacity(block)
+    light = light - opacity
+    if light < 0 then
+      light = 0
+    end
+
+    if oldLight ~= light then
+      self:_setSkyLightWorld(x, y, z, light, markDirty, true)
+      if enqueueFlood then
+        local worldIndex = world:_worldIndex(x, y, z)
+        if light < oldLight and oldLight > 0 then
+          self:_enqueueSkyDark(worldIndex, oldLight, seedUrgent)
+        elseif light > oldLight and light > 1 then
+          self:_enqueueSkyFlood(worldIndex, seedUrgent)
+        end
+      end
+    end
+
+    y = y - 1
+    processedRows = processedRows + 1
+
+    if processedRows >= rowsLimit then
+      break
+    end
+    if useTimeLimit and (lovr.timer.getTime() - startTime) * 1000 >= millisLimit then
+      break
+    end
+  end
+
+  if y >= 1 then
+    if not progress then
+      progress = {}
+      progressMap[columnKey] = progress
+    end
+    progress.y = y
+    progress.light = light
+    return false
+  end
+
+  progressMap[columnKey] = nil
+  self.skyColumnsReady[columnKey] = true
+  if enqueueFlood then
+    self:_setSkyStageFromQueues()
+  end
+  return true
+end
+
 function FloodfillLighting:_ensureSkyColumnReady(x, z, enqueueFlood, markDirty, seedUrgent)
   local world = self.world
   if x < 1 or x > world.sizeX or z < 1 or z > world.sizeZ then
@@ -986,6 +1396,7 @@ function FloodfillLighting:_scheduleSkyBoundsRebuild(minX, maxX, minZ, maxZ, tra
     for x = bx0, bx1 do
       local columnKey = world:_worldColumnKey(x, z)
       self.skyColumnsReady[columnKey] = nil
+      self.skyColumnProgress[columnKey] = nil
       if self:_enqueueSkyColumn(columnKey, false) then
         queued = queued + 1
       end
@@ -1039,7 +1450,7 @@ function FloodfillLighting:_primeSkyLightAfterOpacityEdit()
     immediateMillis = 0
   end
 
-  return self:updateSkyLight(immediateOps, immediateMillis)
+  return self:updateSkyLight(immediateOps, immediateMillis, 'ensure')
 end
 
 function FloodfillLighting:_drainSkyLightForMeshPrep()
@@ -1058,7 +1469,7 @@ function FloodfillLighting:_drainSkyLightForMeshPrep()
     immediateMillis = 0
   end
 
-  return self:updateSkyLight(immediateOps, immediateMillis)
+  return self:updateSkyLight(immediateOps, immediateMillis, 'ensure')
 end
 
 function FloodfillLighting:_removeSkyLightChunksInBounds(minCx, maxCx, minCz, maxCz)
@@ -1155,56 +1566,154 @@ function FloodfillLighting:_propagateSkyDarkFrom(worldIndex, removedLight, markD
   end
 
   local world = self.world
+  local sizeX = world.sizeX
+  local sizeY = world.sizeY
+  local sizeZ = world.sizeZ
   local x, y, z = world:_decodeWorldIndex(worldIndex)
   if not self:_isInsideSkyPropagationWorldXZ(x, z) then
     return
   end
 
-  local function tryNeighbor(nx, ny, nz)
-    if nx < 1 or nx > world.sizeX then
-      return
-    end
-    if ny < 1 or ny > world.sizeY then
-      return
-    end
-    if nz < 1 or nz > world.sizeZ then
-      return
-    end
-    if not self:_isInsideSkyPropagationWorldXZ(nx, nz) then
-      return
-    end
-
-    local neighborLight = self:_getSkyLightWorld(nx, ny, nz)
-    if neighborLight <= 0 then
-      return
-    end
-
-    local block = world:get(nx, ny, nz)
-    local step = self:_getBlockLightOpacity(block)
-    if step < 1 then
-      step = 1
-    end
-
-    if neighborLight + step <= removedLight then
-      if self:_setSkyLightWorld(nx, ny, nz, 0, markDirty, true) then
-        self:_enqueueSkyDark(world:_worldIndex(nx, ny, nz), neighborLight, urgent)
+  local nx = x - 1
+  if nx >= 1 and nx <= sizeX
+    and self:_isInsideSkyPropagationWorldXZ(nx, z) then
+    local neighborLight = self:_getSkyLightWorld(nx, y, z)
+    if neighborLight > 0 then
+      local block = world:get(nx, y, z)
+      local step = self:_getBlockLightOpacity(block)
+      if step < 1 then
+        step = 1
       end
-    else
-      self:_enqueueSkyFlood(world:_worldIndex(nx, ny, nz), urgent)
+
+      local neighborWorldIndex = world:_worldIndex(nx, y, z)
+      if neighborLight + step <= removedLight then
+        if self:_setSkyLightWorld(nx, y, z, 0, markDirty, true) then
+          self:_enqueueSkyDark(neighborWorldIndex, neighborLight, urgent)
+        end
+      else
+        self:_enqueueSkyFlood(neighborWorldIndex, urgent)
+      end
     end
   end
 
-  tryNeighbor(x - 1, y, z)
-  tryNeighbor(x + 1, y, z)
-  tryNeighbor(x, y - 1, z)
-  tryNeighbor(x, y + 1, z)
-  tryNeighbor(x, y, z - 1)
-  tryNeighbor(x, y, z + 1)
+  nx = x + 1
+  if nx >= 1 and nx <= sizeX
+    and self:_isInsideSkyPropagationWorldXZ(nx, z) then
+    local neighborLight = self:_getSkyLightWorld(nx, y, z)
+    if neighborLight > 0 then
+      local block = world:get(nx, y, z)
+      local step = self:_getBlockLightOpacity(block)
+      if step < 1 then
+        step = 1
+      end
+
+      local neighborWorldIndex = world:_worldIndex(nx, y, z)
+      if neighborLight + step <= removedLight then
+        if self:_setSkyLightWorld(nx, y, z, 0, markDirty, true) then
+          self:_enqueueSkyDark(neighborWorldIndex, neighborLight, urgent)
+        end
+      else
+        self:_enqueueSkyFlood(neighborWorldIndex, urgent)
+      end
+    end
+  end
+
+  local ny = y - 1
+  if ny >= 1 and ny <= sizeY
+    and self:_isInsideSkyPropagationWorldXZ(x, z) then
+    local neighborLight = self:_getSkyLightWorld(x, ny, z)
+    if neighborLight > 0 then
+      local block = world:get(x, ny, z)
+      local step = self:_getBlockLightOpacity(block)
+      if step < 1 then
+        step = 1
+      end
+
+      local neighborWorldIndex = world:_worldIndex(x, ny, z)
+      if neighborLight + step <= removedLight then
+        if self:_setSkyLightWorld(x, ny, z, 0, markDirty, true) then
+          self:_enqueueSkyDark(neighborWorldIndex, neighborLight, urgent)
+        end
+      else
+        self:_enqueueSkyFlood(neighborWorldIndex, urgent)
+      end
+    end
+  end
+
+  ny = y + 1
+  if ny >= 1 and ny <= sizeY
+    and self:_isInsideSkyPropagationWorldXZ(x, z) then
+    local neighborLight = self:_getSkyLightWorld(x, ny, z)
+    if neighborLight > 0 then
+      local block = world:get(x, ny, z)
+      local step = self:_getBlockLightOpacity(block)
+      if step < 1 then
+        step = 1
+      end
+
+      local neighborWorldIndex = world:_worldIndex(x, ny, z)
+      if neighborLight + step <= removedLight then
+        if self:_setSkyLightWorld(x, ny, z, 0, markDirty, true) then
+          self:_enqueueSkyDark(neighborWorldIndex, neighborLight, urgent)
+        end
+      else
+        self:_enqueueSkyFlood(neighborWorldIndex, urgent)
+      end
+    end
+  end
+
+  local nz = z - 1
+  if nz >= 1 and nz <= sizeZ
+    and self:_isInsideSkyPropagationWorldXZ(x, nz) then
+    local neighborLight = self:_getSkyLightWorld(x, y, nz)
+    if neighborLight > 0 then
+      local block = world:get(x, y, nz)
+      local step = self:_getBlockLightOpacity(block)
+      if step < 1 then
+        step = 1
+      end
+
+      local neighborWorldIndex = world:_worldIndex(x, y, nz)
+      if neighborLight + step <= removedLight then
+        if self:_setSkyLightWorld(x, y, nz, 0, markDirty, true) then
+          self:_enqueueSkyDark(neighborWorldIndex, neighborLight, urgent)
+        end
+      else
+        self:_enqueueSkyFlood(neighborWorldIndex, urgent)
+      end
+    end
+  end
+
+  nz = z + 1
+  if nz >= 1 and nz <= sizeZ
+    and self:_isInsideSkyPropagationWorldXZ(x, nz) then
+    local neighborLight = self:_getSkyLightWorld(x, y, nz)
+    if neighborLight > 0 then
+      local block = world:get(x, y, nz)
+      local step = self:_getBlockLightOpacity(block)
+      if step < 1 then
+        step = 1
+      end
+
+      local neighborWorldIndex = world:_worldIndex(x, y, nz)
+      if neighborLight + step <= removedLight then
+        if self:_setSkyLightWorld(x, y, nz, 0, markDirty, true) then
+          self:_enqueueSkyDark(neighborWorldIndex, neighborLight, urgent)
+        end
+      else
+        self:_enqueueSkyFlood(neighborWorldIndex, urgent)
+      end
+    end
+  end
+
   self:_enqueueSkyFlood(worldIndex, urgent)
 end
 
 function FloodfillLighting:_propagateSkyFloodFrom(worldIndex, markDirty, urgent)
   local world = self.world
+  local sizeX = world.sizeX
+  local sizeY = world.sizeY
+  local sizeZ = world.sizeZ
   local x, y, z = world:_decodeWorldIndex(worldIndex)
   if not self:_isInsideSkyPropagationWorldXZ(x, z) then
     return
@@ -1215,45 +1724,125 @@ function FloodfillLighting:_propagateSkyFloodFrom(worldIndex, markDirty, urgent)
     return
   end
 
-  local function tryNeighbor(nx, ny, nz)
-    if nx < 1 or nx > world.sizeX then
-      return
-    end
-    if ny < 1 or ny > world.sizeY then
-      return
-    end
-    if nz < 1 or nz > world.sizeZ then
-      return
-    end
-    if not self:_isInsideSkyPropagationWorldXZ(nx, nz) then
-      return
-    end
-
-    local block = world:get(nx, ny, nz)
+  local nx = x - 1
+  if nx >= 1 and nx <= sizeX
+    and self:_isInsideSkyPropagationWorldXZ(nx, z) then
+    local block = world:get(nx, y, z)
     local step = self:_getBlockLightOpacity(block)
     if step < 1 then
       step = 1
     end
 
     local candidate = sourceLight - step
-    if candidate <= 0 then
-      return
-    end
-
-    local neighborLight = self:_getSkyLightWorld(nx, ny, nz)
-    if candidate > neighborLight then
-      if self:_setSkyLightWorld(nx, ny, nz, candidate, markDirty, true) then
-        self:_enqueueSkyFlood(world:_worldIndex(nx, ny, nz), urgent)
+    if candidate > 0 then
+      local neighborLight = self:_getSkyLightWorld(nx, y, z)
+      if candidate > neighborLight then
+        if self:_setSkyLightWorld(nx, y, z, candidate, markDirty, true) then
+          self:_enqueueSkyFlood(world:_worldIndex(nx, y, z), urgent)
+        end
       end
     end
   end
 
-  tryNeighbor(x - 1, y, z)
-  tryNeighbor(x + 1, y, z)
-  tryNeighbor(x, y - 1, z)
-  tryNeighbor(x, y + 1, z)
-  tryNeighbor(x, y, z - 1)
-  tryNeighbor(x, y, z + 1)
+  nx = x + 1
+  if nx >= 1 and nx <= sizeX
+    and self:_isInsideSkyPropagationWorldXZ(nx, z) then
+    local block = world:get(nx, y, z)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+
+    local candidate = sourceLight - step
+    if candidate > 0 then
+      local neighborLight = self:_getSkyLightWorld(nx, y, z)
+      if candidate > neighborLight then
+        if self:_setSkyLightWorld(nx, y, z, candidate, markDirty, true) then
+          self:_enqueueSkyFlood(world:_worldIndex(nx, y, z), urgent)
+        end
+      end
+    end
+  end
+
+  local ny = y - 1
+  if ny >= 1 and ny <= sizeY
+    and self:_isInsideSkyPropagationWorldXZ(x, z) then
+    local block = world:get(x, ny, z)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+
+    local candidate = sourceLight - step
+    if candidate > 0 then
+      local neighborLight = self:_getSkyLightWorld(x, ny, z)
+      if candidate > neighborLight then
+        if self:_setSkyLightWorld(x, ny, z, candidate, markDirty, true) then
+          self:_enqueueSkyFlood(world:_worldIndex(x, ny, z), urgent)
+        end
+      end
+    end
+  end
+
+  ny = y + 1
+  if ny >= 1 and ny <= sizeY
+    and self:_isInsideSkyPropagationWorldXZ(x, z) then
+    local block = world:get(x, ny, z)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+
+    local candidate = sourceLight - step
+    if candidate > 0 then
+      local neighborLight = self:_getSkyLightWorld(x, ny, z)
+      if candidate > neighborLight then
+        if self:_setSkyLightWorld(x, ny, z, candidate, markDirty, true) then
+          self:_enqueueSkyFlood(world:_worldIndex(x, ny, z), urgent)
+        end
+      end
+    end
+  end
+
+  local nz = z - 1
+  if nz >= 1 and nz <= sizeZ
+    and self:_isInsideSkyPropagationWorldXZ(x, nz) then
+    local block = world:get(x, y, nz)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+
+    local candidate = sourceLight - step
+    if candidate > 0 then
+      local neighborLight = self:_getSkyLightWorld(x, y, nz)
+      if candidate > neighborLight then
+        if self:_setSkyLightWorld(x, y, nz, candidate, markDirty, true) then
+          self:_enqueueSkyFlood(world:_worldIndex(x, y, nz), urgent)
+        end
+      end
+    end
+  end
+
+  nz = z + 1
+  if nz >= 1 and nz <= sizeZ
+    and self:_isInsideSkyPropagationWorldXZ(x, nz) then
+    local block = world:get(x, y, nz)
+    local step = self:_getBlockLightOpacity(block)
+    if step < 1 then
+      step = 1
+    end
+
+    local candidate = sourceLight - step
+    if candidate > 0 then
+      local neighborLight = self:_getSkyLightWorld(x, y, nz)
+      if candidate > neighborLight then
+        if self:_setSkyLightWorld(x, y, nz, candidate, markDirty, true) then
+          self:_enqueueSkyFlood(world:_worldIndex(x, y, nz), urgent)
+        end
+      end
+    end
+  end
 end
 
 function FloodfillLighting:getSkyLight(x, y, z)
@@ -1274,6 +1863,10 @@ function FloodfillLighting:getSkyLight(x, y, z)
 end
 
 function FloodfillLighting:_computeChunkEnsureScale(config)
+  if self.skyWarmupActive then
+    return 1
+  end
+
   local softMs = tonumber(config.chunkEnsureSpikeSoftMs)
   if softMs == nil then
     softMs = 12
@@ -1325,6 +1918,28 @@ function FloodfillLighting:_computeChunkEnsureScale(config)
   return 1
 end
 
+function FloodfillLighting:_areSkyHaloColumnsReady(cx, cz)
+  local world = self.world
+  local cs = world.chunkSize
+  local minX = math.max(1, (cx - 1) * cs)
+  local maxX = math.min(world.sizeX, cx * cs + 1)
+  local minZ = math.max(1, (cz - 1) * cs)
+  local maxZ = math.min(world.sizeZ, cz * cs + 1)
+  local ready = self.skyColumnsReady
+  local progress = self.skyColumnProgress
+
+  for z = minZ, maxZ do
+    for x = minX, maxX do
+      local columnKey = world:_worldColumnKey(x, z)
+      if not ready[columnKey] or progress[columnKey] ~= nil then
+        return false
+      end
+    end
+  end
+
+  return true
+end
+
 function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
   local world = self.world
   if not self.enabled then
@@ -1362,25 +1977,26 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
     return true
   end
 
-  if self:_hasSkyQueueWork() then
-    if localOps > 0 then
-      self:updateSkyLight(localOps, localMillis)
-    end
-    if self:_hasSkyQueueWork() then
-      return false
-    end
-  end
-
   self:_ensureSkyHaloColumns(cx, cz, true, false, true)
-
-  if localOps > 0 and self:_hasSkyQueueWork() then
-    self:updateSkyLight(localOps, localMillis)
+  if self:_areSkyHaloColumnsReady(cx, cz) then
+    return true
   end
 
-  if self:_hasSkyQueueWork() then
-    return false
+  local ensurePasses = math.floor(tonumber(config.chunkEnsurePasses) or 2)
+  if ensurePasses < 1 then
+    ensurePasses = 1
   end
-  return true
+
+  if localOps > 0 then
+    for _ = 1, ensurePasses do
+      self:updateSkyLight(localOps, localMillis, 'ensure')
+      if self:_areSkyHaloColumnsReady(cx, cz) then
+        return true
+      end
+    end
+  end
+
+  return self:_areSkyHaloColumnsReady(cx, cz)
 end
 
 function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
@@ -1438,7 +2054,6 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
     return out
   end
 
-  local queueBacklog = self:_hasSkyQueueWork()
   local skyColumnsReady = self.skyColumnsReady
   local strideZ = haloSize
   local strideY = haloSize * haloSize
@@ -1462,8 +2077,8 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
           out[index] = 0
         elseif wy > world.sizeY then
           out[index] = 15
-        elseif queueBacklog or not skyColumnsReady[world:_worldColumnKey(wx, wz)] then
-          -- While floodfill queues are pending, prefer a no-shadow fallback over dark interim vertical values.
+        elseif not skyColumnsReady[world:_worldColumnKey(wx, wz)] then
+          -- If this halo column is not ready yet, use a no-shadow fallback for mesh prep.
           out[index] = 15
         else
           out[index] = self:_getSkyLightWorld(wx, wy, wz)
@@ -1478,13 +2093,32 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
   return out
 end
 
-function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
+function FloodfillLighting:updateSkyLight(maxOps, maxMillis, sourceTag)
+  local metricSource = sourceTag == 'main' and 'main' or 'ensure'
   if not self.enabled then
     self.skyRegionOpsProcessedLast = 0
+    self:_accumulateLightCallMetrics(metricSource, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
     return 0
   end
 
   local config = self.lightingConfig or {}
+  local dequeueScanLimit = math.floor(tonumber(config.dequeueScanLimitPerCall) or 0)
+  if dequeueScanLimit < 0 then
+    dequeueScanLimit = 0
+  end
+  self._dequeueScanLimitCurrent = dequeueScanLimit
+  local columnRowsPerSlice = math.floor(tonumber(config.columnRecomputeRowsPerSlice) or 8)
+  if columnRowsPerSlice < 1 then
+    columnRowsPerSlice = 1
+  end
+  local columnSliceMillis = tonumber(config.columnRecomputeSliceMillis) or 0
+  if columnSliceMillis < 0 then
+    columnSliceMillis = 0
+  end
+  local floodOpsCapPerPass = math.floor(tonumber(config.floodOpsCapPerPass) or 0)
+  if floodOpsCapPerPass < 0 then
+    floodOpsCapPerPass = 0
+  end
   local explicitOpsLimit = maxOps ~= nil
   local explicitMillisLimit = maxMillis ~= nil
   local opsLimit = tonumber(maxOps)
@@ -1536,6 +2170,10 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   end
 
   local hasTimer = lovr and lovr.timer and lovr.timer.getTime
+  local updateStartTime = 0
+  if hasTimer then
+    updateStartTime = lovr.timer.getTime()
+  end
   local useOverallTimeBudget = hasTimer and millisLimit and millisLimit > 0
   local overallStartTime = 0
   if useOverallTimeBudget then
@@ -1562,10 +2200,18 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
   end
 
   local regionProcessed = 0
+  local regionMs = 0
+  local regionStartTime = 0
+  if hasTimer then
+    regionStartTime = lovr.timer.getTime()
+  end
   if self:_hasRegionTasks() then
     regionProcessed = self:_processRegionTasks(regionOpsLimit, regionMillisLimit)
   else
     self.skyRegionOpsProcessedLast = 0
+  end
+  if hasTimer and regionStartTime > 0 then
+    regionMs = (lovr.timer.getTime() - regionStartTime) * 1000
   end
 
   if opsLimit and opsLimit > 0 then
@@ -1585,6 +2231,21 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
 
   self:_setSkyStageFromQueues()
   if self.skyStage == 'idle' then
+    local updateMs = 0
+    if hasTimer and updateStartTime > 0 then
+      updateMs = (lovr.timer.getTime() - updateStartTime) * 1000
+    end
+    self:_accumulateLightCallMetrics(
+      metricSource,
+      updateMs,
+      regionMs,
+      0, 0, 0,
+      0, 0, 0,
+      0, 0, 0,
+      0,
+      0, 0, 0,
+      0
+    )
     return regionProcessed
   end
 
@@ -1594,45 +2255,165 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis)
     startTime = lovr.timer.getTime()
   end
   if (not opsLimit or opsLimit <= 0) and not useTimeBudget then
+    local updateMs = 0
+    if hasTimer and updateStartTime > 0 then
+      updateMs = (lovr.timer.getTime() - updateStartTime) * 1000
+    end
+    self:_accumulateLightCallMetrics(
+      metricSource,
+      updateMs,
+      regionMs,
+      0, 0, 0,
+      0, 0, 0,
+      0, 0, 0,
+      0,
+      0, 0, 0,
+      0
+    )
     return regionProcessed
   end
 
   local world = self.world
   local processed = 0
+  local columnOps = 0
+  local darkOps = 0
+  local floodOps = 0
+  local queueSkipColumns = 0
+  local queueSkipDark = 0
+  local queueSkipFlood = 0
+  local queueCapColumns = 0
+  local queueCapDark = 0
+  local queueCapFlood = 0
+  local columnPartialOps = 0
+  local maxColumnMs = 0
+  local maxDarkMs = 0
+  local maxFloodMs = 0
+  local floodCapHits = 0
   while true do
     if opsLimit and opsLimit > 0 and processed >= opsLimit then
       break
     end
 
-    if useTimeBudget and processed > 0 then
+    if useTimeBudget then
       local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
       if elapsedMs >= millisLimit then
         break
       end
     end
 
-    local columnKey, isUrgent = self:_dequeueSkyColumn()
+    local columnKey, isUrgent, skippedColumns, hitColumnScanCap = self:_dequeueSkyColumn()
+    queueSkipColumns = queueSkipColumns + (skippedColumns or 0)
+    if hitColumnScanCap then
+      queueCapColumns = queueCapColumns + 1
+      break
+    end
     if columnKey then
       local x, z = world:_decodeWorldColumnKey(columnKey)
       if self:_isInsideSkyActiveWorldXZ(x, z) and not self.skyColumnsReady[columnKey] then
-        self:_recomputeSkyColumn(x, z, true, self.skyTrackDirtyVertical, isUrgent)
+        local opStartTime = 0
+        if hasTimer then
+          opStartTime = lovr.timer.getTime()
+        end
+        local complete = self:_recomputeSkyColumnSlice(
+          columnKey,
+          x,
+          z,
+          true,
+          self.skyTrackDirtyVertical,
+          isUrgent,
+          columnRowsPerSlice,
+          columnSliceMillis
+        )
+        if hasTimer and opStartTime > 0 then
+          local opMs = (lovr.timer.getTime() - opStartTime) * 1000
+          if opMs > maxColumnMs then
+            maxColumnMs = opMs
+          end
+        end
+        if not complete then
+          columnPartialOps = columnPartialOps + 1
+          self:_enqueueSkyColumn(columnKey, isUrgent)
+        end
+      else
+        self.skyColumnProgress[columnKey] = nil
       end
+      columnOps = columnOps + 1
       processed = processed + 1
     else
-      local darkIndex, removedLight, darkUrgent = self:_dequeueSkyDark()
+      local darkIndex, removedLight, darkUrgent, skippedDark, hitDarkScanCap = self:_dequeueSkyDark()
+      queueSkipDark = queueSkipDark + (skippedDark or 0)
+      if hitDarkScanCap then
+        queueCapDark = queueCapDark + 1
+        break
+      end
       if darkIndex then
+        local darkStartTime = 0
+        if hasTimer then
+          darkStartTime = lovr.timer.getTime()
+        end
         self:_propagateSkyDarkFrom(darkIndex, removedLight, self.skyTrackDirtyFlood, darkUrgent)
+        if hasTimer and darkStartTime > 0 then
+          local darkMs = (lovr.timer.getTime() - darkStartTime) * 1000
+          if darkMs > maxDarkMs then
+            maxDarkMs = darkMs
+          end
+        end
+        darkOps = darkOps + 1
         processed = processed + 1
       else
-        local worldIndex, floodUrgent = self:_dequeueSkyFlood()
+        if floodOpsCapPerPass > 0 and floodOps >= floodOpsCapPerPass then
+          floodCapHits = floodCapHits + 1
+          break
+        end
+        local worldIndex, floodUrgent, skippedFlood, hitFloodScanCap = self:_dequeueSkyFlood()
+        queueSkipFlood = queueSkipFlood + (skippedFlood or 0)
+        if hitFloodScanCap then
+          queueCapFlood = queueCapFlood + 1
+          break
+        end
         if not worldIndex then
           break
         end
+        local floodStartTime = 0
+        if hasTimer then
+          floodStartTime = lovr.timer.getTime()
+        end
         self:_propagateSkyFloodFrom(worldIndex, self.skyTrackDirtyFlood, floodUrgent)
+        if hasTimer and floodStartTime > 0 then
+          local floodMs = (lovr.timer.getTime() - floodStartTime) * 1000
+          if floodMs > maxFloodMs then
+            maxFloodMs = floodMs
+          end
+        end
+        floodOps = floodOps + 1
         processed = processed + 1
       end
     end
   end
+
+  local updateMs = 0
+  if hasTimer and updateStartTime > 0 then
+    updateMs = (lovr.timer.getTime() - updateStartTime) * 1000
+  end
+  self:_accumulateLightCallMetrics(
+    metricSource,
+    updateMs,
+    regionMs,
+    columnOps,
+    darkOps,
+    floodOps,
+    queueSkipColumns,
+    queueSkipDark,
+    queueSkipFlood,
+    queueCapColumns,
+    queueCapDark,
+    queueCapFlood,
+    columnPartialOps,
+    maxColumnMs,
+    maxDarkMs,
+    maxFloodMs,
+    floodCapHits
+  )
 
   self:_setSkyStageFromQueues()
   return processed + regionProcessed
@@ -1740,6 +2521,7 @@ function FloodfillLighting:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChu
         local x, z = world:_decodeWorldColumnKey(columnKey)
         if x < self.skyActiveMinX or x > self.skyActiveMaxX or z < self.skyActiveMinZ or z > self.skyActiveMaxZ then
           self.skyColumnsReady[columnKey] = nil
+          self.skyColumnProgress[columnKey] = nil
         end
       end
     end
@@ -1825,7 +2607,9 @@ function FloodfillLighting:onPrepareChunk(cx, cz)
 
   for z = minZ, maxZ do
     for x = minX, maxX do
-      self.skyColumnsReady[world:_worldColumnKey(x, z)] = nil
+      local columnKey = world:_worldColumnKey(x, z)
+      self.skyColumnsReady[columnKey] = nil
+      self.skyColumnProgress[columnKey] = nil
     end
   end
 end

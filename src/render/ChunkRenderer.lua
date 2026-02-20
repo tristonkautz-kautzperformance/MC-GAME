@@ -188,13 +188,28 @@ function ChunkRenderer.new(constants, world)
   self._cullFrame = {}
   self._opaqueScratch = {}
   self._opaqueScratchCount = 0
-  self._alphaScratch = {}
-  self._alphaScratchCount = 0
+  self._drawFrameId = 0
+  self._alphaOrder = {}
+  self._alphaOrderCount = 0
+  self._alphaOrderDirty = true
+  self._alphaOrderCamX = nil
+  self._alphaOrderCamY = nil
+  self._alphaOrderCamZ = nil
+  self._deferredEntries = {}
+  self._deferredCount = 0
 
   local renderConfig = constants.RENDER or {}
   self._cullOpaque = renderConfig.cullOpaque ~= false
   self._cullAlpha = renderConfig.cullAlpha == true
   self._sortOpaqueFrontToBack = renderConfig.sortOpaqueFrontToBack == true
+  local alphaOrderResortStep = tonumber(renderConfig.alphaOrderResortStep)
+  if alphaOrderResortStep == nil then
+    alphaOrderResortStep = 1.0
+  end
+  if alphaOrderResortStep < 0 then
+    alphaOrderResortStep = 0
+  end
+  self._alphaOrderResortStepSq = alphaOrderResortStep * alphaOrderResortStep
 
   local threadConfig = constants.THREAD_MESH or {}
   self._threadEnabled = threadConfig.enabled == true
@@ -218,10 +233,32 @@ function ChunkRenderer.new(constants, world)
   self._threadTargetWorkers = 0
   self._threadActiveWorkers = 0
   self._threadWorkerRoundRobin = 1
+  self._threadMaxQueuePrepPerFrame = math.floor(tonumber(threadConfig.maxQueuePrepPerFrame) or 1)
+  if self._threadMaxQueuePrepPerFrame < 0 then
+    self._threadMaxQueuePrepPerFrame = 0
+  end
+  self._threadMaxQueuePrepMillis = tonumber(threadConfig.maxQueuePrepMillis) or 0.8
+  if self._threadMaxQueuePrepMillis < 0 then
+    self._threadMaxQueuePrepMillis = 0
+  end
+  self._threadMaxApplyResultsPerFrame = math.floor(tonumber(threadConfig.maxApplyResultsPerFrame) or 1)
+  if self._threadMaxApplyResultsPerFrame < 1 then
+    self._threadMaxApplyResultsPerFrame = 1
+  end
   self._threadMaxApplyMillis = tonumber(threadConfig.maxApplyMillis) or 1.0
   if self._threadMaxApplyMillis < 0 then
     self._threadMaxApplyMillis = 0
   end
+  self._threadQueuePrepMsLastFrame = 0
+  self._threadQueuePrepOpsLastFrame = 0
+  self._threadQueuePrepDeferredLastFrame = 0
+  self._threadApplyMsLastFrame = 0
+  self._threadApplyResultsLastFrame = 0
+  self._threadPrepEnsureMsLastFrame = 0
+  self._threadPrepBlockHaloMsLastFrame = 0
+  self._threadPrepSkyHaloMsLastFrame = 0
+  self._threadPrepPackMsLastFrame = 0
+  self._threadPrepPushMsLastFrame = 0
   self._meshWorkers = {}
   self._meshWorkerFailed = false
   self._meshWorkerError = nil
@@ -273,6 +310,19 @@ function ChunkRenderer:getThreadingPerfStats()
   return logicalCores, activeWorkers, targetWorkers, activeMeshingThreads, threadedActive
 end
 
+function ChunkRenderer:getThreadingFrameStats()
+  return self._threadQueuePrepOpsLastFrame or 0,
+    self._threadQueuePrepMsLastFrame or 0,
+    self._threadQueuePrepDeferredLastFrame or 0,
+    self._threadApplyResultsLastFrame or 0,
+    self._threadApplyMsLastFrame or 0,
+    self._threadPrepEnsureMsLastFrame or 0,
+    self._threadPrepBlockHaloMsLastFrame or 0,
+    self._threadPrepSkyHaloMsLastFrame or 0,
+    self._threadPrepPackMsLastFrame or 0,
+    self._threadPrepPushMsLastFrame or 0
+end
+
 function ChunkRenderer:isGreedyMeshingEnabled()
   return self._useGreedyMeshing
 end
@@ -299,8 +349,12 @@ function ChunkRenderer:_releaseChunkMeshEntry(entry, forceRelease)
 
   local opaque = entry.opaque
   local alpha = entry.alpha
+  local hadAlpha = alpha ~= nil
   entry.opaque = nil
   entry.alpha = nil
+  if hadAlpha then
+    self._alphaOrderDirty = true
+  end
 
   if forceRelease or self._releaseMeshesRuntime then
     if opaque and opaque ~= alpha then
@@ -748,8 +802,13 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
 
   local oldOpaque = entry.opaque
   local oldAlpha = entry.alpha
+  local oldHadAlpha = oldAlpha ~= nil
   entry.opaque = opaqueMesh or nil
   entry.alpha = alphaMesh or nil
+  local newHadAlpha = entry.alpha ~= nil
+  if oldHadAlpha ~= newHadAlpha then
+    self._alphaOrderDirty = true
+  end
 
   if self._releaseMeshesRuntime and oldOpaque and oldOpaque ~= entry.opaque and oldOpaque ~= oldAlpha then
     self:_releaseMesh(oldOpaque)
@@ -782,6 +841,9 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
 end
 
 function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
+  local hasTimer = lovr.timer and lovr.timer.getTime
+  local stepStartTime = 0
+
   if not self:_isMeshWorkerReady() then
     return 'fallback'
   end
@@ -798,22 +860,50 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     return 'fallback'
   end
 
+  if hasTimer then
+    stepStartTime = lovr.timer.getTime()
+  end
   if self.world.prepareChunk then
     self.world:prepareChunk(cx, cy, cz)
   end
   if self.world.ensureSkyLightForChunk then
     local ready = self.world:ensureSkyLightForChunk(cx, cy, cz)
+    if hasTimer then
+      self._threadPrepEnsureMsLastFrame = self._threadPrepEnsureMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
+    end
     if ready == false then
       return 'defer'
     end
+  elseif hasTimer then
+    self._threadPrepEnsureMsLastFrame = self._threadPrepEnsureMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
   end
 
+  if hasTimer then
+    stepStartTime = lovr.timer.getTime()
+  end
   local halo = self:_acquireThreadHaloTable()
-  local skyHalo = self:_acquireThreadSkyHaloTable()
   self.world:fillBlockHalo(cx, cy, cz, halo)
+  if hasTimer then
+    self._threadPrepBlockHaloMsLastFrame = self._threadPrepBlockHaloMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
+  end
+
+  if hasTimer then
+    stepStartTime = lovr.timer.getTime()
+  end
+  local skyHalo = self:_acquireThreadSkyHaloTable()
   self.world:fillSkyLightHalo(cx, cy, cz, skyHalo)
+  if hasTimer then
+    self._threadPrepSkyHaloMsLastFrame = self._threadPrepSkyHaloMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
+  end
+
+  if hasTimer then
+    stepStartTime = lovr.timer.getTime()
+  end
   local haloBlob = self:_packHaloBlob(halo)
   local skyHaloBlob = self:_packHaloBlob(skyHalo)
+  if hasTimer then
+    self._threadPrepPackMsLastFrame = self._threadPrepPackMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
+  end
   local version = self:_nextBuildVersion(key)
   local job = {
     type = 'build',
@@ -846,8 +936,14 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     usesSkyHaloTablePayload = true
   end
 
+  if hasTimer then
+    stepStartTime = lovr.timer.getTime()
+  end
   local worker = self:_pickMeshWorker()
   if not worker then
+    if hasTimer then
+      self._threadPrepPushMsLastFrame = self._threadPrepPushMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
+    end
     self:_releaseThreadHaloTable(halo)
     self:_releaseThreadSkyHaloTable(skyHalo)
     self:_disableMeshWorker('no_active_worker')
@@ -855,6 +951,9 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
   end
 
   local ok, err = worker:push(job)
+  if hasTimer then
+    self._threadPrepPushMsLastFrame = self._threadPrepPushMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
+  end
   if not ok then
     self:_releaseThreadHaloTable(halo)
     self:_releaseThreadSkyHaloTable(skyHalo)
@@ -878,6 +977,66 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
   return 'queued'
 end
 
+function ChunkRenderer:_processThreadedResult(result)
+  if result.type == 'error' then
+    self:_disableMeshWorker(result.error or 'mesh_worker_error')
+    return false, 0
+  end
+
+  if result.type ~= 'result' or not result.key then
+    return true, 0
+  end
+
+  local key = result.key
+  local inFlightVersion = self._threadInFlightByKey[key]
+  if inFlightVersion and inFlightVersion == result.version then
+    self._threadInFlightByKey[key] = nil
+    self:_releaseInFlightHaloForKey(key)
+    if self._threadInFlightCount > 0 then
+      self._threadInFlightCount = self._threadInFlightCount - 1
+    end
+  end
+
+  local latestVersion = self._chunkBuildVersion[key]
+  if not (latestVersion and result.version == latestVersion) then
+    return true, 0
+  end
+
+  local okApply, applyErr = self:_setChunkMeshEntry(
+    key,
+    result.cx,
+    result.cy,
+    result.cz,
+    result.verticesOpaqueBlob or result.verticesOpaque,
+    result.opaqueCount or 0,
+    result.verticesAlphaBlob or result.verticesAlpha,
+    result.alphaCount or 0,
+    result.indicesOpaqueBlob or result.indicesOpaque,
+    result.indexOpaqueCount or 0,
+    result.indicesOpaqueType,
+    result.indicesAlphaBlob or result.indicesAlpha,
+    result.indexAlphaCount or 0,
+    result.indicesAlphaType,
+    result.indexed == true
+  )
+  if not okApply then
+    self:_disableMeshWorker(applyErr or 'mesh_apply_failed')
+    local rebuiltSync = self:_rebuildChunk(result.cx, result.cy, result.cz)
+    if rebuiltSync == false then
+      self:_requeueDirtyEntry({
+        key = key,
+        cx = result.cx,
+        cy = result.cy,
+        cz = result.cz,
+        dist = 0
+      })
+    end
+    return false, 0
+  end
+
+  return true, 1
+end
+
 function ChunkRenderer:_applyThreadedResults(maxMillis)
   if not self:_isMeshWorkerReady() then
     return 0
@@ -891,69 +1050,25 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
 
   local hasTimer = lovr.timer and lovr.timer.getTime
   local useTimeBudget = hasTimer and maxMillis and maxMillis > 0
+  local maxApplyResults = self._threadMaxApplyResultsPerFrame or math.huge
+  if maxApplyResults < 1 then
+    maxApplyResults = 1
+  end
   local startTime = 0
   if useTimeBudget then
     startTime = lovr.timer.getTime()
   end
-
-  local function processResult(result)
-    if result.type == 'error' then
-      self:_disableMeshWorker(result.error or 'mesh_worker_error')
-      return false
-    end
-
-    if result.type == 'result' and result.key then
-      local key = result.key
-      local inFlightVersion = self._threadInFlightByKey[key]
-      if inFlightVersion and inFlightVersion == result.version then
-        self._threadInFlightByKey[key] = nil
-        self:_releaseInFlightHaloForKey(key)
-        if self._threadInFlightCount > 0 then
-          self._threadInFlightCount = self._threadInFlightCount - 1
-        end
-      end
-
-      local latestVersion = self._chunkBuildVersion[key]
-      if latestVersion and result.version == latestVersion then
-        local okApply, applyErr = self:_setChunkMeshEntry(
-          key,
-          result.cx,
-          result.cy,
-          result.cz,
-          result.verticesOpaqueBlob or result.verticesOpaque,
-          result.opaqueCount or 0,
-          result.verticesAlphaBlob or result.verticesAlpha,
-          result.alphaCount or 0,
-          result.indicesOpaqueBlob or result.indicesOpaque,
-          result.indexOpaqueCount or 0,
-          result.indicesOpaqueType,
-          result.indicesAlphaBlob or result.indicesAlpha,
-          result.indexAlphaCount or 0,
-          result.indicesAlphaType,
-          result.indexed == true
-        )
-        if not okApply then
-          self:_disableMeshWorker(applyErr or 'mesh_apply_failed')
-          local rebuiltSync = self:_rebuildChunk(result.cx, result.cy, result.cz)
-          if rebuiltSync == false then
-            self:_requeueDirtyEntry({
-              key = key,
-              cx = result.cx,
-              cy = result.cy,
-              cz = result.cz,
-              dist = 0
-            })
-          end
-          return false
-        end
-      end
-    end
-
-    return true
+  local callStartTime = 0
+  if hasTimer then
+    callStartTime = lovr.timer.getTime()
   end
 
   local applied = 0
   while true do
+    if applied >= maxApplyResults then
+      break
+    end
+
     if useTimeBudget and applied > 0 then
       local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
       if elapsedMs >= maxMillis then
@@ -967,20 +1082,23 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
       local result = worker and worker:pop() or nil
       if result then
         hadResult = true
-        local continueLoop = processResult(result)
+        local continueLoop, appliedDelta = self:_processThreadedResult(result)
+        applied = applied + appliedDelta
         if not continueLoop then
-          return applied
-        end
-        if result.type == 'result' and result.key then
-          local latestVersion = self._chunkBuildVersion[result.key]
-          if latestVersion and result.version == latestVersion then
-            applied = applied + 1
+          self._threadApplyResultsLastFrame = (self._threadApplyResultsLastFrame or 0) + applied
+          if hasTimer and callStartTime > 0 then
+            self._threadApplyMsLastFrame = (self._threadApplyMsLastFrame or 0) + ((lovr.timer.getTime() - callStartTime) * 1000)
           end
+          return applied
         end
 
         if useTimeBudget and applied > 0 then
           local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
           if elapsedMs >= maxMillis then
+            self._threadApplyResultsLastFrame = (self._threadApplyResultsLastFrame or 0) + applied
+            if hasTimer and callStartTime > 0 then
+              self._threadApplyMsLastFrame = (self._threadApplyMsLastFrame or 0) + ((lovr.timer.getTime() - callStartTime) * 1000)
+            end
             return applied
           end
         end
@@ -990,6 +1108,11 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
     if not hadResult then
       break
     end
+  end
+
+  self._threadApplyResultsLastFrame = (self._threadApplyResultsLastFrame or 0) + applied
+  if hasTimer and callStartTime > 0 then
+    self._threadApplyMsLastFrame = (self._threadApplyMsLastFrame or 0) + ((lovr.timer.getTime() - callStartTime) * 1000)
   end
 
   return applied
@@ -1044,6 +1167,8 @@ end
 local function opaqueSortFrontToBack(a, b)
   return a._sortDistSq < b._sortDistSq
 end
+
+local ALPHA_ORDER_MIN_POSITION_DELTA_SQ = 1e-6
 
 local function buildCullFrame(renderer, cameraX, cameraY, cameraZ, forwardX, forwardY, forwardZ)
   local cull = renderer.constants.CULL or {}
@@ -1978,6 +2103,17 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
     startTime = lovr.timer.getTime()
   end
 
+  self._threadQueuePrepMsLastFrame = 0
+  self._threadQueuePrepOpsLastFrame = 0
+  self._threadQueuePrepDeferredLastFrame = 0
+  self._threadApplyMsLastFrame = 0
+  self._threadApplyResultsLastFrame = 0
+  self._threadPrepEnsureMsLastFrame = 0
+  self._threadPrepBlockHaloMsLastFrame = 0
+  self._threadPrepSkyHaloMsLastFrame = 0
+  self._threadPrepPackMsLastFrame = 0
+  self._threadPrepPushMsLastFrame = 0
+
   self._rebuildsLastFrame = 0
   self:_applyThreadedResults(self._threadMaxApplyMillis)
   self:_pruneChunkMeshesStep(self._pruneMaxChecksPerFrame, self._pruneMaxMillisPerFrame)
@@ -2012,33 +2148,14 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
   local attempted = 0
   local staleRequeued = 0
   local staleRequeueCap = self._staleRequeueCap or 0
-  local deferredEntries = {}
+  local deferredEntries = self._deferredEntries
+  local previousDeferredCount = self._deferredCount or 0
   local deferredCount = 0
-
-  local function deferEntry(entry)
-    deferredCount = deferredCount + 1
-    deferredEntries[deferredCount] = entry
-  end
-
-  local function processRebuildEntry(chunkEntry)
-    local threadStatus = self:_queueThreadedRebuild(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz, chunkEntry.key)
-    if threadStatus == 'queued' then
-      rebuilt = rebuilt + 1
-      return
-    end
-
-    if threadStatus == 'defer' then
-      deferEntry(chunkEntry)
-      return
-    end
-
-    local rebuiltSync = self:_rebuildChunk(chunkEntry.cx, chunkEntry.cy, chunkEntry.cz)
-    if rebuiltSync == false then
-      deferEntry(chunkEntry)
-      return
-    end
-    rebuilt = rebuilt + 1
-  end
+  local queuePrepMs = 0
+  local queuePrepOps = 0
+  local queuePrepDeferred = 0
+  local maxQueuePrepOps = self._threadMaxQueuePrepPerFrame or 0
+  local maxQueuePrepMs = self._threadMaxQueuePrepMillis or 0
 
   while attempted < hardCap do
     if useTimeBudget and attempted > 0 then
@@ -2068,21 +2185,68 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
     if stalePriority and staleRequeued < staleRequeueCap then
       if self:_requeueDirtyEntry(entry) then
         staleRequeued = staleRequeued + 1
-      else
-        processRebuildEntry(entry)
+        entry = nil
       end
-    else
-      processRebuildEntry(entry)
+    end
+
+    if entry then
+      local skipThreadPrep = false
+      if self._threadEnabled and self:_isMeshWorkerReady() then
+        if maxQueuePrepOps > 0 and queuePrepOps >= maxQueuePrepOps then
+          skipThreadPrep = true
+        end
+        if not skipThreadPrep and maxQueuePrepMs > 0 and queuePrepMs >= maxQueuePrepMs then
+          skipThreadPrep = true
+        end
+      end
+
+      local threadStatus = nil
+      if skipThreadPrep then
+        threadStatus = 'defer'
+        queuePrepDeferred = queuePrepDeferred + 1
+      else
+        local prepStartTime = 0
+        if hasTimer then
+          prepStartTime = lovr.timer.getTime()
+        end
+        threadStatus = self:_queueThreadedRebuild(entry.cx, entry.cy, entry.cz, entry.key)
+        if hasTimer and prepStartTime > 0 then
+          queuePrepMs = queuePrepMs + ((lovr.timer.getTime() - prepStartTime) * 1000)
+        end
+        if self._threadEnabled and threadStatus ~= 'fallback' then
+          queuePrepOps = queuePrepOps + 1
+        end
+      end
+
+      if threadStatus == 'queued' then
+        rebuilt = rebuilt + 1
+      elseif threadStatus == 'defer' then
+        deferredCount = deferredCount + 1
+        deferredEntries[deferredCount] = entry
+      else
+        local rebuiltSync = self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
+        if rebuiltSync == false then
+          deferredCount = deferredCount + 1
+          deferredEntries[deferredCount] = entry
+        else
+          rebuilt = rebuilt + 1
+        end
+      end
     end
   end
 
+  self._deferredCount = deferredCount
   for i = 1, deferredCount do
     self:_requeueDirtyEntry(deferredEntries[i])
     deferredEntries[i] = nil
   end
-  for i = deferredCount + 1, #deferredEntries do
+  for i = deferredCount + 1, previousDeferredCount do
     deferredEntries[i] = nil
   end
+
+  self._threadQueuePrepMsLastFrame = queuePrepMs
+  self._threadQueuePrepOpsLastFrame = queuePrepOps
+  self._threadQueuePrepDeferredLastFrame = queuePrepDeferred
 
   self:_applyThreadedResults(self._threadMaxApplyMillis)
   self._rebuildsLastFrame = rebuilt
@@ -2150,7 +2314,67 @@ function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFra
   return dot >= math.cos(maxAngle)
 end
 
+function ChunkRenderer:_ensureAlphaOrder(cameraX, cameraY, cameraZ)
+  local alphaOrder = self._alphaOrder
+  local alphaCount = self._alphaOrderCount or 0
+
+  if self._alphaOrderDirty then
+    local previousCount = alphaCount
+    alphaCount = 0
+    for _, entry in pairs(self._chunkMeshes) do
+      if entry.alpha then
+        alphaCount = alphaCount + 1
+        alphaOrder[alphaCount] = entry
+      end
+    end
+    for i = alphaCount + 1, previousCount do
+      alphaOrder[i] = nil
+    end
+    self._alphaOrderCount = alphaCount
+  else
+    local lastCamX = self._alphaOrderCamX
+    local lastCamY = self._alphaOrderCamY
+    local lastCamZ = self._alphaOrderCamZ
+    if lastCamX ~= nil and lastCamY ~= nil and lastCamZ ~= nil then
+      local camDx = cameraX - lastCamX
+      local camDy = cameraY - lastCamY
+      local camDz = cameraZ - lastCamZ
+      local camDeltaSq = camDx * camDx + camDy * camDy + camDz * camDz
+      local resortStepSq = self._alphaOrderResortStepSq or 0
+      if resortStepSq < ALPHA_ORDER_MIN_POSITION_DELTA_SQ then
+        resortStepSq = ALPHA_ORDER_MIN_POSITION_DELTA_SQ
+      end
+      if camDeltaSq <= resortStepSq then
+        return
+      end
+    end
+  end
+
+  for i = 1, alphaCount do
+    local entry = alphaOrder[i]
+    if entry and entry.alpha then
+      local dx = entry.centerX - cameraX
+      local dy = entry.centerY - cameraY
+      local dz = entry.centerZ - cameraZ
+      entry._sortDistSq = dx * dx + dy * dy + dz * dz
+    end
+  end
+
+  if alphaCount > 1 then
+    table.sort(alphaOrder, alphaSortBackToFront)
+  end
+
+  self._alphaOrderCount = alphaCount
+  self._alphaOrderDirty = false
+  self._alphaOrderCamX = cameraX
+  self._alphaOrderCamY = cameraY
+  self._alphaOrderCamZ = cameraZ
+end
+
 function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, voxelShader, timeOfDay)
+  self._drawFrameId = (self._drawFrameId or 0) + 1
+  local drawFrameId = self._drawFrameId
+
   local forward = self._drawForward
   if forward.set then
     forward:set(0, 0, -1)
@@ -2170,29 +2394,28 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
   local opaqueScratch = self._opaqueScratch
   local prevOpaqueCount = self._opaqueScratchCount or 0
   local opaqueCount = 0
-  local alphaScratch = self._alphaScratch
-  local prevAlphaCount = self._alphaScratchCount or 0
-  local alphaCount = 0
+  local visibleAlphaCount = 0
+  local sortOpaque = self._sortOpaqueFrontToBack
 
-  -- Gather visible opaque + alpha entries in one pass.
+  -- Gather visibility once per frame and build opaque draw list.
   for _, entry in pairs(self._chunkMeshes) do
     if entry.opaque or entry.alpha then
       if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFrame) then
         self._visibleCount = self._visibleCount + 1
-
-        local dx = entry.centerX - cameraX
-        local dy = entry.centerY - cameraY
-        local dz = entry.centerZ - cameraZ
-        local distSq = dx * dx + dy * dy + dz * dz
-        entry._sortDistSq = distSq
+        entry._visibleFrame = drawFrameId
 
         if entry.opaque then
+          if sortOpaque then
+            local dx = entry.centerX - cameraX
+            local dy = entry.centerY - cameraY
+            local dz = entry.centerZ - cameraZ
+            entry._sortDistSq = dx * dx + dy * dy + dz * dz
+          end
           opaqueCount = opaqueCount + 1
           opaqueScratch[opaqueCount] = entry
         end
         if entry.alpha then
-          alphaCount = alphaCount + 1
-          alphaScratch[alphaCount] = entry
+          visibleAlphaCount = visibleAlphaCount + 1
         end
       end
     end
@@ -2203,12 +2426,7 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
   end
   self._opaqueScratchCount = opaqueCount
 
-  for i = alphaCount + 1, prevAlphaCount do
-    alphaScratch[i] = nil
-  end
-  self._alphaScratchCount = alphaCount
-
-  if self._sortOpaqueFrontToBack and opaqueCount > 1 then
+  if sortOpaque and opaqueCount > 1 then
     table.sort(opaqueScratch, opaqueSortFrontToBack)
   end
 
@@ -2220,14 +2438,16 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
     end
   end
 
-  if alphaCount > 1 then
-    table.sort(alphaScratch, alphaSortBackToFront)
+  if self._alphaOrderDirty or visibleAlphaCount > 1 then
+    self:_ensureAlphaOrder(cameraX, cameraY, cameraZ)
   end
 
   pass:setCullMode(self._cullAlpha and 'back' or 'none')
+  local alphaOrder = self._alphaOrder
+  local alphaCount = self._alphaOrderCount or 0
   for i = 1, alphaCount do
-    local entry = alphaScratch[i]
-    if entry and entry.alpha then
+    local entry = alphaOrder[i]
+    if entry and entry.alpha and entry._visibleFrame == drawFrameId then
       pass:draw(entry.alpha, entry.originX, entry.originY, entry.originZ)
     end
   end

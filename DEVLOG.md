@@ -1,5 +1,133 @@
 # Dev Log
 
+## 2026-02-20
+
+### Frame-Time Spike Mitigation (Render Radius 16)
+- Optimized alpha draw ordering in `src/render/ChunkRenderer.lua`:
+  - removed per-frame `alphaScratch` build/sort in `draw`.
+  - added persistent alpha order cache (`_alphaOrder`) sorted by camera position and rebuilt only when camera position changes or alpha mesh presence changes.
+  - alpha pass now filters cached order by frame visibility tag (`_visibleFrame`) to avoid double culling.
+  - follow-up spike fix: alpha list rebuild now happens only when alpha membership changes, and camera-position resort is throttled by movement step (`RENDER.alphaOrderResortStep`, default `1.0` block) to avoid resorting full alpha cache on tiny movement jitter.
+  - exposed alpha resort step in `src/constants.lua` (`Constants.RENDER.alphaOrderResortStep`) for runtime tuning if needed.
+  - draw path now skips alpha resort work when 0-1 alpha chunks are visible in the current frame.
+- Optimized floodfill neighbor propagation in `src/world/lighting/FloodfillLighting.lua`:
+  - unrolled six-neighbor propagation checks in `_propagateSkyDarkFrom` and `_propagateSkyFloodFrom`.
+  - removed per-call `tryNeighbor` closure allocation while preserving bounds/propagation behavior.
+- Optimized rebuild/apply hot paths in `src/render/ChunkRenderer.lua`:
+  - `rebuildDirty` now reuses persistent deferred-entry storage (`_deferredEntries`) instead of allocating a new table each call.
+  - removed per-call local helper closures in `rebuildDirty` and `_applyThreadedResults` by inlining logic / using a renderer method.
+- Optimized dirty-drain path in `src/world/ChunkWorld.lua`:
+  - `drainDirtyChunkKeys(out)` now clears `self._dirty` in place while draining keys.
+  - removed per-call `self._dirty = {}` table swap allocation.
+
+### Streaming Spike Budget Tuning
+- Tuned streaming/dispatch budgets in `src/constants.lua` to reduce 30-50ms chunk-load spikes:
+  - `Constants.THREAD_MESH.maxInFlight`: `4` -> `2`
+  - `Constants.REBUILD.maxPerFrame`: `16` -> `10`
+  - `Constants.REBUILD.maxMillisPerFrame`: `1.8` -> `1.2`
+  - `Constants.LIGHTING.chunkEnsureOps`: `768` -> `384`
+
+### Streaming Spike Guardrails + Thread Stage Telemetry
+- Added per-frame threaded-dispatch guardrails in `src/render/ChunkRenderer.lua`:
+  - caps costly pre-dispatch prep work via `THREAD_MESH.maxQueuePrepPerFrame` and `THREAD_MESH.maxQueuePrepMillis`.
+  - caps threaded mesh-apply burst size via `THREAD_MESH.maxApplyResultsPerFrame`.
+- Added thread-stage frame metrics in `ChunkRenderer` (`getThreadingFrameStats`):
+  - prep attempts, prep ms, prep deferrals, apply count, apply ms.
+- Wired new thread-stage perf telemetry into HUD via `src/game/GameState.lua` and `src/ui/HUD.lua`:
+  - new perf line: `Thread: Prep ... | Apply ...`.
+- Added default tuning fields in `src/constants.lua`:
+  - `THREAD_MESH.maxQueuePrepPerFrame = 1`
+  - `THREAD_MESH.maxQueuePrepMillis = 0.8`
+  - `THREAD_MESH.maxApplyResultsPerFrame = 1`
+
+### Stage Timing Instrumentation + One-Pass Skylight A/B
+- Added update/draw stage timing instrumentation in `src/game/GameState.lua`:
+  - update stages: `updateTotal`, `updateSim`, `updateLight`, `updateRebuild`.
+  - draw stages: `drawWorld`, `drawRenderer`.
+  - each stage now tracks current ms + `Worst(1s)` style rolling max.
+- Added skyline pass telemetry:
+  - `GameState` now tracks `skyLightPasses` used in the frame.
+- Added HUD diagnostics in `src/ui/HUD.lua`:
+  - `StageU` and `StageD` lines showing per-stage frame ms + `Worst(1s)` plus sky-light pass count.
+- Added temporary A/B cap in `src/constants.lua`:
+  - `Constants.LIGHTING.maxPassesPerFrame = 1` to force single-pass `updateSkyLight` per frame while profiling spike sources.
+
+### Perf HUD Overflow/Layout Fix
+- Updated perf/debug panel layout in `src/ui/HUD.lua` to keep diagnostics visible with expanded stage/thread metrics:
+  - widened panel in perf mode and allowed slight extra width when line count is high.
+  - switched perf text rendering to explicit newline-only layout (disabled auto wrap) so panel height matches actual displayed lines.
+  - added dynamic text-scale/panel-height fitting with top anchor + bottom clamp so the panel stays on-screen.
+
+### Pass 1: Lighting Queue Guardrails + Deep Spike Telemetry
+- Added queue stale-scan guardrail in `src/world/lighting/FloodfillLighting.lua`:
+  - new `Constants.LIGHTING.dequeueScanLimitPerCall` (default `512`) bounds dequeue scanning per call for sky column/dark/flood queues.
+  - when a per-call scan cap is reached, `updateSkyLight` now exits the current pass early and continues in later frames.
+- Tightened time-budget behavior for lighting loops:
+  - `_processRegionTasks(...)` and `updateSkyLight(...)` now enforce time budget checks without requiring at least one processed op first.
+- Added floodfill sub-stage perf counters in `FloodfillLighting`:
+  - per-pass totals for `updateSkyLight` ms, region-strip ms, column/dark/flood op counts.
+  - queue stale-skip counts and scan-cap-hit counts for column/dark/flood dequeues.
+- Added threaded prep micro-breakdown telemetry in `src/render/ChunkRenderer.lua`:
+  - per-frame prep slices: ensure lighting, block halo fill, skylight halo fill, halo blob pack, worker push.
+- Wired new telemetry into HUD via `src/game/GameState.lua` and `src/ui/HUD.lua`:
+  - `PrepMs: ...` line for threaded prep breakdown.
+  - `LPerf: ...` and `LSkip: ...` lines for floodfill queue behavior and op distribution.
+
+### Pass 2: Incremental Sky-Column Solve + Per-Op Max Timings
+- Added incremental sky-column recompute path in `src/world/lighting/FloodfillLighting.lua`:
+  - queued vertical sky-column work is now processed in slices (`columnRecomputeRowsPerSlice`, `columnRecomputeSliceMillis`) with continuation state per column.
+  - partial columns are re-enqueued so one large column no longer needs to complete in a single light op.
+- Added new tuning knobs in `src/constants.lua`:
+  - `Constants.LIGHTING.columnRecomputeRowsPerSlice = 8`
+  - `Constants.LIGHTING.columnRecomputeSliceMillis = 0.20`
+- Added pass-level max-op timing telemetry for floodfill update:
+  - max per-op ms for column/dark/flood propagation plus partial-column op count.
+- Wired new metrics through `ChunkWorld` -> `GameState` -> HUD:
+  - new HUD line `LMax: C ... D ... F ... Partial ...`.
+- Added queue-progress hygiene:
+  - column continuation state is now cleared when region/column readiness is invalidated (prepare/rebuild/prune/remove paths).
+
+### Pass 3: Floodfill Worst(1s) Telemetry + Hard Flood Op Cap
+- Added rolling `Worst(1s)` tracking in `src/world/lighting/FloodfillLighting.lua` for:
+  - `LPerf` update/region ms.
+  - `LMax` per-op max column/dark/flood ms.
+  - partial-column op count.
+- Added hard flood-op guardrail:
+  - new `Constants.LIGHTING.floodOpsCapPerPass` (default `32`) caps flood propagation ops per `updateSkyLight` pass.
+  - added `lightFloodCapHits` telemetry so HUD shows when this cap was the stopping reason.
+- Wired new perf fields through `src/world/ChunkWorld.lua` and `src/game/GameState.lua` into `src/ui/HUD.lua`:
+  - `LPerf` now shows current + `Worst(1s)` for update/region timings.
+  - `LMax` now shows current + `Worst(1s)` and partial op worst.
+  - `LSkip` now includes flood hard-cap hit count (`FCap`).
+- Mild lighting spike-budget tuning in `src/constants.lua`:
+  - `urgentMillisPerFrame`: `1.75` -> `1.50`
+  - `startupWarmupMillisPerFrame`: `4.0` -> `3.0`
+
+### Pass 4: Local-Ready Chunk Gating + Main-vs-Ensure Telemetry Split
+- Reworked chunk-lighting readiness in `src/world/lighting/FloodfillLighting.lua`:
+  - `ensureSkyLightForChunk(...)` now gates chunk meshing on local halo-column readiness (`_areSkyHaloColumnsReady`) instead of requiring all global sky queues to drain.
+  - added bounded per-call local catch-up passes (`chunkEnsurePasses`) to prioritize near-player chunk readiness.
+  - startup/warmup now bypasses chunk-ensure downscaling so initial visible chunks do not stall behind aggressive ensure throttling.
+- Adjusted skylight halo fallback behavior in `fillSkyLightHalo(...)`:
+  - fallback-to-full-light now triggers only when the local halo column is not ready (not on unrelated global queue backlog).
+- Split floodfill telemetry sources:
+  - `updateSkyLight(...)` now accepts a source tag and tracks main frame lighting (`main`) separately from mesh-prep/ensure calls (`ensure`).
+  - `LPerf/LMax/LSkip` now represent the main update-stage lighting work, preventing ensure-time calls from masking stage spikes.
+  - added ensure-side counters (`LEns`) for calls, ms, and op mix.
+- Wired new metrics through `src/world/ChunkWorld.lua`, `src/game/GameState.lua`, and `src/ui/HUD.lua`.
+- Tuned startup/backlog knobs in `src/constants.lua`:
+  - `floodOpsCapPerPass`: `32` -> `192`
+  - `maxPassesPerFrame`: `1` -> `2`
+  - `chunkEnsureSpikeHardScale`: `0.2` -> `0.35`
+  - `urgentMillisPerFrame`: `1.50` -> `1.75`
+  - `startupWarmupMillisPerFrame`: `3.0` -> `4.0`
+  - added `chunkEnsurePasses = 2`
+
+### Temporarily Disabled Sheep/Ghost Gameplay Presence
+- Updated `src/constants.lua` mob tuning so `Constants.MOBS.maxSheep` and `Constants.MOBS.maxGhosts` are both `0`.
+- This prevents Sheep/Ghost from appearing in-game while keeping `src/mobs/MobSystem.lua` and related combat systems intact for future re-enable.
+- Updated `README.md` feature/control text to reflect the temporary gameplay disablement.
+
 ## 2026-02-17
 
 ### Render Distance vs Simulation Distance Split

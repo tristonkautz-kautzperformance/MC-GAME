@@ -1,283 +1,190 @@
 Codex Instructions (Codex 5.3)
 ==============================
 
-Task: Alpha Minecraft-Style Skylight (No Block Lights Yet)
-----------------------------------------------------------
+Task: Reduce Frame-Time Spikes (Render Radius 16)
+------------------------------------------------
 
-Date: 2026-02-14
+Date: 2026-02-20
 
-Context / Goal
---------------
-Replicate early Minecraft Alpha lighting as closely as practical with our current tech stack:
-- Skylight only (no torches/lava yet).
-- Discrete light levels 0..15.
-- "Blocky" look (no smooth lighting / AO).
-- Tree canopy creates dark patches on grass (like the reference screenshot).
+Context
+-------
+At render radius 16, average FPS is high (~250), but frame-time spikes occur:
+- Idle / looking around: spikes to 20ms+
+- Moving / streaming chunks: spikes to 60ms+
 
-Performance target:
-- Essentially zero per-frame CPU cost during normal play (when no blocks are changing).
-- Lighting work happens only when:
-  - A chunk becomes newly relevant (entering mesh cache), or
-  - A block edit changes opacity (break/place), and the affected region needs a light update.
-- Keep allocations low; prefer packed arrays/blobs and reuse scratch buffers.
+Goal
+----
+Reduce spikes (micro-stutter) by removing obvious per-frame allocations and avoidable
+O(n log n) work, without changing gameplay or visuals.
 
-If true flood-fill skylight is not performant enough with our systems, ship vertical-only skylight (top-down) as a fallback.
-
-Non-goals (do NOT implement in this task)
-----------------------------------------
-- Block light sources (torches, lava, glowstone).
-- Smooth lighting / vertex interpolation / per-corner light sampling.
-- Dynamic shadows (shadow maps).
-- Textures/material system.
-- Any gameplay/input/menu changes.
-
-Hard constraints (do NOT break)
--------------------------------
-- Pointer lock / relative mouse flow and all input + menu behavior.
-- World bounds and bedrock unbreakable.
-- Leaves remain translucent/alpha-rendered (they are currently `opaque=false`, `alpha<1`).
-- Renderer rebuild scheduling/budgeting and threaded meshing fallback behavior.
+Hard Constraints (Do Not Break)
+------------------------------
+- No gameplay, input, menu, or save-format changes.
+- No world-gen changes.
+- No lighting correctness changes (only performance refactors).
+- Keep pointer lock / bag / pause flows intact.
 - Keep files ASCII when practical.
-- Update `DEVLOG.md` for meaningful changes and `README.md` only if controls change (they shouldn't).
+- Minimal diffs; avoid broad refactors.
+- Update DEVLOG.md with a short perf entry. Do not change README.md.
 
-Key notes about our current code
---------------------------------
-- Meshing happens in a worker thread (`src/render/mesher_thread.lua`) using a (cs+2)^3 "block halo" payload.
-- Chunk meshes are built with per-vertex: Position (vec3), Normal (vec3), Color (vec4).
-- Greedy meshing merges faces by block id only; this will cause lighting artifacts unless the merge key includes light.
+Acceptance Criteria
+-------------------
+- Lower "Worst(1s)" spikes at idle and while turning the camera in place.
+- Fewer large spikes while moving and streaming.
+- No visible change to alpha rendering order compared to current behavior.
+- The touched hot paths no longer allocate new tables/functions every frame.
 
-Deliverables (what "done" means)
---------------------------------
-1) Skylight data exists (0..15) and is available to the mesher for any chunk being meshed.
-2) Chunk meshes render with alpha-like brightness:
-   - Top faces brightest; bottom darkest; side faces intermediate (classic Minecraft per-face shading).
-   - Grass under leaves is visibly darker.
-3) Block edits that change skylight occlusion update lighting without huge hitches:
-   - Breaking leaf blocks should brighten the ground underneath after rebuild.
-   - Placing opaque blocks should darken nearby spaces appropriately.
-4) No obvious chunk-boundary seams in lighting.
-5) Flood-fill mode is enabled by default IF it is performant; otherwise provide a vertical-only mode toggle.
-
-Implementation plan (do in this order)
+Implementation Plan (Do In This Order)
 --------------------------------------
 
-0) Add configuration + opacity definitions
-Files: `src/constants.lua`
+1) Alpha: Remove Per-Frame table.sort in Draw
+Files: src/render/ChunkRenderer.lua
 
-- Add `Constants.LIGHTING` with at least:
-  - `enabled` (bool)
-  - `mode` = `'floodfill'` or `'vertical'`
-  - `leafOpacity` (int 0..15, suggested start: 2)
-  - `maxUpdatesPerFrame` and/or `maxMillisPerFrame` for skylight propagation work
-  - `debugDraw` / `debugForceGrayscale` (optional)
-- Add a per-block skylight opacity definition:
-  - Either add `BLOCK_INFO[*].lightOpacity` explicitly, OR derive it:
-    - AIR: 0
-    - Opaque blocks: 15
-    - LEAF: use `Constants.LIGHTING.leafOpacity`
+Problem:
+- ChunkRenderer:draw currently sorts visible alpha chunks every frame:
+  - table.sort(alphaScratch, alphaSortBackToFront)
+- Alpha sort key is entry._sortDistSq (distance squared to camera), which depends on
+  camera position, not look direction.
 
-1) Store skylight per chunk (packed, low GC)
-Files: `src/world/ChunkWorld.lua` (and optionally a new module `src/world/Skylight.lua`)
+Solution:
+- Maintain a persistent alpha draw order list sorted by camera POSITION.
+- Rebuild/sort only when camera position changes or when alpha meshes are created/removed.
+- Avoid double culling: compute visibility once per frame, then draw alpha by filtering
+  the cached alpha list.
 
-Goal: Efficient per-voxel skylight for chunks that we actively mesh/render.
+Steps:
+A) Add renderer fields in ChunkRenderer.new:
+- self._drawFrameId = 0
+- self._alphaOrder = {}
+- self._alphaOrderCount = 0
+- self._alphaOrderDirty = true
+- self._alphaOrderCamX/Y/Z = nil
 
-Lifetime/pruning (required):
-- The renderer already prunes chunk meshes using a keep radius:
-  - `keepRadiusChunks = drawRadiusChunks + alwaysVisiblePaddingChunks + meshCachePaddingChunks`
-- Skylight storage MUST be pruned using the same keep radius (or a small superset, e.g. `keepRadiusChunks + 1` for flood-fill edge stability), otherwise memory will grow as the player moves.
-- Add something like `ChunkWorld:pruneSkyLightChunks(centerCx, centerCz, keepRadiusChunks)` and call it from `ChunkRenderer:setPriorityOriginWorld` (when `_pruneKeepRadius` is updated) or alongside `_pruneChunkMeshesStep`.
+B) Mark cached alpha list dirty when alpha presence changes:
+- In ChunkRenderer:_setChunkMeshEntry:
+  - Compare previous entry.alpha (nil/non-nil) vs new alphaMesh (nil/non-nil).
+  - If alpha presence changed, set self._alphaOrderDirty = true.
+- In any prune/remove path that deletes an entry with alpha, also set dirty.
 
-Recommended representation (simple first, optimize later):
-- Per chunk: 4096 bytes (u8) storing 0..15 per voxel.
-  - Implementation options:
-    - LuaJIT FFI `uint8_t[4096]` (fast, low overhead), OR
-    - `lovr.data.newBlob(4096)` (if random write is workable), OR
-    - a Lua string (hard to mutate; not recommended for incremental updates).
+C) Add a method ChunkRenderer:_ensureAlphaOrder(cameraX, cameraY, cameraZ):
+- If not dirty and camera position is unchanged (use epsilon on squared distance), return.
+- Otherwise rebuild:
+  - Clear self._alphaOrder using self._alphaOrderCount (no new tables).
+  - Iterate pairs(self._chunkMeshes) and collect entries where entry.alpha exists.
+  - Compute entry._sortDistSq = (entry.centerX - cameraX)^2 + (entry.centerY - cameraY)^2 + (entry.centerZ - cameraZ)^2
+  - Sort self._alphaOrder back-to-front using existing alphaSortBackToFront.
+  - Store cameraX/Y/Z to self._alphaOrderCam*, set dirty false, update count.
 
-Add these world APIs:
-- `ChunkWorld:getSkyLight(x, y, z) -> int 0..15`
-- `ChunkWorld:fillSkyLightHalo(cx, cy, cz, out) -> out`
-  - `out` matches `fillBlockHalo` layout: (cs+2)^3, with the same indexing scheme.
-  - Returned values are bytes 0..15.
-- `ChunkWorld:ensureSkyLightForChunk(cx, cy, cz) -> bool ready`
-  - Ensures skylight data exists for this chunk (and any needed neighbor data for correct meshing).
-  - In flood-fill mode, it may schedule async/incremental work and return false until ready.
+D) Refactor ChunkRenderer:draw:
+- At function start: self._drawFrameId = (self._drawFrameId or 0) + 1
+- In the existing pairs(self._chunkMeshes) visibility loop:
+  - Compute visibility once with _isVisibleChunk(...).
+  - If visible: set entry._visibleFrame = self._drawFrameId.
+  - Keep current opaqueScratch build/draw behavior (including optional opaque sort).
+  - Do NOT build/sort alphaScratch anymore.
+- Before alpha pass:
+  - Call self:_ensureAlphaOrder(cameraX, cameraY, cameraZ).
+- Alpha draw pass:
+  - Iterate i=1..self._alphaOrderCount in order.
+  - For each entry: if entry.alpha exists and entry._visibleFrame == self._drawFrameId then pass:draw(...).
+- Remove the old per-frame alphaScratch + table.sort(alphaScratch, ...) path.
 
-Important: Do NOT compute/store skylight for the entire 1280x1280x64 world in Lua tables (too much overhead).
+Notes:
+- Keep the existing alpha sort key (distance squared) to preserve current visual behavior.
+- Rebuild must happen when camera moves OR alpha meshes appear/disappear.
 
-2) Compute skylight: vertical pass (required, used by both modes)
-Files: `src/world/ChunkWorld.lua`
+2) Floodfill Lighting: Remove Per-Op Closure Allocation
+Files: src/world/lighting/FloodfillLighting.lua
 
-Implement a direct "from sky" vertical scan for skylight values.
+Problem:
+- _propagateSkyDarkFrom and _propagateSkyFloodFrom define a local tryNeighbor closure
+  on every call, then call it 6 times.
 
-Rules:
-- Skylight starts at 15 at the top of the world and travels downward.
-- The vertical scan does NOT attenuate through air (opacity 0 keeps light unchanged).
-- Light decreases only by the opacity of blocks it passes through.
-- Fully opaque blocks (opacity 15) block all further skylight below them.
+Solution:
+- Inline/unroll the 6 neighbor checks with straight-line code (no nested function).
+- Cache common locals (world, sizeX/sizeY/sizeZ) at top of the function.
 
-Pseudo:
-- For each world (x,z) column needed by the currently prepared chunks:
-  - `light = 15`
-  - For y = sizeY down to 1:
-    - `opacity = lightOpacity(blockAt(x,y,z))` (0..15)
-    - `light = max(light - opacity, 0)`
-    - `skyLight[x,y,z] = light`
-    - If `light == 0` and `opacity == 15`, you can early-out for remaining y as 0.
+Steps:
+- In FloodfillLighting:_propagateSkyDarkFrom (around where local function tryNeighbor exists):
+  - Remove the local function.
+  - Inline the neighbor checks for:
+    (x-1,y,z), (x+1,y,z), (x,y-1,z), (x,y+1,z), (x,y,z-1), (x,y,z+1)
+  - Keep logic identical (bounds, propagation bounds, enqueue dark/flood).
+  - Keep the final self:_enqueueSkyFlood(worldIndex, urgent) behavior.
+- In FloodfillLighting:_propagateSkyFloodFrom: do the same unroll.
 
-Vertical-only mode:
-- Stop after the vertical scan. This should already create strong "tree shadows" with leaf opacity > 0.
+3) Renderer: Eliminate Per-Frame Tables/Closures In Rebuild Paths
+Files: src/render/ChunkRenderer.lua
 
-3) Flood-fill skylight propagation (optional, preferred if performant)
-Files: `src/world/ChunkWorld.lua`
+Problem:
+- ChunkRenderer:rebuildDirty allocates per call:
+  - deferredEntries = {}
+  - local functions deferEntry and processRebuildEntry
+- ChunkRenderer:_applyThreadedResults allocates per call:
+  - local function processResult
 
-Implement alpha-like skylight spread into caves/overhangs.
+Solution:
+- Reuse a persistent deferred list table owned by the renderer.
+- Inline helper bodies or move them to methods so no per-call closures are created.
 
-Propagation rule (classic):
-- From a cell with light level L, consider 6 neighbors.
-- Neighbor candidate:
-  - `step = max(1, lightOpacity(neighborBlock))`
-  - `candidate = L - step`
-- If `candidate > neighborLight` and `candidate > 0`, set neighborLight and enqueue neighbor.
-- Do not propagate into fully opaque blocks in practice (they will have step=15 and candidate<=0).
+Steps:
+A) In ChunkRenderer.new add:
+- self._deferredEntries = {}
+- self._deferredCount = 0
 
-Important detail:
-- The vertical scan already gives "full strength" skylight down open columns.
-- Flood-fill handles sideways bleed and lighting inside structures/caves.
+B) In ChunkRenderer:rebuildDirty:
+- Replace local deferredEntries = {} with local deferredEntries = self._deferredEntries.
+- Track deferredCount as a number and clear tail using the previous count.
+- Remove local function deferEntry and inline its 2-line body at call sites.
+- Remove local function processRebuildEntry and inline its logic inside the while loop.
 
-Performance/scheduling requirements:
-- Flood fill must be incremental or time-budgeted:
-  - Add a queue of pending light updates in `ChunkWorld`.
-  - Implement the queue with O(1) head/tail indices (no `table.remove(..., 1)`), and avoid per-node `{x,y,z}` table allocations by storing packed indices.
-  - Process up to `Constants.LIGHTING.maxUpdatesPerFrame` OR `maxMillisPerFrame` per frame.
-- If this proves too slow, keep `mode='vertical'` as the shipped default and leave flood-fill behind a toggle.
+C) In ChunkRenderer:_applyThreadedResults:
+- Remove local function processResult(result).
+- Inline the logic where results are popped, OR move to a method like:
+  - ChunkRenderer:_processThreadedResult(result)
+  defined once at file scope.
 
-Integration point (required):
-- `ChunkWorld` currently has no `update()`; add `ChunkWorld:updateSkyLight(maxOps, maxMillis)` (or similar) and call it every frame from `GameState:_updateGame(dt)` BEFORE `renderer:rebuildDirty(...)`.
-- The update function must early-out fast when no work is queued to preserve the "near zero in-frame cost" requirement.
+Acceptance check:
+- After this change, rebuildDirty and _applyThreadedResults should not allocate new
+  tables/functions every frame.
 
-4) Update skylight on block edits (no huge hitches)
-Files: `src/world/ChunkWorld.lua`, `src/interaction/Interaction.lua` (only if needed), `src/game/GameState.lua` (only if needed)
+4) World Dirty Drain: Reuse self._dirty Table (No Table Swap)
+Files: src/world/ChunkWorld.lua
 
-When `ChunkWorld:set(x, y, z, value)` changes a block:
-- If the block's `lightOpacity` changes, skylight needs updating.
-- Requirements:
-  - Mark affected chunks dirty (already happens for mesh); ensure skylight changes also cause mesh rebuild where needed.
-  - Update skylight without doing a full-region recompute.
+Problem:
+- ChunkWorld:drainDirtyChunkKeys ends by assigning self._dirty = {} (per-call table alloc).
 
-Edit update strategy (must stay correct and hitch-free):
-- Vertical-only mode:
-  - Recompute skylight for the edited (x,z) column (and any columns you treat as affected by leaf opacity), then mark only the owning chunk dirty.
-- Flood-fill mode:
-  - Do NOT rely on a naive "bounded recompute" unless you handle boundary conditions; otherwise you can get incorrect light and seams at the recompute region edge.
-  - Prefer ONE of these approaches:
-    A) Incremental light update (accurate, fastest once implemented):
-       - Implement the standard two-queue update used by voxel engines: propagate increases when opening skylight, and propagate decreases when blocking skylight, across the cached active chunks.
-    B) Recompute the active lighting region from scratch (simpler, still viable because world Y=64):
-       - Define an active region in chunks: at least the renderer mesh keep radius (and ideally `+1` chunk) around the player.
-       - Re-run vertical scan for all columns in that region, then run flood-fill inside that region.
-       - Time-budget the work in `ChunkWorld:updateSkyLight` so edits do not hitch.
-- Dirty marking MUST account for skylight range:
-  - When an opacity change happens, mark dirty all chunks within `ceil(15 / CHUNK_SIZE)` chunks in X/Z (which is 1 for `CHUNK_SIZE=16`), even if the edit is not on a chunk boundary.
+Solution:
+- Clear the existing table while draining.
 
-5) Provide skylight to the mesher thread
-Files: `src/render/ChunkRenderer.lua`, `src/render/mesher_thread.lua`, `src/render/MeshWorker.lua` (only if needed)
+Steps:
+- In ChunkWorld:drainDirtyChunkKeys(out):
+  - When self._dirty is non-empty:
+    - for key in pairs(self._dirty) do
+      - count = count + 1; out[count] = key
+      - self._dirty[key] = nil
+    - end
+  - Preserve trimming of out tail to nil as it is today.
+  - Do not assign a new table to self._dirty.
 
-Add a second halo payload for skylight:
-- In `ChunkRenderer:_queueThreadedRebuild`, after `fillBlockHalo`:
-  - Call `world:fillSkyLightHalo(cx, cy, cz, skyHalo)`.
-  - Pack it similarly to `_packHaloBlob` (prefer blob fast path).
-  - Send as `job.skyHaloBlob` (or `job.skyHalo` fallback).
+Manual Verification
+-------------------
+Run: lovr .
 
-In `mesher_thread.lua`:
-- Decode `skyHaloBlob` the same way as `haloBlob`.
-- Sample per-face skylight from the neighbor/air-side voxel:
-  - For a face between `block` and `neighbor`, use `sky = skyHalo[index + neighborOffset]`.
+With CULL.drawRadiusChunks = 16, use F3 perf HUD and compare before/after:
+- Idle (not moving, not turning)
+- Turning in place (rotate only)
+- Moving across chunk boundaries (streaming)
 
-Important (current code gotcha):
-- `mesher_thread.lua` decodes `haloBlob` into a single shared scratch table. If you decode BOTH `haloBlob` and `skyHaloBlob`, you MUST decode into separate scratch buffers (or the arrays will alias and overwrite each other).
+Look at:
+- Perf: Frame ms and Worst(1s)
+- Rebuild: ... ms
+- LightQ: Pending/Tasks
 
-Fallback correctness:
-- Also update the synchronous meshing path (`ChunkRenderer:_buildChunkNaive` / `_buildChunkGreedy`) to sample skylight the same way, because it is used if the thread worker is disabled or fails.
-
-6) Prevent greedy meshing lighting artifacts
-Files: `src/render/mesher_thread.lua`
-
-Greedy meshing MUST NOT merge faces across different skylight values.
-- Update the greedy mask so the merge key includes:
-  - block id
-  - skylight sample for that face (0..15)
-  - (optionally) whether the face goes to the opaque or alpha output, though block id already implies this.
-
-Implementation tip:
-- Avoid bit ops: `mergeKey = blockId * 16 + skyLight` is sufficient for current block id range and is fast.
-
-7) Add a light attribute to vertices and render with a cheap shader
-Files: `src/render/ChunkRenderer.lua`, `src/render/mesher_thread.lua`, new shader module (e.g. `src/render/VoxelShader.lua`)
-
-Why:
-- Baking brightness into vertex colors would require remeshing for day/night changes.
-- Storing a light attribute lets us apply day/night with a uniform at draw time.
-
-Changes:
-- Add `VertexLight` to the mesh vertex format (verify LOVR 0.18 supported attribute type; prefer `float` if unsure).
-- Update all vertex emission paths (naive + greedy, indexed + non-indexed) to output the extra component.
-- Update any blob/packing stride constants (`VERTEX_FLOAT_STRIDE`) accordingly.
-
-Shader requirements:
-- Inputs: VertexColor (base color + alpha), VertexNormal, VertexLight (0..15 or 0..1).
-- Uniforms:
-  - `uSkySubtract` (0..15) derived from `Sky.timeOfDay` (emulates Minecraft "skylight subtracted").
-  - Brightness mapping for final light 0..15.
-    - Preferred: embed a `const float brightnessLUT[16] = ...;` directly in the shader code to avoid uniform-array send quirks.
-    - Alternative: `uBrightnessLUT[16]` uniform (ONLY if verified working with LOVR 0.18 `shader:send` semantics).
-- Face shading:
-  - Multiply by a constant based on the normal axis to match classic Minecraft:
-    - top: 1.0
-    - bottom: 0.5
-    - one side axis: 0.8
-    - other side axis: 0.6
-  - Derive this from `VertexNormal` so no extra attribute is needed.
-
-Draw integration:
-- In `GameState:draw`, before `renderer:draw`, set the shader once (push/pop state).
-- Do not allocate tables per frame for uniforms; reuse cached arrays.
-- Apply the shader to both opaque and alpha passes.
-
-8) Fallback behavior and toggles
-Files: `src/constants.lua`, `src/ui/HUD.lua` (optional), `src/input/Input.lua` (optional)
-
-Required:
-- A single config toggle `Constants.LIGHTING.mode`:
-  - `'floodfill'`: vertical + flood-fill propagation
-  - `'vertical'`: vertical only
-
-Optional (debug-friendly):
-- A HUD line showing lighting mode and/or a debug key to toggle modes (only if it does not conflict with existing controls).
-
-Verification checklist (required)
---------------------------------
-Run: `lovr .`
-
-Visual checks
-- Daytime: tree canopy creates clear dark patches on ground; sides are shaded darker than tops.
-- No obvious lighting seams at chunk boundaries while walking around.
-- Breaking/placing opaque blocks near a boundary updates lighting on both sides after rebuild.
-- Leaves filtering: raising `leafOpacity` increases darkness under trees (tuneable).
-
-Perf checks
-- Standing still in a fully built area: no lighting CPU work happening (queue stays empty).
-- Heavy rebuild moments (startup or after many edits): lighting work is budgeted and does not cause large spikes.
-- Threaded meshing still works (no worker crashes from larger job payloads).
-
-Search/spot-checks
-- `rg -n \"VertexLight\" src/render -S`
-- `rg -n \"fillSkyLightHalo|getSkyLight\" src/world -S`
-- `rg -n \"skyHalo\" src/render -S`
-
-Notes / common failure modes
-----------------------------
-- If greedy meshing ignores light in its merge key, shadows will "smear" into giant quads.
-- If skylight is computed only per chunk without considering neighbors, chunk edges will show seams.
-- If flood-fill is synchronous and unbounded, chunk load/edit events will hitch hard.
-- If leaf opacity is 0, trees will not cast the alpha-style "shadows" from the screenshot.
+Documentation
+-------------
+Add a DEVLOG.md entry dated 2026-02-20 summarizing:
+- alpha draw sorting cache
+- floodfill propagation unroll (no closures)
+- renderer rebuild path allocation removals
+- dirty drain table reuse

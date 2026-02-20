@@ -87,6 +87,26 @@ Constants.CULL = {
   meshCachePaddingChunks = 2
 }
 
+Constants.FOG = {
+  enabled = true,
+  -- If startDistance is nil, it derives from endDistance * startRatioOfEnd.
+  -- startDistance = 0,
+  -- If endDistance is nil, it derives from draw radius minus endPaddingBlocks.
+  -- endDistance = 0,
+  startRatioOfEnd = 0.58,
+  endPaddingBlocks = 4,
+  strength = 1.0,
+  -- < 1 starts ramping fog earlier and makes it feel denser.
+  densityExponent = 0.72,
+  -- Minimum atmospheric haze applied everywhere (0 disables baseline haze).
+  baseAmount = 0.04,
+  -- Height fog adds low-altitude volume for a thicker Minecraft-like feel.
+  -- heightStart = 0, -- absolute world Y cutoff (defaults from heightStartRatio).
+  heightStartRatio = 0.75,
+  heightFalloff = 0.018,
+  heightStrength = 0.22
+}
+
 Constants.MESH = {
   greedy = true,
   indexed = false

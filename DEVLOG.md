@@ -2,6 +2,14 @@
 
 ## 2026-02-20
 
+### World-Edge Fog Layer
+- Added distance fog in `src/render/VoxelShader.lua` so far chunks fade out instead of hard-cutting at the render boundary.
+- Fog uses horizontal camera distance and blends toward the current sky color, matching day/night transitions for cleaner world-edge masking.
+- Added fog tuning defaults in `src/constants.lua` under `Constants.FOG` (`enabled`, `startRatioOfEnd`, `endPaddingBlocks`, `strength`).
+- Updated `src/game/GameState.lua` to pass constants into `VoxelShader.new(...)` so fog/shader settings are configured from runtime constants.
+- Increased fog presence with denser defaults and added curve controls (`densityExponent`, `baseAmount`) in `src/constants.lua`.
+- Added low-altitude height fog in `src/render/VoxelShader.lua` (`heightStartRatio`, `heightFalloff`, `heightStrength`) for a thicker, more volumetric atmosphere.
+
 ### Frame-Time Spike Mitigation (Render Radius 16)
 - Optimized alpha draw ordering in `src/render/ChunkRenderer.lua`:
   - removed per-frame `alphaScratch` build/sort in `draw`.

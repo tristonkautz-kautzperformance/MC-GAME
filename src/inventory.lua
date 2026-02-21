@@ -29,10 +29,20 @@ local function clearSlot(slot)
   end
   slot.block = nil
   slot.count = 0
+  slot.durability = nil
 end
 
-function Inventory.new(defaultBlocks, slotCount, startCount, hotbarCount)
+local function sanitizeDurability(value)
+  local n = parseInteger(value)
+  if not n or n <= 0 then
+    return nil
+  end
+  return n
+end
+
+function Inventory.new(defaultBlocks, slotCount, startCount, hotbarCount, blockInfo)
   local self = setmetatable({}, Inventory)
+
   local totalSlots = parseInteger(slotCount) or 8
   if totalSlots < 1 then
     totalSlots = 1
@@ -53,39 +63,91 @@ function Inventory.new(defaultBlocks, slotCount, startCount, hotbarCount)
   self.slots = {}
   self.heldBlock = nil
   self.heldCount = 0
+  self.heldDurability = nil
+  self.blockInfo = blockInfo or {}
+
+  local defaultCount = parseInteger(startCount) or 0
 
   for i = 1, self.slotCount do
     local entry = defaultBlocks and defaultBlocks[i] or nil
     local block = nil
     local count = 0
+    local durability = nil
 
     if type(entry) == 'table' then
       block = entry.block or entry.id
       local explicitCount = parseInteger(entry.count)
       if block then
-        count = explicitCount or (startCount or 0)
+        count = explicitCount or defaultCount
       end
+      durability = sanitizeDurability(entry.durability)
     else
       block = entry
       if block then
-        count = startCount or 0
+        count = defaultCount
       end
     end
 
     block = parseInteger(block)
     count = parseInteger(count) or 0
-    if not block or block <= 0 or count <= 0 then
-      block = nil
-      count = 0
+
+    local slot = { block = nil, count = 0, durability = nil }
+    if block and block > 0 and count > 0 then
+      local stackable = self:isStackable(block)
+      if not stackable and count > 1 then
+        count = 1
+      end
+      slot.block = block
+      slot.count = count
+      if not stackable then
+        durability = sanitizeDurability(durability) or self:getDefaultDurability(block)
+        slot.durability = durability
+      end
     end
 
-    self.slots[i] = {
-      block = block,
-      count = count
-    }
+    self.slots[i] = slot
   end
 
   return self
+end
+
+function Inventory:getBlockInfo(block)
+  return self.blockInfo and self.blockInfo[block] or nil
+end
+
+function Inventory:isStackable(block)
+  local info = self:getBlockInfo(block)
+  if info and info.stackable == false then
+    return false
+  end
+  return true
+end
+
+function Inventory:getToolType(block)
+  local info = self:getBlockInfo(block)
+  if info and type(info.toolType) == 'string' then
+    return info.toolType
+  end
+  return nil
+end
+
+function Inventory:getDefaultDurability(block)
+  local info = self:getBlockInfo(block)
+  if not info then
+    return nil
+  end
+
+  local maxDurability = parseInteger(info.maxDurability)
+  if maxDurability and maxDurability > 0 then
+    return maxDurability
+  end
+
+  local durability = parseInteger(info.durability)
+  if durability and durability > 0 then
+    return durability
+  end
+
+  return nil
 end
 
 function Inventory:getHotbarCount()
@@ -125,12 +187,24 @@ function Inventory:getSlot(index)
   return self.slots[index]
 end
 
+function Inventory:getSelectedSlot()
+  return self.slots[self.selected]
+end
+
 function Inventory:getSelectedBlock()
   local slot = self.slots[self.selected]
-  if not slot or not slot.block or slot.count <= 0 then
+  if not slotHasStack(slot) then
     return nil
   end
   return slot.block
+end
+
+function Inventory:getSelectedToolType()
+  local slot = self.slots[self.selected]
+  if not slotHasStack(slot) then
+    return nil
+  end
+  return self:getToolType(slot.block)
 end
 
 function Inventory:hasHeldStack()
@@ -147,18 +221,62 @@ function Inventory:getHeldStack(out)
   end
   out.block = self.heldBlock
   out.count = self.heldCount
+  out.durability = self.heldDurability
   return out
+end
+
+function Inventory:_setHeldStack(block, count, durability)
+  block = parseInteger(block)
+  count = parseInteger(count) or 0
+  if not block or block <= 0 or count <= 0 then
+    self:_clearHeldStack()
+    return false
+  end
+
+  local stackable = self:isStackable(block)
+  if not stackable and count > 1 then
+    count = 1
+  end
+
+  self.heldBlock = block
+  self.heldCount = count
+  self.heldDurability = stackable and nil or (sanitizeDurability(durability) or self:getDefaultDurability(block))
+  return true
 end
 
 function Inventory:_clearHeldStack()
   self.heldBlock = nil
   self.heldCount = 0
+  self.heldDurability = nil
+end
+
+function Inventory:dropHeldStack(out)
+  if not self:hasHeldStack() then
+    return nil
+  end
+
+  if type(out) ~= 'table' then
+    out = {}
+  end
+  out.block = self.heldBlock
+  out.count = self.heldCount
+  out.durability = self.heldDurability
+  self:_clearHeldStack()
+  return out
 end
 
 function Inventory:consumeSelected(amount)
-  amount = amount or 1
+  amount = parseInteger(amount) or 1
+  if amount <= 0 then
+    return false
+  end
+
   local slot = self.slots[self.selected]
-  if not slot or not slot.block or slot.count < amount then
+  if not slotHasStack(slot) then
+    return false
+  end
+
+  if slot.count < amount then
     return false
   end
 
@@ -169,55 +287,207 @@ function Inventory:consumeSelected(amount)
   return true
 end
 
-function Inventory:canAdd(block, amount)
-  amount = amount or 1
-  block = parseInteger(block)
-  if not block or amount <= 0 then
-    return false
-  end
-
+function Inventory:_countEmptySlots()
+  local count = 0
   for i = 1, self.slotCount do
-    local slot = self.slots[i]
-    if slotHasStack(slot) and slot.block == block then
-      return true
+    if not slotHasStack(self.slots[i]) then
+      count = count + 1
     end
   end
-
-  for i = 1, self.slotCount do
-    local slot = self.slots[i]
-    if not slotHasStack(slot) then
-      return true
-    end
-  end
-
-  return false
+  return count
 end
 
-function Inventory:add(block, amount)
-  amount = amount or 1
+function Inventory:countEmptySlots()
+  return self:_countEmptySlots()
+end
+
+function Inventory:canAdd(block, amount)
+  return self:canAddStack(block, amount)
+end
+
+function Inventory:canAddStack(block, amount)
+  amount = parseInteger(amount) or 1
   block = parseInteger(block)
   if not block or amount <= 0 then
     return false
   end
 
-  for i = 1, self.slotCount do
-    local slot = self.slots[i]
-    if slotHasStack(slot) and slot.block == block then
-      slot.count = slot.count + amount
-      return true
+  if self:isStackable(block) then
+    for i = 1, self.slotCount do
+      local slot = self.slots[i]
+      if slotHasStack(slot) and slot.block == block then
+        return true
+      end
     end
+
+    for i = 1, self.slotCount do
+      if not slotHasStack(self.slots[i]) then
+        return true
+      end
+    end
+    return false
   end
 
+  return self:_countEmptySlots() >= amount
+end
+
+function Inventory:add(block, amount, durability)
+  local added = self:addStack(block, amount, durability)
+  return added >= (parseInteger(amount) or 1)
+end
+
+function Inventory:addStack(block, amount, durability)
+  amount = parseInteger(amount) or 1
+  block = parseInteger(block)
+  if not block or amount <= 0 then
+    return 0
+  end
+
+  if self:isStackable(block) then
+    for i = 1, self.slotCount do
+      local slot = self.slots[i]
+      if slotHasStack(slot) and slot.block == block then
+        slot.count = slot.count + amount
+        return amount
+      end
+    end
+
+    for i = 1, self.slotCount do
+      local slot = self.slots[i]
+      if not slotHasStack(slot) then
+        slot.block = block
+        slot.count = amount
+        slot.durability = nil
+        return amount
+      end
+    end
+
+    return 0
+  end
+
+  local remaining = amount
+  local added = 0
+  local entryDurability = sanitizeDurability(durability) or self:getDefaultDurability(block)
   for i = 1, self.slotCount do
     local slot = self.slots[i]
     if not slotHasStack(slot) then
       slot.block = block
-      slot.count = amount
-      return true
+      slot.count = 1
+      slot.durability = entryDurability
+      added = added + 1
+      remaining = remaining - 1
+      if remaining <= 0 then
+        break
+      end
     end
   end
 
-  return false
+  return added
+end
+
+function Inventory:_mergeHeldIntoSlot(slot)
+  if not self:isStackable(self.heldBlock) then
+    return false
+  end
+
+  slot.count = slot.count + self.heldCount
+  self:_clearHeldStack()
+  return true
+end
+
+function Inventory:_swapHeldWithSlot(slot)
+  local swapBlock = slot.block
+  local swapCount = slot.count
+  local swapDurability = slot.durability
+
+  slot.block = self.heldBlock
+  slot.count = self.heldCount
+  slot.durability = self.heldDurability
+
+  self.heldBlock = swapBlock
+  self.heldCount = swapCount
+  self.heldDurability = swapDurability
+  return true
+end
+
+function Inventory:interactAnySlot(slot, button)
+  if not slot then
+    return false
+  end
+
+  local actionButton = parseInteger(button) or 1
+  local hasSlotStack = slotHasStack(slot)
+
+  if actionButton == 1 then
+    if not self:hasHeldStack() then
+      if not hasSlotStack then
+        return false
+      end
+      self:_setHeldStack(slot.block, slot.count, slot.durability)
+      clearSlot(slot)
+      return true
+    end
+
+    if not hasSlotStack then
+      slot.block = self.heldBlock
+      slot.count = self.heldCount
+      slot.durability = self.heldDurability
+      self:_clearHeldStack()
+      return true
+    end
+
+    if slot.block == self.heldBlock and self:isStackable(slot.block) then
+      return self:_mergeHeldIntoSlot(slot)
+    end
+
+    return self:_swapHeldWithSlot(slot)
+  end
+
+  if actionButton ~= 2 then
+    return false
+  end
+
+  if not self:hasHeldStack() then
+    if not hasSlotStack then
+      return false
+    end
+    if not self:isStackable(slot.block) then
+      return false
+    end
+
+    slot.count = slot.count - 1
+    self:_setHeldStack(slot.block, 1, slot.durability)
+    if slot.count <= 0 then
+      clearSlot(slot)
+    end
+    return true
+  end
+
+  if not self:isStackable(self.heldBlock) then
+    return false
+  end
+
+  if not hasSlotStack then
+    slot.block = self.heldBlock
+    slot.count = 1
+    slot.durability = nil
+    self.heldCount = self.heldCount - 1
+    if self.heldCount <= 0 then
+      self:_clearHeldStack()
+    end
+    return true
+  end
+
+  if slot.block ~= self.heldBlock or not self:isStackable(slot.block) then
+    return false
+  end
+
+  slot.count = slot.count + 1
+  self.heldCount = self.heldCount - 1
+  if self.heldCount <= 0 then
+    self:_clearHeldStack()
+  end
+  return true
 end
 
 function Inventory:interactSlot(index)
@@ -225,38 +495,7 @@ function Inventory:interactSlot(index)
   if not slot then
     return false
   end
-
-  if not self:hasHeldStack() then
-    if not slotHasStack(slot) then
-      return false
-    end
-
-    self.heldBlock = slot.block
-    self.heldCount = slot.count
-    clearSlot(slot)
-    return true
-  end
-
-  if not slotHasStack(slot) then
-    slot.block = self.heldBlock
-    slot.count = self.heldCount
-    self:_clearHeldStack()
-    return true
-  end
-
-  if slot.block == self.heldBlock then
-    slot.count = slot.count + self.heldCount
-    self:_clearHeldStack()
-    return true
-  end
-
-  local swapBlock = slot.block
-  local swapCount = slot.count
-  slot.block = self.heldBlock
-  slot.count = self.heldCount
-  self.heldBlock = swapBlock
-  self.heldCount = swapCount
-  return true
+  return self:interactAnySlot(slot, 1)
 end
 
 function Inventory:stowHeldStack()
@@ -264,41 +503,50 @@ function Inventory:stowHeldStack()
     return true
   end
 
-  for i = 1, self.slotCount do
-    local slot = self.slots[i]
-    if slotHasStack(slot) and slot.block == self.heldBlock then
-      slot.count = slot.count + self.heldCount
-      self:_clearHeldStack()
-      return true
-    end
+  local added = self:addStack(self.heldBlock, self.heldCount, self.heldDurability)
+  if added <= 0 then
+    return false
   end
 
-  for i = 1, self.slotCount do
-    local slot = self.slots[i]
-    if not slotHasStack(slot) then
-      slot.block = self.heldBlock
-      slot.count = self.heldCount
-      self:_clearHeldStack()
-      return true
-    end
-  end
-
-  local fallbackIndex = clamp(self.selected, 1, self.slotCount)
-  local slot = self.slots[fallbackIndex]
-  if not slotHasStack(slot) then
-    slot.block = self.heldBlock
-    slot.count = self.heldCount
+  self.heldCount = self.heldCount - added
+  if self.heldCount <= 0 then
     self:_clearHeldStack()
     return true
   end
 
-  local swapBlock = slot.block
-  local swapCount = slot.count
-  slot.block = self.heldBlock
-  slot.count = self.heldCount
-  self.heldBlock = swapBlock
-  self.heldCount = swapCount
   return false
+end
+
+function Inventory:damageSelectedTool(amount)
+  amount = parseInteger(amount) or 1
+  if amount <= 0 then
+    return false
+  end
+
+  local slot = self.slots[self.selected]
+  if not slotHasStack(slot) then
+    return false
+  end
+
+  local toolType = self:getToolType(slot.block)
+  if not toolType then
+    return false
+  end
+
+  local durability = sanitizeDurability(slot.durability) or self:getDefaultDurability(slot.block)
+  if not durability then
+    clearSlot(slot)
+    return true
+  end
+
+  durability = durability - amount
+  if durability <= 0 then
+    clearSlot(slot)
+  else
+    slot.durability = durability
+  end
+
+  return true
 end
 
 function Inventory:getState(out)
@@ -320,12 +568,18 @@ function Inventory:getState(out)
     local slot = self.slots[i]
     local blockId = 0
     local count = 0
+    local durability = 0
     if slotHasStack(slot) then
       blockId = parseInteger(slot.block) or 0
       count = parseInteger(slot.count) or 0
       if blockId <= 0 or count <= 0 then
         blockId = 0
         count = 0
+      else
+        if not self:isStackable(blockId) and count > 1 then
+          count = 1
+        end
+        durability = sanitizeDurability(slot.durability) or 0
       end
     end
 
@@ -333,8 +587,9 @@ function Inventory:getState(out)
     if outSlot then
       outSlot.block = blockId
       outSlot.count = count
+      outSlot.durability = durability
     else
-      slotsOut[i] = { block = blockId, count = count }
+      slotsOut[i] = { block = blockId, count = count, durability = durability }
     end
   end
 
@@ -355,19 +610,27 @@ function Inventory:applyState(state)
     local source = (type(slots) == 'table') and slots[i] or nil
     local blockId = source and parseInteger(source.block) or nil
     local count = source and parseInteger(source.count) or nil
+    local durability = source and sanitizeDurability(source.durability) or nil
 
     local slot = self.slots[i]
     if not slot then
-      slot = { block = nil, count = 0 }
+      slot = { block = nil, count = 0, durability = nil }
       self.slots[i] = slot
     end
 
     if not blockId or blockId <= 0 or not count or count <= 0 then
-      slot.block = nil
-      slot.count = 0
+      clearSlot(slot)
     else
+      if not self:isStackable(blockId) and count > 1 then
+        count = 1
+      end
       slot.block = blockId
       slot.count = count
+      if self:isStackable(blockId) then
+        slot.durability = nil
+      else
+        slot.durability = durability or self:getDefaultDurability(blockId)
+      end
     end
   end
 

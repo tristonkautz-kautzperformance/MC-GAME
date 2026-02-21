@@ -21,12 +21,51 @@ local function sanitizeNumber(value, fallback)
   return value
 end
 
+local function isFiniteNumber(value)
+  return type(value) == 'number'
+    and value == value
+    and value ~= math.huge
+    and value ~= -math.huge
+end
+
 local function resetVec3(v, x, y, z)
   if v.set then
     v:set(x, y, z)
   else
     v.x, v.y, v.z = x, y, z
   end
+end
+
+local function getMouseAndWindowSpace()
+  local hasLovrMouse = lovr.mouse and lovr.mouse.getPosition
+  local hasSystemMouse = lovr.system and lovr.system.getMousePosition
+  local hasWindowPx = lovr.system and lovr.system.getWindowWidth and lovr.system.getWindowHeight
+  local hasWindowDims = lovr.system and lovr.system.getWindowDimensions
+
+  if hasLovrMouse then
+    local mx, my = lovr.mouse.getPosition()
+    -- lovr-mouse can report framebuffer-scaled coordinates; pair with pixel window size first.
+    if hasWindowPx then
+      return mx, my, lovr.system.getWindowWidth(), lovr.system.getWindowHeight()
+    end
+    if hasWindowDims then
+      return mx, my, lovr.system.getWindowDimensions()
+    end
+    return mx, my, nil, nil
+  end
+
+  if hasSystemMouse then
+    local mx, my = lovr.system.getMousePosition()
+    if hasWindowDims then
+      return mx, my, lovr.system.getWindowDimensions()
+    end
+    if hasWindowPx then
+      return mx, my, lovr.system.getWindowWidth(), lovr.system.getWindowHeight()
+    end
+    return mx, my, nil, nil
+  end
+
+  return nil, nil, nil, nil
 end
 
 local function getInventoryCounts(inventory, fallbackHotbar)
@@ -46,9 +85,220 @@ local function getInventoryCounts(inventory, fallbackHotbar)
   return hotbarCount, totalSlots, storageCount
 end
 
+local function areViewAnglesValid(leftAngle, rightAngle, upAngle, downAngle)
+  return isFiniteNumber(leftAngle)
+    and isFiniteNumber(rightAngle)
+    and isFiniteNumber(upAngle)
+    and isFiniteNumber(downAngle)
+    and leftAngle < 0
+    and rightAngle > 0
+    and upAngle > 0
+    and downAngle < 0
+    and leftAngle < rightAngle
+    and downAngle < upAngle
+    and math.abs(leftAngle) < 1.56
+    and math.abs(rightAngle) < 1.56
+    and math.abs(upAngle) < 1.56
+    and math.abs(downAngle) < 1.56
+end
+
+local function areTanFrustumValid(leftTan, rightTan, upTan, downTan)
+  return isFiniteNumber(leftTan)
+    and isFiniteNumber(rightTan)
+    and isFiniteNumber(upTan)
+    and isFiniteNumber(downTan)
+    and leftTan < 0
+    and rightTan > 0
+    and upTan > 0
+    and downTan < 0
+    and leftTan < rightTan
+    and downTan < upTan
+    and math.abs(leftTan) < 50
+    and math.abs(rightTan) < 50
+    and math.abs(upTan) < 50
+    and math.abs(downTan) < 50
+end
+
+local function coerceViewAngles(leftAngle, rightAngle, upAngle, downAngle)
+  if areViewAnglesValid(leftAngle, rightAngle, upAngle, downAngle) then
+    return leftAngle, rightAngle, upAngle, downAngle
+  end
+
+  if not (isFiniteNumber(leftAngle) and isFiniteNumber(rightAngle) and isFiniteNumber(upAngle) and isFiniteNumber(downAngle)) then
+    return nil
+  end
+  if not (leftAngle < 0 and rightAngle > 0 and upAngle > 0 and downAngle < 0) then
+    return nil
+  end
+
+  local maxAbs = math.max(math.abs(leftAngle), math.abs(rightAngle), math.abs(upAngle), math.abs(downAngle))
+  if maxAbs > math.pi and maxAbs <= 180 then
+    local degToRad = math.pi / 180
+    local l = leftAngle * degToRad
+    local r = rightAngle * degToRad
+    local u = upAngle * degToRad
+    local d = downAngle * degToRad
+    if areViewAnglesValid(l, r, u, d) then
+      return l, r, u, d
+    end
+  end
+
+  return nil
+end
+
+local function anglesToTanFrustum(leftAngle, rightAngle, upAngle, downAngle)
+  leftAngle, rightAngle, upAngle, downAngle = coerceViewAngles(leftAngle, rightAngle, upAngle, downAngle)
+  if not leftAngle then
+    return nil
+  end
+
+  local leftTan = math.tan(leftAngle)
+  local rightTan = math.tan(rightAngle)
+  local upTan = math.tan(upAngle)
+  local downTan = math.tan(downAngle)
+  if not areTanFrustumValid(leftTan, rightTan, upTan, downTan) then
+    return nil
+  end
+
+  return leftTan, rightTan, upTan, downTan
+end
+
+local function projectionToTanFrustum(projection)
+  local leftValue = tonumber(projection[1])
+  local rightValue = tonumber(projection[2])
+  local upValue = tonumber(projection[3])
+  local downValue = tonumber(projection[4])
+  if not leftValue or not rightValue or not upValue or not downValue then
+    return nil
+  end
+
+  local nearValue = tonumber(projection[5])
+  if nearValue and nearValue > 1e-6 then
+    local leftTan = leftValue / nearValue
+    local rightTan = rightValue / nearValue
+    local upTan = upValue / nearValue
+    local downTan = downValue / nearValue
+    if areTanFrustumValid(leftTan, rightTan, upTan, downTan) then
+      return leftTan, rightTan, upTan, downTan, 'pass.getProjection.frustum'
+    end
+  end
+
+  local leftTan, rightTan, upTan, downTan = anglesToTanFrustum(leftValue, rightValue, upValue, downValue)
+  if leftTan then
+    return leftTan, rightTan, upTan, downTan, 'pass.getProjection.angles'
+  end
+
+  if areTanFrustumValid(leftValue, rightValue, upValue, downValue) then
+    return leftValue, rightValue, upValue, downValue, 'pass.getProjection.tangent'
+  end
+
+  return nil
+end
+
+local function projectionAnglesFromMatrix(values, offsetXIndex, offsetYIndex)
+  local m00 = tonumber(values[1])
+  local m11 = tonumber(values[6])
+  local m02 = tonumber(values[offsetXIndex]) or 0
+  local m12 = tonumber(values[offsetYIndex]) or 0
+  if not m00 or not m11 or math.abs(m00) < 1e-6 or math.abs(m11) < 1e-6 then
+    return nil
+  end
+
+  local tanLeft = (-1 - m02) / m00
+  local tanRight = (1 - m02) / m00
+  local tanDown = (-1 - m12) / m11
+  local tanUp = (1 - m12) / m11
+
+  if not isFiniteNumber(tanLeft)
+    or not isFiniteNumber(tanRight)
+    or not isFiniteNumber(tanUp)
+    or not isFiniteNumber(tanDown) then
+    return nil
+  end
+
+  local leftAngle = math.atan(tanLeft)
+  local rightAngle = math.atan(tanRight)
+  local upAngle = math.atan(tanUp)
+  local downAngle = math.atan(tanDown)
+  if not areViewAnglesValid(leftAngle, rightAngle, upAngle, downAngle) then
+    return nil
+  end
+
+  return leftAngle, rightAngle, upAngle, downAngle
+end
+
+local function resolveViewAngles(pass, width, height, constants)
+  if pass then
+    if pass.getViewAngles then
+      local leftAngle, rightAngle, upAngle, downAngle = pass:getViewAngles(1)
+      local leftTan, rightTan, upTan, downTan = anglesToTanFrustum(leftAngle, rightAngle, upAngle, downAngle)
+      if leftTan then
+        return leftTan, rightTan, upTan, downTan, 'pass.getViewAngles'
+      end
+    end
+
+    if pass.getProjection then
+      local projection = { pass:getProjection(1) }
+      if #projection >= 4 then
+        local leftTan, rightTan, upTan, downTan, source = projectionToTanFrustum(projection)
+        if leftTan then
+          return leftTan, rightTan, upTan, downTan, source
+        end
+      end
+
+      local projectionMatrix = nil
+      if #projection >= 16 then
+        projectionMatrix = projection
+      elseif #projection == 1 and projection[1] and projection[1].unpack then
+        local ok, unpacked = pcall(function()
+          return { projection[1]:unpack() }
+        end)
+        if ok and unpacked and #unpacked >= 16 then
+          projectionMatrix = unpacked
+        end
+      end
+
+      if projectionMatrix then
+        local leftAngle, rightAngle, upAngle, downAngle = projectionAnglesFromMatrix(projectionMatrix, 9, 10)
+        if areViewAnglesValid(leftAngle, rightAngle, upAngle, downAngle) then
+          local leftTan, rightTan, upTan, downTan = anglesToTanFrustum(leftAngle, rightAngle, upAngle, downAngle)
+          if leftTan then
+            return leftTan, rightTan, upTan, downTan, 'projectionMatrix(9,10)'
+          end
+        end
+
+        leftAngle, rightAngle, upAngle, downAngle = projectionAnglesFromMatrix(projectionMatrix, 3, 7)
+        if areViewAnglesValid(leftAngle, rightAngle, upAngle, downAngle) then
+          local leftTan, rightTan, upTan, downTan = anglesToTanFrustum(leftAngle, rightAngle, upAngle, downAngle)
+          if leftTan then
+            return leftTan, rightTan, upTan, downTan, 'projectionMatrix(3,7)'
+          end
+        end
+      end
+    end
+  end
+
+  if lovr.headset and lovr.headset.getViewAngles then
+    local leftAngle, rightAngle, upAngle, downAngle = lovr.headset.getViewAngles(1)
+    local leftTan, rightTan, upTan, downTan = anglesToTanFrustum(leftAngle, rightAngle, upAngle, downAngle)
+    if leftTan then
+      return leftTan, rightTan, upTan, downTan, 'headset.getViewAngles'
+    end
+  end
+
+  local cull = (constants and constants.CULL) or {}
+  local fovDegrees = tonumber(cull.fovDegrees) or 90
+  fovDegrees = clamp(fovDegrees, 50, 130)
+  local halfVertical = math.rad(fovDegrees) * 0.5
+  local aspect = width / height
+  local halfHorizontal = math.atan(math.tan(halfVertical) * aspect)
+  return -math.tan(halfHorizontal), math.tan(halfHorizontal), math.tan(halfVertical), -math.tan(halfVertical), 'constants.fallback'
+end
+
 function HUD.new(constants)
   local self = setmetatable({}, HUD)
   self.constants = constants
+  self._hudDistance = 1.14
 
   self._forward = lovr.math.newVec3(0, 0, -1)
   self._right = lovr.math.newVec3(1, 0, 0)
@@ -60,14 +310,16 @@ function HUD.new(constants)
   self._hudLineCount = 0
   self._hudText = ''
   self._hudTextTimer = 0
+  self._uiRayDebug = 'n/a'
 
   local perf = constants.PERF or {}
   self._hudTextInterval = perf.hudUpdateInterval or 0.10
 
   self._helpText = table.concat({
-    'WASD move  Space jump  LMB attack/break  RMB place',
-    'Wheel/1-8 select  Click capture  Tab bag',
-    'Bag: Arrows/WASD move  Enter/Click move stack  Esc/Tab close',
+    'WASD move  Space jump  Hold LMB break',
+    'RMB: pickup/workbench/berry/place  Wheel/1-8 select',
+    'Bag/Workbench: LMB move stack  RMB split/place-1',
+    'Shift+RMB on workbench places block normally',
     'F3 perf HUD  F11 fullscreen  Esc unlock/menu  F1 help'
   }, '\n')
   self._tipText = 'F1 help  |  F3 perf HUD  |  Tab bag'
@@ -318,11 +570,185 @@ function HUD:_drawHotbar(pass, orientation, baseX, baseY, baseZ, right, up, forw
         'right',
         'bottom'
       )
+    elseif slot and slot.durability and slot.durability > 0 then
+      self:_text(
+        pass,
+        orientation,
+        baseX,
+        baseY,
+        baseZ,
+        right,
+        up,
+        forward,
+        tostring(math.floor(slot.durability)),
+        slotX + slotSize * 0.35,
+        panelY - slotSize * 0.36,
+        0.014,
+        0.96,
+        0.82,
+        0.58,
+        0.98,
+        'right',
+        'bottom'
+      )
     end
   end
 
   self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, selectedName, 0, panelY + panelHeight * 0.90, 0.024, 0.90, 0.92, 0.94, 0.93, 'center', 'middle')
   return panelWidth, panelY, panelHeight
+end
+
+function HUD:_buildMouseRay(pass, panelY, panelWidth, panelHeight, outRay)
+  local mouseSamples = {}
+  local mouseSampleCount = 0
+  if lovr.mouse and lovr.mouse.getPosition then
+    local mx, my = lovr.mouse.getPosition()
+    if mx and my then
+      mouseSampleCount = mouseSampleCount + 1
+      mouseSamples[mouseSampleCount] = { x = mx, y = my, source = 'lovr.mouse' }
+    end
+  end
+  if lovr.system and lovr.system.getMousePosition then
+    local mx, my = lovr.system.getMousePosition()
+    if mx and my then
+      mouseSampleCount = mouseSampleCount + 1
+      mouseSamples[mouseSampleCount] = { x = mx, y = my, source = 'lovr.system' }
+    end
+  end
+  if mouseSampleCount == 0 then
+    self._uiRayDebug = 'invalid.mouse'
+    return false
+  end
+
+  local dims = {}
+  local dimCount = 0
+  local function pushDims(w, h, label)
+    w, h = tonumber(w), tonumber(h)
+    if not w or not h or w <= 0 or h <= 0 then
+      return
+    end
+    for i = 1, dimCount do
+      local d = dims[i]
+      if math.abs(d.w - w) < 0.5 and math.abs(d.h - h) < 0.5 then
+        return
+      end
+    end
+    dimCount = dimCount + 1
+    dims[dimCount] = { w = w, h = h, label = label }
+  end
+
+  if pass and pass.getDimensions then
+    pushDims(pass:getDimensions(), 'passDims')
+  end
+  if lovr.system then
+    if lovr.system.getWindowWidth and lovr.system.getWindowHeight then
+      pushDims(lovr.system.getWindowWidth(), lovr.system.getWindowHeight(), 'windowPx')
+    end
+    if lovr.system.getWindowDimensions then
+      pushDims(lovr.system.getWindowDimensions(), 'windowDims')
+    end
+  end
+
+  if dimCount == 0 then
+    local mx, my, w, h = getMouseAndWindowSpace()
+    if mx and my and w and h and w > 0 and h > 0 then
+      pushDims(w, h, 'fallbackDims')
+      if mouseSampleCount == 0 then
+        mouseSampleCount = mouseSampleCount + 1
+        mouseSamples[mouseSampleCount] = { x = mx, y = my, source = 'fallbackMouse' }
+      end
+    end
+  end
+
+  if dimCount == 0 then
+    self._uiRayDebug = 'invalid.window'
+    return false
+  end
+
+  local referenceW = dims[1].w
+  local referenceH = dims[1].h
+  local tanLeft, tanRight, tanUp, tanDown, angleSource = resolveViewAngles(pass, referenceW, referenceH, self.constants)
+  if not areTanFrustumValid(tanLeft, tanRight, tanUp, tanDown) then
+    self._uiRayDebug = 'invalid.angles'
+    return false
+  end
+
+  local distance = self._hudDistance or 1.14
+  local panelHalfW = panelWidth * 0.5
+  local panelHalfH = panelHeight * 0.5
+
+  local bestScore = -math.huge
+  local bestX = nil
+  local bestY = nil
+  local bestSource = nil
+
+  local function evaluate(sample, d, useTopLeft)
+    local mx = sample.x
+    local my = sample.y
+    if mx < -1 or my < -1 or mx > d.w + 1 or my > d.h + 1 then
+      return
+    end
+
+    local ndcX = (mx / d.w) * 2 - 1
+    local ndcY
+    if useTopLeft then
+      ndcY = 1 - (my / d.h) * 2
+    else
+      ndcY = (my / d.h) * 2 - 1
+    end
+
+    local tx = (ndcX + 1) * 0.5
+    local ty = (ndcY + 1) * 0.5
+    local tanX = tanLeft + (tanRight - tanLeft) * tx
+    local tanY = tanDown + (tanUp - tanDown) * ty
+    local localX = tanX * distance
+    local localY = tanY * distance
+    if not (isFiniteNumber(localX) and isFiniteNumber(localY)) then
+      return
+    end
+
+    local dxOutside = math.max(math.abs(localX) - panelHalfW, 0)
+    local dyOutside = math.max(math.abs(localY - panelY) - panelHalfH, 0)
+    local score = -(dxOutside + dyOutside)
+    if dxOutside == 0 and dyOutside == 0 then
+      score = score + 10
+    end
+
+    if sample.source == 'lovr.mouse' and d.label == 'windowPx' then
+      score = score + 0.40
+    elseif sample.source == 'lovr.system' and d.label == 'windowDims' then
+      score = score + 0.40
+    end
+    if useTopLeft then
+      score = score + 0.20
+    end
+
+    if score > bestScore then
+      bestScore = score
+      bestX = localX
+      bestY = localY
+      bestSource = string.format('%s/%s/%s', sample.source, d.label, useTopLeft and 'top' or 'bottom')
+    end
+  end
+
+  for si = 1, mouseSampleCount do
+    local sample = mouseSamples[si]
+    for di = 1, dimCount do
+      local d = dims[di]
+      evaluate(sample, d, true)
+      evaluate(sample, d, false)
+    end
+  end
+
+  if not bestX or not bestY then
+    self._uiRayDebug = 'invalid.mapping'
+    return false
+  end
+
+  outRay.localX = bestX
+  outRay.localY = bestY
+  self._uiRayDebug = string.format('%s | %s', tostring(angleSource or 'unknown'), tostring(bestSource or 'unknown'))
+  return true
 end
 
 function HUD:_drawBagMenu(pass, orientation, baseX, baseY, baseZ, right, up, forward, state)
@@ -334,106 +760,114 @@ function HUD:_drawBagMenu(pass, orientation, baseX, baseY, baseZ, right, up, for
   local defaultHotbar = self.constants.HOTBAR_SLOT_COUNT or self.constants.INVENTORY_SLOT_COUNT or 8
   local hotbarCount, slotCount, storageCount = getInventoryCounts(inventory, defaultHotbar)
   local storageRows = math.ceil(storageCount / hotbarCount)
-  local sectionGap = (storageRows > 0) and 0.040 or 0
+  local sectionGap = (storageRows > 0) and 0.038 or 0
 
-  local slotSize = 0.086
+  local mode = state.inventoryMenuMode == 'workbench' and 'workbench' or 'bag'
+  local ingredientSlots = mode == 'workbench' and (state.workbenchCraftSlots or {}) or (state.bagCraftSlots or {})
+  local ingredientCols = mode == 'workbench' and 5 or 2
+  local ingredientRows = mode == 'workbench' and 5 or 1
+  local craftables = state.craftableOutputs or {}
+
+  local slotSize = 0.082
   local slotGap = 0.010
-  local panelPad = 0.022
-  local titleHeight = 0.070
-  local hintHeight = 0.038
+  local titleHeight = 0.072
+  local hintHeight = 0.040
+  local outputRowHeight = 0.060
 
-  local rowCount = storageRows + 1
-  local gridWidth = hotbarCount * slotSize + (hotbarCount - 1) * slotGap
-  local gridHeight = rowCount * slotSize + (rowCount - 1) * slotGap + sectionGap
-  local panelWidth = gridWidth + panelPad * 2
-  local panelHeight = gridHeight + panelPad * 2 + titleHeight + hintHeight
+  local invWidth = hotbarCount * slotSize + (hotbarCount - 1) * slotGap
+  local invHeight = (storageRows + 1) * slotSize + storageRows * slotGap + sectionGap
+  local ingredientWidth = ingredientCols * slotSize + (ingredientCols - 1) * slotGap
+  local ingredientHeight = ingredientRows * slotSize + (ingredientRows - 1) * slotGap
+  local outputsVisible = math.max(1, math.min(#craftables, 6))
+  local outputsHeight = outputsVisible * outputRowHeight
+
+  local leftWidth = invWidth + 0.06
+  local rightWidth = math.max(0.58, ingredientWidth + 0.16)
+  local contentHeight = math.max(invHeight + 0.07, ingredientHeight + outputsHeight + 0.20)
+  local panelWidth = leftWidth + rightWidth + 0.08
+  local panelHeight = contentHeight + titleHeight + hintHeight + 0.04
   local panelY = -0.065
 
-  self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, 0, 1.90, 1.14, 0.02, 0.02, 0.03, 0.58, 0.0006)
+  local panelLeft = -panelWidth * 0.5
+  local panelTop = panelY + panelHeight * 0.5
+  local leftCenterX = panelLeft + leftWidth * 0.5 + 0.02
+  local rightLeft = panelLeft + leftWidth + 0.05
+  local rightCenterX = rightLeft + rightWidth * 0.5
+  local contentTopY = panelTop - titleHeight - 0.025
+
+  local hover = state.uiHover
+  if type(hover) ~= 'table' then
+    hover = {}
+    state.uiHover = hover
+  end
+  hover.kind = nil
+  hover.index = nil
+  hover.source = nil
+  hover.outputIndex = nil
+
+  local ray = self._uiRay
+  if type(ray) ~= 'table' then
+    ray = {}
+    self._uiRay = ray
+  end
+
+  local mouseLocalX = nil
+  local mouseLocalY = nil
+  if self:_buildMouseRay(pass, panelY, panelWidth, panelHeight, ray) then
+    mouseLocalX = ray.localX
+    mouseLocalY = ray.localY
+  end
+
+  local function pointInRect(cx, cy, width, height)
+    if not mouseLocalX or not mouseLocalY then
+      return false
+    end
+    return mouseLocalX >= cx - width * 0.5
+      and mouseLocalX <= cx + width * 0.5
+      and mouseLocalY >= cy - height * 0.5
+      and mouseLocalY <= cy + height * 0.5
+  end
+
+  state.uiMouseInsideMenu = pointInRect(0, panelY, panelWidth, panelHeight)
+
+  local function setHover(kind, index, source, outputIndex)
+    hover.kind = kind
+    hover.index = index
+    hover.source = source
+    hover.outputIndex = outputIndex
+  end
+
+  self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, 0, 1.95, 1.16, 0.02, 0.02, 0.03, 0.58, 0.0006)
   self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, panelY, panelWidth + 0.010, panelHeight + 0.010, 0.18, 0.21, 0.26, 0.58, 0.0002)
   self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, panelY, panelWidth, panelHeight, 0.05, 0.06, 0.07, 0.92, 0.0001)
 
-  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Bag', 0, panelY + panelHeight * 0.5 - panelPad - 0.020, 0.032, 0.94, 0.96, 0.98, 0.98)
+  local title = mode == 'workbench' and 'Workbench' or 'Bag'
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, title, 0, panelTop - titleHeight * 0.50, 0.031, 0.94, 0.96, 0.98, 0.98)
 
   local selected = inventory and inventory.getSelectedIndex and inventory:getSelectedIndex() or 1
   selected = clamp(selected, 1, hotbarCount)
-  local cursorIndex = math.floor(tonumber(state.inventoryMenuCursor) or selected)
-  cursorIndex = clamp(cursorIndex, 1, slotCount)
 
-  local startX = -gridWidth * 0.5 + slotSize * 0.5
-  local firstRowY = panelY + panelHeight * 0.5 - panelPad - titleHeight - slotSize * 0.5
+  local function drawStackSlot(slot, x, y, isSelected, showNumber, slotIndex, hoverKind, hoverSource)
+    local hovered = pointInRect(x, y, slotSize, slotSize)
+    if hovered then
+      setHover(hoverKind, slotIndex, hoverSource, nil)
+    end
 
-  local function drawSlot(slotIndex, x, y, showNumber)
-    local isCursor = slotIndex == cursorIndex
-    local isSelected = slotIndex == selected
-
-    if isCursor then
-      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize + 0.012, slotSize + 0.012, 0.98, 0.89, 0.52, 0.30, -0.0002)
+    if hovered then
+      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize + 0.010, slotSize + 0.010, 0.98, 0.89, 0.52, 0.30, -0.0002)
     end
     if isSelected then
       self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize + 0.006, slotSize + 0.006, 0.66, 0.82, 0.98, 0.22, -0.0001)
     end
 
-    local slot = inventory:getSlot(slotIndex)
-    local hasStack = slot and slot.block and slot.count and slot.count > 0
-    local bgValue = showNumber and 0.17 or 0.13
-    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize, slotSize, bgValue, bgValue, bgValue + 0.01, 0.97, 0)
+    local bg = 0.14
+    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize, slotSize, bg, bg, bg + 0.01, 0.97, 0)
 
+    local hasStack = slot and slot.block and slot.count and slot.count > 0
     if hasStack then
       local info = self.constants.BLOCK_INFO[slot.block]
-      if info and info.color then
-        local color = info.color
-        self:_plane(
-          pass,
-          orientation,
-          baseX,
-          baseY,
-          baseZ,
-          right,
-          up,
-          forward,
-          x,
-          y,
-          slotSize * 0.62,
-          slotSize * 0.62,
-          sanitizeNumber(color[1], 0.6),
-          sanitizeNumber(color[2], 0.6),
-          sanitizeNumber(color[3], 0.6),
-          sanitizeNumber(info.alpha, 1),
-          -0.0003
-        )
-      else
-        self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize * 0.55, slotSize * 0.55, 0.08, 0.08, 0.09, 0.92, -0.0003)
-      end
-
-      if slot.count > 1 then
-        self:_text(
-          pass,
-          orientation,
-          baseX,
-          baseY,
-          baseZ,
-          right,
-          up,
-          forward,
-          tostring(slot.count),
-          x + slotSize * 0.35,
-          y - slotSize * 0.34,
-          0.018,
-          0.96,
-          0.96,
-          0.93,
-          0.98,
-          'right',
-          'bottom'
-        )
-      end
-    else
-      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize * 0.55, slotSize * 0.55, 0.08, 0.08, 0.09, 0.92, -0.0003)
-    end
-
-    if showNumber then
-      self:_text(
+      local color = info and info.color or nil
+      self:_plane(
         pass,
         orientation,
         baseX,
@@ -442,41 +876,127 @@ function HUD:_drawBagMenu(pass, orientation, baseX, baseY, baseZ, right, up, for
         right,
         up,
         forward,
-        tostring(slotIndex),
-        x - slotSize * 0.35,
-        y + slotSize * 0.37,
-        0.0135,
-        0.66,
-        0.71,
-        0.76,
-        0.88,
-        'left',
-        'top'
+        x,
+        y,
+        slotSize * 0.62,
+        slotSize * 0.62,
+        sanitizeNumber(color and color[1], 0.6),
+        sanitizeNumber(color and color[2], 0.6),
+        sanitizeNumber(color and color[3], 0.6),
+        sanitizeNumber(info and info.alpha, 1),
+        -0.0003
       )
+
+      if slot.count > 1 then
+        self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, tostring(slot.count), x + slotSize * 0.35, y - slotSize * 0.34, 0.018, 0.96, 0.96, 0.93, 0.98, 'right', 'bottom')
+      elseif slot.durability and slot.durability > 0 then
+        self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, tostring(math.floor(slot.durability)), x + slotSize * 0.35, y - slotSize * 0.34, 0.0135, 0.96, 0.82, 0.58, 0.98, 'right', 'bottom')
+      end
+    else
+      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, x, y, slotSize * 0.55, slotSize * 0.55, 0.08, 0.08, 0.09, 0.92, -0.0003)
+    end
+
+    if showNumber then
+      self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, tostring(slotIndex), x - slotSize * 0.35, y + slotSize * 0.37, 0.0135, 0.66, 0.71, 0.76, 0.88, 'left', 'top')
     end
   end
 
+  local invStartX = leftCenterX - invWidth * 0.5 + slotSize * 0.5
+  local invTopY = contentTopY - 0.010
+  local firstStorageRowY = invTopY - slotSize * 0.5
+
   if storageRows > 0 then
-    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Storage', 0, firstRowY + slotSize * 0.78, 0.018, 0.90, 0.92, 0.95, 0.92)
+    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Storage', leftCenterX, firstStorageRowY + slotSize * 0.78, 0.017, 0.90, 0.92, 0.95, 0.92)
   end
 
   for row = 1, storageRows do
-    local slotY = firstRowY - (row - 1) * (slotSize + slotGap)
+    local slotY = firstStorageRowY - (row - 1) * (slotSize + slotGap)
     for col = 1, hotbarCount do
       local storageOrdinal = (row - 1) * hotbarCount + col
       local slotIndex = hotbarCount + storageOrdinal
       if slotIndex <= slotCount then
-        local slotX = startX + (col - 1) * (slotSize + slotGap)
-        drawSlot(slotIndex, slotX, slotY, false)
+        local slotX = invStartX + (col - 1) * (slotSize + slotGap)
+        drawStackSlot(inventory:getSlot(slotIndex), slotX, slotY, false, false, slotIndex, 'inventory_slot', nil)
       end
     end
   end
 
-  local hotbarY = firstRowY - storageRows * (slotSize + slotGap) - sectionGap
-  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Hotbar', 0, hotbarY + slotSize * 0.78, 0.018, 0.90, 0.92, 0.95, 0.92)
+  local hotbarY = firstStorageRowY - storageRows * (slotSize + slotGap) - sectionGap
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Hotbar', leftCenterX, hotbarY + slotSize * 0.78, 0.017, 0.90, 0.92, 0.95, 0.92)
   for i = 1, hotbarCount do
-    local slotX = startX + (i - 1) * (slotSize + slotGap)
-    drawSlot(i, slotX, hotbarY, true)
+    local slotX = invStartX + (i - 1) * (slotSize + slotGap)
+    drawStackSlot(inventory:getSlot(i), slotX, hotbarY, i == selected, true, i, 'inventory_slot', nil)
+  end
+
+  local ingredientLabel = mode == 'workbench' and 'Workbench Ingredients' or 'Bag Ingredients'
+  local ingredientStartX = rightCenterX - ingredientWidth * 0.5 + slotSize * 0.5
+  local ingredientStartY = invTopY - slotSize * 0.5
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, ingredientLabel, rightCenterX, ingredientStartY + slotSize * 0.90, 0.017, 0.90, 0.95, 0.92, 0.94)
+
+  for row = 1, ingredientRows do
+    local slotY = ingredientStartY - (row - 1) * (slotSize + slotGap)
+    for col = 1, ingredientCols do
+      local ingredientIndex = (row - 1) * ingredientCols + col
+      local slotX = ingredientStartX + (col - 1) * (slotSize + slotGap)
+      drawStackSlot(ingredientSlots[ingredientIndex], slotX, slotY, false, false, ingredientIndex, 'ingredient_slot', mode)
+    end
+  end
+
+  local ingredientBottomY = ingredientStartY - (ingredientRows - 1) * (slotSize + slotGap) - slotSize * 0.5
+  local outputTopY = ingredientBottomY - 0.045
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'Craftable', rightCenterX, outputTopY + 0.028, 0.017, 0.90, 0.95, 0.92, 0.94)
+
+  local outputWidth = rightWidth - 0.060
+  local outputStartY = outputTopY - 0.034
+  local shown = math.min(#craftables, 6)
+  if shown == 0 then
+    local emptyY = outputStartY - outputRowHeight * 0.5
+    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, rightCenterX, emptyY, outputWidth, outputRowHeight - 0.006, 0.08, 0.09, 0.10, 0.92, 0)
+    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, 'No fully satisfied recipes', rightCenterX, emptyY, 0.0145, 0.70, 0.74, 0.78, 0.95)
+  else
+    for i = 1, shown do
+      local recipe = craftables[i]
+      local rowY = outputStartY - (i - 1) * outputRowHeight
+      local hovered = pointInRect(rightCenterX, rowY, outputWidth, outputRowHeight - 0.006)
+      if hovered then
+        setHover('craft_output', nil, mode, i)
+      end
+
+      local bgR, bgG, bgB, bgA = 0.09, 0.10, 0.12, 0.94
+      if hovered then
+        bgR, bgG, bgB, bgA = 0.20, 0.16, 0.09, 0.95
+      end
+
+      self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, rightCenterX, rowY, outputWidth, outputRowHeight - 0.006, bgR, bgG, bgB, bgA, 0)
+
+      local outputId = recipe and (recipe.outputId or (recipe.output and recipe.output.id)) or nil
+      local outputInfo = outputId and self.constants.BLOCK_INFO[outputId] or nil
+      local outputColor = outputInfo and outputInfo.color or nil
+      self:_plane(
+        pass,
+        orientation,
+        baseX,
+        baseY,
+        baseZ,
+        right,
+        up,
+        forward,
+        rightCenterX - outputWidth * 0.45,
+        rowY,
+        0.034,
+        0.034,
+        sanitizeNumber(outputColor and outputColor[1], 0.75),
+        sanitizeNumber(outputColor and outputColor[2], 0.75),
+        sanitizeNumber(outputColor and outputColor[3], 0.75),
+        sanitizeNumber(outputInfo and outputInfo.alpha, 1),
+        -0.0002
+      )
+
+      local name = recipe and (recipe.name or recipe.label) or 'Recipe'
+      local outCount = recipe and (recipe.outputCount or (recipe.output and recipe.output.count)) or 1
+      local label = string.format('%s x%d', name, outCount)
+      self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, label, rightCenterX - outputWidth * 0.40, rowY, 0.0145, 0.94, 0.95, 0.96, 0.97, 'left', 'middle')
+    end
   end
 
   local held = inventory and inventory.getHeldStack and inventory:getHeldStack() or nil
@@ -484,30 +1004,15 @@ function HUD:_drawBagMenu(pass, orientation, baseX, baseY, baseZ, right, up, for
     local heldInfo = self.constants.BLOCK_INFO[held.block]
     local heldName = heldInfo and heldInfo.name or 'Unknown'
     local heldText = string.format('Holding: %s x%d', heldName, held.count)
-    local heldX = panelWidth * 0.24
-    local heldY = panelY + panelHeight * 0.5 - panelPad - 0.022
-    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, heldX, heldY, panelWidth * 0.44, 0.040, 0.11, 0.12, 0.15, 0.86, 0)
-    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, heldText, heldX, heldY, 0.016, 0.97, 0.90, 0.66, 0.98, 'center', 'middle')
+    local heldY = panelY - panelHeight * 0.5 + hintHeight + 0.040
+    self:_plane(pass, orientation, baseX, baseY, baseZ, right, up, forward, 0, heldY, panelWidth * 0.44, 0.040, 0.11, 0.12, 0.15, 0.86, 0)
+    self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, heldText, 0, heldY, 0.016, 0.97, 0.90, 0.66, 0.98, 'center', 'middle')
   end
 
-  self:_text(
-    pass,
-    orientation,
-    baseX,
-    baseY,
-    baseZ,
-    right,
-    up,
-    forward,
-    'Arrows/WASD move  Enter/Click move stack  Tab/Esc close',
-    0,
-    panelY - panelHeight * 0.5 + panelPad + 0.010,
-    0.014,
-    0.80,
-    0.84,
-    0.90,
-    0.90
-  )
+  local hintText = mode == 'workbench'
+    and 'LMB move stack  RMB move one  Shift+Click output: craft max  Esc/Tab close'
+    or 'LMB move stack  RMB move one  Click output to craft  Shift+Click output: craft max'
+  self:_text(pass, orientation, baseX, baseY, baseZ, right, up, forward, hintText, 0, panelY - panelHeight * 0.5 + 0.017, 0.0138, 0.80, 0.84, 0.90, 0.92)
 end
 
 function HUD:_drawVitals(pass, orientation, baseX, baseY, baseZ, right, up, forward, state, hotbarWidth, hotbarY, hotbarHeight)
@@ -543,7 +1048,26 @@ function HUD:_rebuildHudText(state)
   count = count + 1
   lines[count] = string.format('Mouse: %s  |  Relative: %s', state.mouseStatusText or 'Unknown', state.relativeMouseReady and 'Yes' or 'No')
   count = count + 1
-  lines[count] = string.format('Bag: %s', state.inventoryMenuOpen and 'Open' or 'Closed')
+  local craftUiText = 'Closed'
+  if state.inventoryMenuOpen then
+    craftUiText = state.inventoryMenuMode == 'workbench' and 'Workbench' or 'Bag'
+  end
+  lines[count] = string.format('Craft UI: %s', craftUiText)
+  if state.inventoryMenuOpen then
+    local hoverKind = 'none'
+    local hover = state.uiHover
+    if type(hover) == 'table' and hover.kind then
+      hoverKind = tostring(hover.kind)
+    end
+    count = count + 1
+    lines[count] = string.format('UI Hover: %s  |  Inside: %s', hoverKind, state.uiMouseInsideMenu and 'yes' or 'no')
+    count = count + 1
+    local uiMapping = self._uiRayDebug or 'n/a'
+    if state.inventoryMenuScreen and state.uiMenuMouseDebug and state.uiMenuMouseDebug ~= '' then
+      uiMapping = state.uiMenuMouseDebug
+    end
+    lines[count] = string.format('UI Ray: %s', tostring(uiMapping))
+  end
   count = count + 1
   lines[count] = string.format('Mesh: %s', state.meshingMode or 'Unknown')
   count = count + 1
@@ -754,7 +1278,7 @@ function HUD:draw(pass, state)
   resetVec3(up, 0, 1, 0)
   up:rotate(cameraOrientation)
 
-  local distance = 1.14
+  local distance = self._hudDistance or 1.14
   local baseX = cameraX + forward.x * distance
   local baseY = cameraY + forward.y * distance
   local baseZ = cameraZ + forward.z * distance
@@ -762,9 +1286,19 @@ function HUD:draw(pass, state)
   pass:push('state')
   pass:setDepthWrite(false)
 
-  if state.inventoryMenuOpen then
+  if not state.inventoryMenuOpen then
+    if type(state.uiHover) == 'table' then
+      state.uiHover.kind = nil
+      state.uiHover.index = nil
+      state.uiHover.source = nil
+      state.uiHover.outputIndex = nil
+    end
+    state.uiMouseInsideMenu = false
+  end
+
+  if state.inventoryMenuOpen and not state.inventoryMenuScreen then
     self:_drawBagMenu(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state)
-  else
+  elseif not state.inventoryMenuOpen then
     self:_drawCrosshair(pass, cameraOrientation, baseX, baseY, baseZ, right, up, forward, state.targetActive)
 
     local targetName = state.targetName or 'None'

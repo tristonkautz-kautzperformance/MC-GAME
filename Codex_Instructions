@@ -1,190 +1,221 @@
 Codex Instructions (Codex 5.3)
 ==============================
 
-Task: Reduce Frame-Time Spikes (Render Radius 16)
-------------------------------------------------
+Task: Survival Baseline (Crafting, Tools, Drops, Pickups)
+--------------------------------------------------------
 
-Date: 2026-02-20
-
-Context
--------
-At render radius 16, average FPS is high (~250), but frame-time spikes occur:
-- Idle / looking around: spikes to 20ms+
-- Moving / streaming chunks: spikes to 60ms+
+Date: 2026-02-21
 
 Goal
 ----
-Reduce spikes (micro-stutter) by removing obvious per-frame allocations and avoidable
-O(n log n) work, without changing gameplay or visuals.
+Build the first playable survival loop:
+- spawn with an empty inventory
+- find and pick up world items (stick, flint, berry) via RMB interact (no vacuum)
+- craft flint tools in the bag crafting UI (bag crafting is always available)
+- hold-to-break blocks with visible crack overlay (not instant)
+- block drops spawn item entities (not auto-added to inventory)
+- craft/place a workbench to access the larger 5x5 crafting UI
+- craft stone tools (only better via durability, not speed)
+- berries restore hunger
 
-Hard Constraints (Do Not Break)
-------------------------------
-- No gameplay, input, menu, or save-format changes.
-- No world-gen changes.
-- No lighting correctness changes (only performance refactors).
-- Keep pointer lock / bag / pause flows intact.
+Hard Constraints
+----------------
+- Keep pointer lock / relative mouse behavior intact (lovr-mouse.lua, MouseLock).
 - Keep files ASCII when practical.
-- Minimal diffs; avoid broad refactors.
-- Update DEVLOG.md with a short perf entry. Do not change README.md.
+- Performance-first: cap and cull item entities; avoid per-frame table churn in hot loops.
+- Prefer minimal diffs and keep the current code style/architecture.
+- Update DEVLOG.md for meaningful changes and README.md for control changes.
 
-Acceptance Criteria
--------------------
-- Lower "Worst(1s)" spikes at idle and while turning the camera in place.
-- Fewer large spikes while moving and streaming.
-- No visible change to alpha rendering order compared to current behavior.
-- The touched hot paths no longer allocate new tables/functions every frame.
+Non-Goals (For This Pass)
+------------------------
+- No advanced UI polish beyond functional hover/click.
+- No persistent saving of world item entities (OK if they disappear on reload).
+- No recipe "gating" beyond crafting grid slot count rules.
 
-Implementation Plan (Do In This Order)
---------------------------------------
+Feature Requirements (Must Match Exactly)
+----------------------------------------
 
-1) Alpha: Remove Per-Frame table.sort in Draw
-Files: src/render/ChunkRenderer.lua
+1) Empty Spawn Inventory
+- New games must start with no items/blocks in hotbar or storage.
+- Remove the debug/default sword + blocks from defaults.
 
-Problem:
-- ChunkRenderer:draw currently sorts visible alpha chunks every frame:
-  - table.sort(alphaScratch, alphaSortBackToFront)
-- Alpha sort key is entry._sortDistSq (distance squared to camera), which depends on
-  camera position, not look direction.
+2) World Item Entities (Pickups + Drops)
+- Items: stick, flint, berry exist as world entities.
+- Pickup requires RMB interaction (raycast + range). No vacuum pickup.
+- Entity pickup must take priority over block placement and workbench open.
+- Entities are almost always 1x stacks; still support `count` for dropped block stacks.
+- Breaking blocks spawns entities at the broken block position (not auto inventory add).
 
-Solution:
-- Maintain a persistent alpha draw order list sorted by camera POSITION.
-- Rebuild/sort only when camera position changes or when alpha meshes are created/removed.
-- Avoid double culling: compute visibility once per frame, then draw alpha by filtering
-  the cached alpha list.
+3) Workbench Interaction Rules
+- Add a placeable workbench block crafted from wood.
+- RMB on a placed workbench opens the workbench crafting UI and suppresses block placement.
+- Shift+RMB on a workbench forces normal block placement behavior (override suppression).
 
-Steps:
-A) Add renderer fields in ChunkRenderer.new:
-- self._drawFrameId = 0
-- self._alphaOrder = {}
-- self._alphaOrderCount = 0
-- self._alphaOrderDirty = true
-- self._alphaOrderCamX/Y/Z = nil
+4) Inventory Cursor Rules (All Slot Grids)
+- True mouse hover hit-testing is required (not keyboard cursor).
+- LMB on a slot:
+  - if hand empty: pick up entire stack
+  - if hand holding: place/merge; if different item then swap
+- RMB on a slot:
+  - if hand holding: place exactly 1 into hovered slot (empty or same item only)
+  - if hand empty: pick up exactly 1 from hovered stack into hand
+- Clicking outside the UI drops the held stack into the world as item entities.
+- These rules apply to: inventory slots, bag crafting ingredient slots, workbench ingredient slots.
 
-B) Mark cached alpha list dirty when alpha presence changes:
-- In ChunkRenderer:_setChunkMeshEntry:
-  - Compare previous entry.alpha (nil/non-nil) vs new alphaMesh (nil/non-nil).
-  - If alpha presence changed, set self._alphaOrderDirty = true.
-- In any prune/remove path that deletes an entry with alpha, also set dirty.
+5) Crafting Model (Shapeless + "Fully Satisfied Only")
+- Crafting is shapeless (count-based).
+- UI shows ONLY craftables where all required ingredients are fully satisfied by the current
+  ingredient slots. Do not show partial matches.
+- Clicking output crafts 1. Shift+click crafts as many as possible (bounded by ingredients and
+  available inventory space).
+- Bag crafting grid is 2x1 (2 ingredient slots).
+- Workbench crafting grid is 5x5 (25 ingredient slots).
+- No other gating: if it fits in the available number of ingredient slots, it is craftable.
 
-C) Add a method ChunkRenderer:_ensureAlphaOrder(cameraX, cameraY, cameraZ):
-- If not dirty and camera position is unchanged (use epsilon on squared distance), return.
-- Otherwise rebuild:
-  - Clear self._alphaOrder using self._alphaOrderCount (no new tables).
-  - Iterate pairs(self._chunkMeshes) and collect entries where entry.alpha exists.
-  - Compute entry._sortDistSq = (entry.centerX - cameraX)^2 + (entry.centerY - cameraY)^2 + (entry.centerZ - cameraZ)^2
-  - Sort self._alphaOrder back-to-front using existing alphaSortBackToFront.
-  - Store cameraX/Y/Z to self._alphaOrderCam*, set dirty false, update count.
+6) Tools, Block Requirements, Durability
+- Tools required (hands cannot break these at all):
+  - Wood requires an axe (flint/stone).
+  - Stone requires a pickaxe (flint/stone).
+- Flint tools are the first tools craftable from world pickups and enable progression.
+- Stone tools are better ONLY via durability (keep break speed the same between tiers).
+- Durability decreases by 1 for each successful block break that used the tool.
+- When durability reaches 0, remove the tool from the slot.
+- Tools must be non-stackable (do not merge or split between slots via cursor logic).
 
-D) Refactor ChunkRenderer:draw:
-- At function start: self._drawFrameId = (self._drawFrameId or 0) + 1
-- In the existing pairs(self._chunkMeshes) visibility loop:
-  - Compute visibility once with _isVisibleChunk(...).
-  - If visible: set entry._visibleFrame = self._drawFrameId.
-  - Keep current opaqueScratch build/draw behavior (including optional opaque sort).
-  - Do NOT build/sort alphaScratch anymore.
-- Before alpha pass:
-  - Call self:_ensureAlphaOrder(cameraX, cameraY, cameraZ).
-- Alpha draw pass:
-  - Iterate i=1..self._alphaOrderCount in order.
-  - For each entry: if entry.alpha exists and entry._visibleFrame == self._drawFrameId then pass:draw(...).
-- Remove the old per-frame alphaScratch + table.sort(alphaScratch, ...) path.
+7) Block Breaking Over Time + Crack Overlay
+- Breaking is hold-to-break, not instant.
+- While holding LMB and targeting a breakable block:
+  - accumulate break progress with dt
+  - show crack overlay that advances through stages
+  - releasing LMB or changing target resets progress
+- When progress completes, set block to AIR and spawn drop entities.
 
-Notes:
-- Keep the existing alpha sort key (distance squared) to preserve current visual behavior.
-- Rebuild must happen when camera moves OR alpha meshes appear/disappear.
+8) Hunger + Berries
+- Eating a single berry restores 1/4 max hunger.
+  - With current default maxHunger=20, each berry restores 5 hunger.
+- Berry use should be via RMB when selected in hotbar, as long as no entity was picked up
+  and no workbench UI was opened.
 
-2) Floodfill Lighting: Remove Per-Op Closure Allocation
-Files: src/world/lighting/FloodfillLighting.lua
 
-Problem:
-- _propagateSkyDarkFrom and _propagateSkyFloodFrom define a local tryNeighbor closure
-  on every call, then call it 6 times.
+Implementation Notes (How To Fit This Repo)
+------------------------------------------
 
-Solution:
-- Inline/unroll the 6 neighbor checks with straight-line code (no nested function).
-- Cache common locals (world, sizeX/sizeY/sizeZ) at top of the function.
+Input + Interaction Priority (World Context)
+Order of operations for RMB while in game (inventory menu closed, mouse locked):
+1) If an item entity is targeted and in range: pick it up.
+2) Else if targeted block is a workbench and NOT Shift: open workbench UI (suppress place).
+3) Else if selected item is berry: eat berry (restore hunger, consume 1).
+4) Else: attempt normal block place (existing Interaction:tryPlace).
 
-Steps:
-- In FloodfillLighting:_propagateSkyDarkFrom (around where local function tryNeighbor exists):
-  - Remove the local function.
-  - Inline the neighbor checks for:
-    (x-1,y,z), (x+1,y,z), (x,y-1,z), (x,y+1,z), (x,y,z-1), (x,y,z+1)
-  - Keep logic identical (bounds, propagation bounds, enqueue dark/flood).
-  - Keep the final self:_enqueueSkyFlood(worldIndex, urgent) behavior.
-- In FloodfillLighting:_propagateSkyFloodFrom: do the same unroll.
+Hold-to-break:
+- Prefer polling `lovr.system.isMouseDown(1)` each frame and driving break progress off that.
+- Do not regress existing pointer-lock capture behavior.
 
-3) Renderer: Eliminate Per-Frame Tables/Closures In Rebuild Paths
-Files: src/render/ChunkRenderer.lua
+True Mouse Hover (3D HUD Panels)
+- Bag/workbench UIs are drawn as camera-facing panels in `src/ui/HUD.lua`.
+- Implement hit-testing by:
+  - using `lovr.system.getMousePosition()` and window size
+  - using `pass:getProjection(1)` (left/right/up/down) to compute a ray from the camera
+  - intersecting that ray with the HUD plane (same plane used for drawing)
+  - converting hit point to local panel coordinates (dot against camera right/up vectors)
+  - mapping local coordinates into hovered slot/button
+- Store hovered element in game state so click handling can use it.
 
-Problem:
-- ChunkRenderer:rebuildDirty allocates per call:
-  - deferredEntries = {}
-  - local functions deferEntry and processRebuildEntry
-- ChunkRenderer:_applyThreadedResults allocates per call:
-  - local function processResult
+Entity System
+- Create a lightweight item entity manager (suggested file: `src/items/ItemEntities.lua`):
+  - `spawn(id, x, y, z, count)`
+  - `update(dt, playerX, playerY, playerZ)` (cull far, simple bob/spin)
+  - `draw(pass, constants)` (draw small colored cube/plane using BLOCK_INFO color)
+  - `raycast(origin, dir, maxDistance, outHit)` (sphere hit test, nearest)
+  - `tryPickup(hit, inventory)`
+- Keep an upper cap on active entities (drop oldest/farthest if needed).
+- World "ambient" spawns:
+  - Spawn stick/flint/berry entities in newly-seen chunks near the player, using a seeded RNG
+    based on chunk coords + world seed. Track which chunks have been spawned this session to
+    avoid respawning while running.
+  - Do NOT spawn stone as an ambient pickup.
 
-Solution:
-- Reuse a persistent deferred list table owned by the renderer.
-- Inline helper bodies or move them to methods so no per-call closures are created.
+Tools + Non-Stackable Handling
+- Add a `stackable=false` flag in `Constants.BLOCK_INFO` for tool items.
+- Update inventory/cursor transfer logic to respect `stackable=false`:
+  - never merge stacks
+  - RMB "move 1" should be treated as no-op for non-stackables
 
-Steps:
-A) In ChunkRenderer.new add:
-- self._deferredEntries = {}
-- self._deferredCount = 0
+Crafting Containers
+- Implement separate ingredient slot containers for:
+  - bag: 2 slots
+  - workbench: 25 slots
+- Closing a crafting UI should attempt to return ingredient items to the player inventory;
+  any overflow should drop to the world as entities (do not delete items).
 
-B) In ChunkRenderer:rebuildDirty:
-- Replace local deferredEntries = {} with local deferredEntries = self._deferredEntries.
-- Track deferredCount as a number and clear tail using the previous count.
-- Remove local function deferEntry and inline its 2-line body at call sites.
-- Remove local function processRebuildEntry and inline its logic inside the while loop.
+Crack Overlay
+- Simple is OK: draw a translucent tinted cube slightly larger than the targeted block, with
+  alpha based on crack stage.
+- Keep the existing white outline if desired; crack overlay is additional feedback.
 
-C) In ChunkRenderer:_applyThreadedResults:
-- Remove local function processResult(result).
-- Inline the logic where results are popped, OR move to a method like:
-  - ChunkRenderer:_processThreadedResult(result)
-  defined once at file scope.
 
-Acceptance check:
-- After this change, rebuildDirty and _applyThreadedResults should not allocate new
-  tables/functions every frame.
+Data: IDs + Recipes (Use These)
+-------------------------------
 
-4) World Dirty Drain: Reuse self._dirty Table (No Table Swap)
-Files: src/world/ChunkWorld.lua
+IDs
+- Keep existing block ids (AIR..WATER) as-is.
+- Add: `Constants.BLOCK.WORKBENCH` as a new placeable block.
+- Add items (example ids, adjust if needed but keep them stable):
+  - STICK = 1101
+  - FLINT = 1102
+  - BERRY = 1103
+  - FLINT_SWORD = 1201
+  - FLINT_AXE = 1202
+  - FLINT_PICKAXE = 1203
+  - STONE_SWORD = 1301
+  - STONE_AXE = 1302
+  - STONE_PICKAXE = 1303
 
-Problem:
-- ChunkWorld:drainDirtyChunkKeys ends by assigning self._dirty = {} (per-call table alloc).
+Durability (Starting Values)
+- Flint tools: 80
+- Stone tools: 160
+- Break speed: keep identical between flint and stone (only durability differs).
 
-Solution:
-- Clear the existing table while draining.
+Recipes (Shapeless)
+Bag (2 ingredient slots):
+- Workbench: 4x WOOD -> 1x WORKBENCH block
+- Flint Sword: 2x FLINT + 1x STICK -> 1x FLINT_SWORD (durability 80)
+- Flint Axe: 2x FLINT + 2x STICK -> 1x FLINT_AXE (durability 80)
+- Flint Pickaxe: 3x FLINT + 2x STICK -> 1x FLINT_PICKAXE (durability 80)
 
-Steps:
-- In ChunkWorld:drainDirtyChunkKeys(out):
-  - When self._dirty is non-empty:
-    - for key in pairs(self._dirty) do
-      - count = count + 1; out[count] = key
-      - self._dirty[key] = nil
-    - end
-  - Preserve trimming of out tail to nil as it is today.
-  - Do not assign a new table to self._dirty.
+Workbench (5x5 ingredient slots):
+- Stone Sword: 2x STONE + 1x STICK + 1x FLINT -> 1x STONE_SWORD (durability 160)
+- Stone Axe: 2x STONE + 2x STICK + 1x FLINT -> 1x STONE_AXE (durability 160)
+- Stone Pickaxe: 3x STONE + 2x STICK + 1x FLINT -> 1x STONE_PICKAXE (durability 160)
 
-Manual Verification
--------------------
-Run: lovr .
+Rationale:
+- Stone tool recipes require 3 distinct ingredient types so they cannot fit in the 2-slot bag.
+  This enforces progression via grid size, not explicit gating.
 
-With CULL.drawRadiusChunks = 16, use F3 perf HUD and compare before/after:
-- Idle (not moving, not turning)
-- Turning in place (rotate only)
-- Moving across chunk boundaries (streaming)
 
-Look at:
-- Perf: Frame ms and Worst(1s)
-- Rebuild: ... ms
-- LightQ: Pending/Tasks
+Suggested Implementation Order (Do In This Order)
+------------------------------------------------
+1) Constants + empty inventory defaults; remove starter items.
+2) Item entity manager (spawn/draw/raycast/pickup/drop) wired into GameState.
+3) RMB world priority logic (entity pickup, workbench open w/ shift override, berry use, place).
+4) Hold-to-break + crack overlay + entity drops (replace instant break).
+5) Non-stackable tools + durability tracking.
+6) Mouse hover hit-testing for bag menu; convert bag UI to mouse-driven slot clicks.
+7) Bag crafting (2x1) with craft list + output click (shift for max).
+8) Workbench block place + workbench UI (5x5) + workbench crafting.
+9) Cleanup + docs (README controls, DEVLOG entry).
 
-Documentation
--------------
-Add a DEVLOG.md entry dated 2026-02-20 summarizing:
-- alpha draw sorting cache
-- floodfill propagation unroll (no closures)
-- renderer rebuild path allocation removals
-- dirty drain table reuse
+
+Acceptance Checklist (Manual)
+-----------------------------
+Run: `lovr .`
+- New game starts with empty hotbar/storage.
+- RMB on stick/flint/berry entity picks it up.
+- Bag (Tab) shows true mouse hover; LMB/RMB stack rules work; clicking outside drops held stack.
+- Craft flint axe/pick in bag; tools are non-stackable; durability shows and decreases on use.
+- Hands cannot break wood or stone at all.
+- Hold LMB breaks dirt/grass/etc over time; wood requires axe; stone requires pickaxe.
+- Breaking blocks spawns drop entities; RMB picks them up.
+- Craft/place workbench; RMB opens workbench UI; Shift+RMB places blocks normally.
+- Craft stone tools only in workbench (not possible in bag); stone tools last longer only.
+- Eating berry (RMB with berry selected) restores 5 hunger (maxHunger=20).

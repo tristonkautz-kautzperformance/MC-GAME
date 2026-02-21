@@ -7,8 +7,10 @@ local MouseLock = require 'src.input.MouseLock'
 local Input = require 'src.input.Input'
 local Interaction = require 'src.interaction.Interaction'
 local HUD = require 'src.ui.HUD'
+local InventoryMenu = require 'src.ui.InventoryMenu'
 local Sky = require 'src.sky.Sky'
 local MobSystem = require 'src.mobs.MobSystem'
+local ItemEntities = require 'src.items.ItemEntities'
 local ChunkRenderer = require 'src.render.ChunkRenderer'
 local VoxelShader = require 'src.render.VoxelShader'
 local SaveSystem = require 'src.save.SaveSystem'
@@ -63,41 +65,33 @@ local function worldToChunk(value, chunkSize, maxChunks)
   return clamp(chunk, 1, maxChunks)
 end
 
-local function getInventoryLayout(inventory)
-  local totalSlots = math.max(1, math.floor(tonumber(inventory and inventory.slotCount) or 1))
-  local hotbarCount = totalSlots
-  if inventory and inventory.getHotbarCount then
-    hotbarCount = math.floor(tonumber(inventory:getHotbarCount()) or totalSlots)
+local function newStackSlotArray(slotCount)
+  local slots = {}
+  for i = 1, slotCount do
+    slots[i] = { block = nil, count = 0, durability = nil }
   end
-  hotbarCount = clamp(hotbarCount, 1, totalSlots)
-
-  local storageCount = math.max(0, totalSlots - hotbarCount)
-  local storageRows = math.ceil(storageCount / hotbarCount)
-  return hotbarCount, totalSlots, storageCount, storageRows
+  return slots
 end
 
-local function slotIndexToGrid(index, hotbarCount, storageRows)
-  local slotIndex = math.max(1, math.floor(tonumber(index) or 1))
-  if slotIndex <= hotbarCount then
-    return storageRows + 1, slotIndex
-  end
-
-  local storageOrdinal = slotIndex - hotbarCount
-  local row = math.floor((storageOrdinal - 1) / hotbarCount) + 1
-  local col = ((storageOrdinal - 1) % hotbarCount) + 1
-  return row, col
+local function slotHasStack(slot)
+  return slot and slot.block and slot.count and slot.count > 0
 end
 
-local function gridToSlotIndex(row, col, hotbarCount, storageCount, storageRows)
-  if row == storageRows + 1 then
-    return col
+local function clearStackSlot(slot)
+  if not slot then
+    return
+  end
+  slot.block = nil
+  slot.count = 0
+  slot.durability = nil
+end
+
+local function isShiftDown()
+  if not (lovr.system and lovr.system.isKeyDown) then
+    return false
   end
 
-  local storageOrdinal = (row - 1) * hotbarCount + col
-  if storageOrdinal < 1 or storageOrdinal > storageCount then
-    return nil
-  end
-  return hotbarCount + storageOrdinal
+  return lovr.system.isKeyDown('lshift') or lovr.system.isKeyDown('rshift')
 end
 
 local function newStagePerfEntry()
@@ -129,8 +123,10 @@ function GameState.new(constants)
   self.input = nil
   self.interaction = nil
   self.hud = nil
+  self.inventoryMenuUi = nil
   self.sky = nil
   self.mobs = nil
+  self.itemEntities = nil
   self.renderer = nil
   self.voxelShader = nil
   self._voxelShaderError = nil
@@ -180,8 +176,19 @@ function GameState.new(constants)
   self._skyLightPassesLastFrame = 0
   self.relativeMouseReady = false
   self.inventoryMenuOpen = false
+  self.inventoryMenuMode = 'bag'
   self.inventoryMenuCursorIndex = 1
   self._inventoryMenuReturnLock = false
+  self._uiHover = { kind = nil, index = nil, source = nil, outputIndex = nil }
+  self._uiMouseInsideMenu = false
+  self._uiMenuMouseDebug = 'n/a'
+
+  self.bagCraftSlots = {}
+  self.workbenchCraftSlots = {}
+  self.craftableOutputs = {}
+  self._craftCounts = {}
+  self._craftCountKeys = {}
+  self._entityRayHitScratch = {}
   self._loaded = false
 
   return self
@@ -374,13 +381,421 @@ function GameState:_tickEnqueuedMetric(dt)
   self._enqueuedTimer = timer
 end
 
+function GameState:_getCraftingConfig()
+  return self.constants.CRAFTING or {}
+end
+
+function GameState:_resetCraftingSlots()
+  local crafting = self:_getCraftingConfig()
+  local bagCount = math.max(1, math.floor(tonumber(crafting.bagSlotCount) or 2))
+  local workbenchCount = math.max(1, math.floor(tonumber(crafting.workbenchSlotCount) or 25))
+  self.bagCraftSlots = newStackSlotArray(bagCount)
+  self.workbenchCraftSlots = newStackSlotArray(workbenchCount)
+  self.craftableOutputs = {}
+end
+
+function GameState:_getCraftSlotsForMode(mode)
+  if mode == 'workbench' then
+    return self.workbenchCraftSlots
+  end
+  return self.bagCraftSlots
+end
+
+function GameState:_getActiveCraftSlots()
+  return self:_getCraftSlotsForMode(self.inventoryMenuMode)
+end
+
+function GameState:_spawnDroppedStackAt(x, y, z, block, count, durability)
+  if not self.itemEntities then
+    return 0
+  end
+  return self.itemEntities:dropStack(x, y, z, block, count, durability)
+end
+
+function GameState:_dropStackNearPlayer(block, count, durability)
+  if not self.player then
+    return
+  end
+
+  local lookX, lookY, lookZ = self.player:getLookVector()
+  local dropX = self.player.x + lookX * 0.75
+  local dropY = self.player.y + self.player.eyeHeight * 0.62
+  local dropZ = self.player.z + lookZ * 0.75
+  self:_spawnDroppedStackAt(dropX, dropY, dropZ, block, count, durability)
+end
+
+function GameState:_dropHeldStackNearPlayer()
+  if not (self.inventory and self.inventory.dropHeldStack) then
+    return false
+  end
+
+  local held = self.inventory:dropHeldStack()
+  if not held then
+    return false
+  end
+
+  self:_dropStackNearPlayer(held.block, held.count, held.durability)
+  return true
+end
+
+function GameState:_returnCraftSlotsToInventory(slots)
+  if not slots or not self.inventory then
+    return
+  end
+
+  for i = 1, #slots do
+    local slot = slots[i]
+    if slotHasStack(slot) then
+      local added = 0
+      if self.inventory.addStack then
+        added = self.inventory:addStack(slot.block, slot.count, slot.durability)
+      end
+
+      local remaining = slot.count - added
+      if remaining > 0 then
+        self:_dropStackNearPlayer(slot.block, remaining, slot.durability)
+      end
+      clearStackSlot(slot)
+    end
+  end
+end
+
+function GameState:_returnAllCraftingItems()
+  self:_returnCraftSlotsToInventory(self.bagCraftSlots)
+  self:_returnCraftSlotsToInventory(self.workbenchCraftSlots)
+end
+
+function GameState:_collectCraftCounts(slots)
+  local counts = self._craftCounts
+  local keys = self._craftCountKeys
+
+  for i = 1, #keys do
+    counts[keys[i]] = nil
+    keys[i] = nil
+  end
+
+  local keyCount = 0
+  for i = 1, #slots do
+    local slot = slots[i]
+    if slotHasStack(slot) then
+      local id = slot.block
+      if counts[id] == nil then
+        keyCount = keyCount + 1
+        keys[keyCount] = id
+        counts[id] = slot.count
+      else
+        counts[id] = counts[id] + slot.count
+      end
+    end
+  end
+
+  return counts
+end
+
+function GameState:_refreshCraftableOutputs()
+  local crafting = self:_getCraftingConfig()
+  local recipes = self.inventoryMenuMode == 'workbench' and (crafting.workbenchRecipes or {}) or (crafting.bagRecipes or {})
+  local slots = self:_getActiveCraftSlots()
+  local counts = self:_collectCraftCounts(slots)
+  local outputs = self.craftableOutputs
+
+  local write = 0
+  for i = 1, #recipes do
+    local recipe = recipes[i]
+    local ingredients = recipe.ingredients or {}
+    local fullySatisfied = true
+    for blockId, needed in pairs(ingredients) do
+      if (counts[blockId] or 0) < needed then
+        fullySatisfied = false
+        break
+      end
+    end
+
+    if fullySatisfied then
+      write = write + 1
+      local out = outputs[write]
+      if not out then
+        out = {}
+        outputs[write] = out
+      end
+
+      local output = recipe.output or {}
+      local outputId = output.id
+      local info = self.constants.BLOCK_INFO[outputId]
+
+      out.recipe = recipe
+      out.outputId = outputId
+      out.outputCount = math.max(1, math.floor(tonumber(output.count) or 1))
+      out.outputDurability = output.durability
+      out.name = (info and info.name) or ('Item ' .. tostring(outputId))
+    end
+  end
+
+  for i = write + 1, #outputs do
+    outputs[i] = nil
+  end
+end
+
+function GameState:_computeIngredientCraftLimit(recipe, counts)
+  local ingredients = recipe.ingredients or {}
+  local limit = math.huge
+  local hasIngredient = false
+
+  for blockId, needed in pairs(ingredients) do
+    hasIngredient = true
+    local available = counts[blockId] or 0
+    local maxByThis = math.floor(available / needed)
+    if maxByThis < limit then
+      limit = maxByThis
+    end
+  end
+
+  if not hasIngredient or limit == math.huge then
+    return 0
+  end
+  return math.max(0, limit)
+end
+
+function GameState:_computeInventoryCraftLimit(recipe, ingredientLimit)
+  if ingredientLimit <= 0 or not self.inventory then
+    return 0
+  end
+
+  local output = recipe.output or {}
+  local outputId = output.id
+  if not outputId then
+    return 0
+  end
+
+  local outputCount = math.max(1, math.floor(tonumber(output.count) or 1))
+  local outputDurability = output.durability
+  local stackable = self.inventory.isStackable and self.inventory:isStackable(outputId) or true
+
+  if stackable then
+    if self.inventory.canAddStack and self.inventory:canAddStack(outputId, outputCount, outputDurability) then
+      return ingredientLimit
+    end
+    return 0
+  end
+
+  local emptySlots = self.inventory.countEmptySlots and self.inventory:countEmptySlots() or 0
+  local perCraft = outputCount
+  if perCraft <= 0 then
+    perCraft = 1
+  end
+  local maxByInventory = math.floor(emptySlots / perCraft)
+  if maxByInventory < 0 then
+    maxByInventory = 0
+  end
+  return math.min(ingredientLimit, maxByInventory)
+end
+
+function GameState:_consumeRecipeIngredients(slots, ingredients, craftCount)
+  if craftCount <= 0 then
+    return false
+  end
+
+  for _ = 1, craftCount do
+    for blockId, needed in pairs(ingredients) do
+      local remaining = needed
+      for i = 1, #slots do
+        local slot = slots[i]
+        if remaining <= 0 then
+          break
+        end
+        if slotHasStack(slot) and slot.block == blockId then
+          if slot.count > remaining then
+            slot.count = slot.count - remaining
+            remaining = 0
+          else
+            remaining = remaining - slot.count
+            clearStackSlot(slot)
+          end
+        end
+      end
+
+      if remaining > 0 then
+        return false
+      end
+    end
+  end
+
+  return true
+end
+
+function GameState:_craftOutputAt(outputIndex, craftMax)
+  local outputEntry = self.craftableOutputs[outputIndex]
+  if not outputEntry then
+    return false
+  end
+
+  local recipe = outputEntry.recipe
+  if not recipe then
+    return false
+  end
+
+  local slots = self:_getActiveCraftSlots()
+  local counts = self:_collectCraftCounts(slots)
+  local ingredientLimit = self:_computeIngredientCraftLimit(recipe, counts)
+  if ingredientLimit <= 0 then
+    return false
+  end
+
+  local desiredCraftCount = craftMax and ingredientLimit or 1
+  local craftCount = self:_computeInventoryCraftLimit(recipe, desiredCraftCount)
+  if craftCount <= 0 then
+    return false
+  end
+
+  local ingredients = recipe.ingredients or {}
+  if not self:_consumeRecipeIngredients(slots, ingredients, craftCount) then
+    return false
+  end
+
+  local output = recipe.output or {}
+  local outputId = output.id
+  local outputCount = math.max(1, math.floor(tonumber(output.count) or 1))
+  local outputDurability = output.durability
+  local stackable = self.inventory.isStackable and self.inventory:isStackable(outputId) or true
+
+  if stackable then
+    local total = outputCount * craftCount
+    local added = self.inventory:addStack(outputId, total, outputDurability)
+    local remaining = total - added
+    if remaining > 0 then
+      self:_dropStackNearPlayer(outputId, remaining, outputDurability)
+    end
+  else
+    for _ = 1, craftCount do
+      local added = self.inventory:addStack(outputId, outputCount, outputDurability)
+      local remaining = outputCount - added
+      if remaining > 0 then
+        self:_dropStackNearPlayer(outputId, remaining, outputDurability)
+      end
+    end
+  end
+
+  self:_refreshCraftableOutputs()
+  return true
+end
+
+function GameState:_handleInventoryClick(button)
+  if not self.inventory then
+    return false
+  end
+
+  local hover = self._uiHover
+  local clickButton = math.floor(tonumber(button) or 1)
+  local handled = false
+
+  if hover and hover.kind == 'inventory_slot' and hover.index then
+    local slot = self.inventory:getSlot(hover.index)
+    if slot and self.inventory.interactAnySlot then
+      handled = self.inventory:interactAnySlot(slot, clickButton)
+      if hover.index >= 1 and hover.index <= self.inventory:getHotbarCount() then
+        self.inventory:setSelectedIndex(hover.index)
+      end
+    end
+  elseif hover and hover.kind == 'ingredient_slot' and hover.index then
+    local ingredientSlots = self:_getCraftSlotsForMode(hover.source)
+    local slot = ingredientSlots and ingredientSlots[hover.index] or nil
+    if slot and self.inventory.interactAnySlot then
+      handled = self.inventory:interactAnySlot(slot, clickButton)
+    end
+  elseif hover and hover.kind == 'craft_output' and hover.outputIndex and clickButton == 1 then
+    handled = self:_craftOutputAt(hover.outputIndex, isShiftDown())
+  elseif not self._uiMouseInsideMenu then
+    handled = self:_dropHeldStackNearPlayer()
+  end
+
+  if handled then
+    self:_refreshCraftableOutputs()
+  end
+  return handled
+end
+
+function GameState:_tryConsumeBerry()
+  if not (self.inventory and self.stats) then
+    return false
+  end
+
+  local berryId = self.constants.ITEM and self.constants.ITEM.BERRY or nil
+  if not berryId then
+    return false
+  end
+
+  local selected = self.inventory:getSelectedBlock()
+  if selected ~= berryId then
+    return false
+  end
+
+  local maxHunger = tonumber(self.stats.maxHunger) or 20
+  local currentHunger = tonumber(self.stats.hunger) or 0
+  if currentHunger >= maxHunger then
+    return false
+  end
+
+  local restoreAmount = maxHunger * 0.25
+  if restoreAmount <= 0 then
+    return false
+  end
+
+  if not self.inventory:consumeSelected(1) then
+    return false
+  end
+
+  self.stats.hunger = clamp(currentHunger + restoreAmount, 0, maxHunger)
+  return true
+end
+
+function GameState:_spawnBlockDrop(blockBreakResult)
+  if not (self.itemEntities and blockBreakResult and blockBreakResult.block) then
+    return
+  end
+
+  local block = blockBreakResult.block
+  if block == self.constants.BLOCK.AIR then
+    return
+  end
+
+  local halfSize = tonumber(self.itemEntities.itemHalfSize) or 0.11
+  local groundY = (blockBreakResult.y - 1) + halfSize + 0.01
+  self.itemEntities:spawn(block, blockBreakResult.x - 0.5, groundY, blockBreakResult.z - 0.5, 1)
+end
+
+function GameState:_spawnAmbientAroundChunk(cx, cz)
+  if self.itemEntities and self.itemEntities.spawnAmbientAroundChunk then
+    self.itemEntities:spawnAmbientAroundChunk(cx, cz)
+  end
+end
+
+function GameState:_isEntityHitBlockedByBlock(entityHit, cameraX, cameraY, cameraZ)
+  if not (entityHit and entityHit.distance and self.interaction and self.interaction.targetHit) then
+    return false
+  end
+
+  local blockHit = self.interaction.targetHit
+  local blockCenterX = blockHit.x - 0.5
+  local blockCenterY = blockHit.y - 0.5
+  local blockCenterZ = blockHit.z - 0.5
+  local dx = blockCenterX - cameraX
+  local dy = blockCenterY - cameraY
+  local dz = blockCenterZ - cameraZ
+  local blockDistanceSq = dx * dx + dy * dy + dz * dz
+  local entityDistanceSq = entityHit.distance * entityHit.distance
+  return blockDistanceSq < entityDistanceSq
+end
+
 function GameState:_saveNow()
   if not self.saveSystem or not self.world then
     return false, 'missing_session'
   end
 
   if self.inventory and self.inventory.stowHeldStack then
-    self.inventory:stowHeldStack()
+    local stowed = self.inventory:stowHeldStack()
+    if not stowed then
+      self:_dropHeldStackNearPlayer()
+    end
   end
 
   return self.saveSystem:save(self.world, self.constants, self.player, self.inventory, self.sky, self.stats)
@@ -446,8 +861,10 @@ function GameState:_teardownSession()
   self.input = nil
   self.interaction = nil
   self.hud = nil
+  self.inventoryMenuUi = nil
   self.sky = nil
   self.mobs = nil
+  self.itemEntities = nil
   if self.renderer and self.renderer.shutdown then
     self.renderer:shutdown()
   end
@@ -467,8 +884,15 @@ function GameState:_teardownSession()
   self._enqueuedCount = 0
   self._enqueuedTimer = 0
   self.inventoryMenuOpen = false
+  self.inventoryMenuMode = 'bag'
   self.inventoryMenuCursorIndex = 1
   self._inventoryMenuReturnLock = false
+  self._uiHover = { kind = nil, index = nil, source = nil, outputIndex = nil }
+  self._uiMouseInsideMenu = false
+  self._uiMenuMouseDebug = 'n/a'
+  self.bagCraftSlots = {}
+  self.workbenchCraftSlots = {}
+  self.craftableOutputs = {}
 
   if self.mouseLock then
     self.mouseLock:unlock()
@@ -552,8 +976,10 @@ function GameState:_startSession(loadSave)
     self.constants.HOTBAR_DEFAULTS,
     self.constants.INVENTORY_SLOT_COUNT,
     self.constants.INVENTORY_START_COUNT,
-    self.constants.HOTBAR_SLOT_COUNT
+    self.constants.HOTBAR_SLOT_COUNT,
+    self.constants.BLOCK_INFO
   )
+  self:_resetCraftingSlots()
   if savedInventoryState then
     self.inventory:applyState(savedInventoryState)
   end
@@ -567,12 +993,19 @@ function GameState:_startSession(loadSave)
     self.input:setInventoryMenuOpen(false)
   end
   self.inventoryMenuOpen = false
+  self.inventoryMenuMode = 'bag'
   self.inventoryMenuCursorIndex = self.inventory:getSelectedIndex()
   self._inventoryMenuReturnLock = false
+  self._uiHover = { kind = nil, index = nil, source = nil, outputIndex = nil }
+  self._uiMouseInsideMenu = false
+  self._uiMenuMouseDebug = 'n/a'
+  self:_refreshCraftableOutputs()
   self.interaction = Interaction.new(self.constants, self.world, self.player, self.inventory)
   self.hud = HUD.new(self.constants)
+  self.inventoryMenuUi = InventoryMenu.new(self.constants)
   self.sky = Sky.new(self.constants)
   self.mobs = MobSystem.new(self.constants, self.world, self.player, self.stats)
+  self.itemEntities = ItemEntities.new(self.constants, self.world)
   do
     local mobConfig = self.constants.MOBS or {}
     local threshold = tonumber(mobConfig.skipAiWhenDirtyQueueAbove)
@@ -625,6 +1058,7 @@ function GameState:_startSession(loadSave)
     local pcz = worldToChunk(cameraZ, self.world.chunkSize, self.world.chunksZ)
     self._lastPlayerChunkX = pcx
     self._lastPlayerChunkZ = pcz
+    self:_spawnAmbientAroundChunk(pcx, pcz)
 
     local seedKeys = self._enqueueScratch
     local seedCount = self.world:enqueueChunkSquare(pcx, pcz, r, minCy, maxCy, seedKeys)
@@ -790,21 +1224,31 @@ function GameState:_updateMenu()
   self:_handleMenuAction(action)
 end
 
-function GameState:_setInventoryMenuOpen(open, skipRelock)
+function GameState:_setInventoryMenuOpen(open, skipRelock, mode)
   local nextState = open and true or false
-  self.inventoryMenuOpen = nextState
+  local nextMode = mode == 'workbench' and 'workbench' or 'bag'
 
+  if nextState and self.inventoryMenuOpen then
+    self.inventoryMenuMode = nextMode
+    self:_refreshCraftableOutputs()
+    return
+  end
+  if not nextState and not self.inventoryMenuOpen then
+    return
+  end
+
+  self.inventoryMenuOpen = nextState
   if self.input and self.input.setInventoryMenuOpen then
     self.input:setInventoryMenuOpen(nextState)
   end
 
   if nextState then
+    self.inventoryMenuMode = nextMode
     self._inventoryMenuReturnLock = (self.mouseLock and self.mouseLock.isLocked and self.mouseLock:isLocked()) and true or false
-    if self.inventory and self.inventory.getSelectedIndex then
-      self.inventoryMenuCursorIndex = self.inventory:getSelectedIndex()
-    else
-      self.inventoryMenuCursorIndex = 1
-    end
+    self._uiHover = { kind = nil, index = nil, source = nil, outputIndex = nil }
+    self._uiMouseInsideMenu = false
+    self._uiMenuMouseDebug = 'n/a'
+    self:_refreshCraftableOutputs()
     if self.mouseLock then
       self.mouseLock:unlock()
     end
@@ -813,10 +1257,21 @@ function GameState:_setInventoryMenuOpen(open, skipRelock)
 
   local shouldRelock = self._inventoryMenuReturnLock and not skipRelock
   self._inventoryMenuReturnLock = false
+  self.inventoryMenuMode = 'bag'
 
+  self:_returnAllCraftingItems()
   if self.inventory and self.inventory.stowHeldStack then
-    self.inventory:stowHeldStack()
+    local stowed = self.inventory:stowHeldStack()
+    if not stowed then
+      self:_dropHeldStackNearPlayer()
+    end
   end
+
+  self._uiHover = { kind = nil, index = nil, source = nil, outputIndex = nil }
+  self._uiMouseInsideMenu = false
+  self._uiMenuMouseDebug = 'n/a'
+  self:_refreshCraftableOutputs()
+
   if shouldRelock and self.mouseLock then
     self.mouseLock:lock()
   end
@@ -826,57 +1281,12 @@ function GameState:_toggleInventoryMenu()
   if not self.inventory then
     return
   end
-  self:_setInventoryMenuOpen(not self.inventoryMenuOpen)
-end
 
-function GameState:_moveInventoryCursor(dx, dy)
-  if not self.inventory then
-    return
+  if self.inventoryMenuOpen then
+    self:_setInventoryMenuOpen(false)
+  else
+    self:_setInventoryMenuOpen(true, false, 'bag')
   end
-
-  local hotbarCount, totalSlots, storageCount, storageRows = getInventoryLayout(self.inventory)
-  local totalRows = storageRows + 1
-  local cursorIndex = clamp(math.floor(tonumber(self.inventoryMenuCursorIndex) or 1), 1, totalSlots)
-  local row, col = slotIndexToGrid(cursorIndex, hotbarCount, storageRows)
-
-  local moveX = math.floor(tonumber(dx) or 0)
-  local moveY = math.floor(tonumber(dy) or 0)
-  if moveX == 0 and moveY == 0 then
-    return
-  end
-
-  row = clamp(row + moveY, 1, totalRows)
-  col = clamp(col + moveX, 1, hotbarCount)
-
-  local nextIndex = gridToSlotIndex(row, col, hotbarCount, storageCount, storageRows)
-  if not nextIndex and row <= storageRows then
-    for fallbackCol = hotbarCount, 1, -1 do
-      nextIndex = gridToSlotIndex(row, fallbackCol, hotbarCount, storageCount, storageRows)
-      if nextIndex then
-        break
-      end
-    end
-  end
-
-  if not nextIndex then
-    return
-  end
-
-  self.inventoryMenuCursorIndex = nextIndex
-  if nextIndex <= hotbarCount and self.inventory.setSelectedIndex then
-    self.inventory:setSelectedIndex(nextIndex)
-  end
-end
-
-function GameState:_interactInventoryCursor()
-  if not (self.inventory and self.inventory.interactSlot) then
-    return
-  end
-
-  local _, totalSlots = getInventoryLayout(self.inventory)
-  local cursorIndex = clamp(math.floor(tonumber(self.inventoryMenuCursorIndex) or 1), 1, totalSlots)
-  self.inventoryMenuCursorIndex = cursorIndex
-  self.inventory:interactSlot(cursorIndex)
 end
 
 function GameState:_placePlayerAtRespawn(spawnX, spawnY, spawnZ)
@@ -983,13 +1393,29 @@ function GameState:_updateGame(dt)
   end
 
   if self.inventoryMenuOpen then
-    local moveX, moveY = self.input:consumeInventoryMove()
-    if moveX ~= 0 or moveY ~= 0 then
-      self:_moveInventoryCursor(moveX, moveY)
+    self:_refreshCraftableOutputs()
+    if self.inventoryMenuUi and self.inventoryMenuUi.update then
+      local menuState = {
+        inventory = self.inventory,
+        inventoryMenuMode = self.inventoryMenuMode,
+        bagCraftSlots = self.bagCraftSlots,
+        workbenchCraftSlots = self.workbenchCraftSlots,
+        craftableOutputs = self.craftableOutputs,
+        uiHover = self._uiHover,
+        uiMouseInsideMenu = self._uiMouseInsideMenu,
+        uiMouseDebug = self._uiMenuMouseDebug
+      }
+      self.inventoryMenuUi:update(menuState)
+      self._uiHover = menuState.uiHover or self._uiHover
+      self._uiMouseInsideMenu = menuState.uiMouseInsideMenu == true
+      self._uiMenuMouseDebug = menuState.uiMouseDebug or self._uiMenuMouseDebug
     end
 
-    if self.input:consumeInventoryInteract() then
-      self:_interactInventoryCursor()
+    if self.input:consumeInventoryLeftClick() then
+      self:_handleInventoryClick(1)
+    end
+    if self.input:consumeInventoryRightClick() then
+      self:_handleInventoryClick(2)
     end
 
     self.input:consumeOpenMenu()
@@ -1038,6 +1464,7 @@ function GameState:_updateGame(dt)
 
     self._lastPlayerChunkX = pcx
     self._lastPlayerChunkZ = pcz
+    self:_spawnAmbientAroundChunk(pcx, pcz)
   end
 
   local _, daylight = self.sky:update(dt)
@@ -1063,6 +1490,9 @@ function GameState:_updateGame(dt)
   if self.stats then
     self.stats:update(dt)
   end
+  if self.itemEntities then
+    self.itemEntities:update(dt, cameraX, cameraY, cameraZ)
+  end
 
   if self:_handleDeathRespawn() then
     local respawnCameraX, respawnCameraY, respawnCameraZ = self.player:getCameraPosition()
@@ -1082,24 +1512,74 @@ function GameState:_updateGame(dt)
   if self.mobs then
     self.mobs:updateTarget(cameraX, cameraY, cameraZ, lookX, lookY, lookZ, self.player.reach)
   end
+
+  local entityHit = nil
+  if self.itemEntities then
+    entityHit = self.itemEntities:raycast(
+      cameraX,
+      cameraY,
+      cameraZ,
+      lookX,
+      lookY,
+      lookZ,
+      self.player.reach,
+      self._entityRayHitScratch
+    )
+  end
+  if entityHit and self:_isEntityHitBlockedByBlock(entityHit, cameraX, cameraY, cameraZ) then
+    entityHit = nil
+  end
+
+  local attackedMob = false
   if self.input:consumeBreak() then
-    local attackedMob = false
     if self.mobs then
       local combat = self.constants.COMBAT or {}
       local handDamage = tonumber(combat.handDamage) or 1
       local swordDamage = tonumber(combat.swordDamage) or 4
-      local selectedId = self.inventory and self.inventory:getSelectedBlock() or nil
-      local swordId = self.constants.ITEM and self.constants.ITEM.SWORD or nil
-      local damage = (selectedId == swordId) and swordDamage or handDamage
+      local selectedToolType = self.inventory and self.inventory.getSelectedToolType and self.inventory:getSelectedToolType() or nil
+      local damage = (selectedToolType == 'sword') and swordDamage or handDamage
       attackedMob = self.mobs:tryAttackTarget(damage)
     end
-
-    if not attackedMob then
-      self.interaction:tryBreak()
-    end
   end
+
+  local holdingBreak = false
+  if self.mouseLock and self.mouseLock.isLocked and self.mouseLock:isLocked() and lovr.system and lovr.system.isMouseDown then
+    holdingBreak = lovr.system.isMouseDown(1)
+  end
+  if attackedMob then
+    holdingBreak = false
+  end
+
+  local brokenBlock = self.interaction:updateBreaking(dt, holdingBreak)
+  if brokenBlock then
+    self:_spawnBlockDrop(brokenBlock)
+  end
+
   if self.input:consumePlace() then
-    self.interaction:tryPlace()
+    local handled = false
+
+    if entityHit then
+      if self.itemEntities then
+        self.itemEntities:tryPickup(entityHit, self.inventory)
+      end
+      handled = true
+    end
+
+    if not handled then
+      local hit = self.interaction.targetHit
+      if hit and hit.block == self.constants.BLOCK.WORKBENCH and not isShiftDown() then
+        self:_setInventoryMenuOpen(true, false, 'workbench')
+        handled = true
+      end
+    end
+
+    if not handled and self:_tryConsumeBerry() then
+      handled = true
+    end
+
+    if not handled then
+      self.interaction:tryPlace()
+    end
   end
 
   if self.input:consumeOpenMenu() then
@@ -1259,6 +1739,9 @@ function GameState:draw(pass)
   if drawRendererStartTime and drawRendererEndTime then
     drawRendererMs = (drawRendererEndTime - drawRendererStartTime) * 1000
   end
+  if self.itemEntities then
+    self.itemEntities:draw(pass)
+  end
   if self.mobs then
     self.mobs:draw(pass)
   end
@@ -1309,9 +1792,38 @@ function GameState:draw(pass)
   end
   local stats = self.stats
   local mobTargetName = self.mobs and self.mobs:getTargetName() or 'None'
+  local entityTargetName = 'None'
+  local entityTargetActive = false
+  if self.itemEntities and self.player then
+    local lookX, lookY, lookZ = self.player:getLookVector()
+    local entityHit = self.itemEntities:raycast(
+      cameraX,
+      cameraY,
+      cameraZ,
+      lookX,
+      lookY,
+      lookZ,
+      self.player.reach,
+      self._entityRayHitScratch
+    )
+    if entityHit and self:_isEntityHitBlockedByBlock(entityHit, cameraX, cameraY, cameraZ) then
+      entityHit = nil
+    end
+    if entityHit and entityHit.id then
+      local info = self.constants.BLOCK_INFO[entityHit.id]
+      entityTargetName = info and info.name or 'Item'
+      entityTargetActive = true
+    end
+  end
   local blockTargetName = self.interaction:getTargetName()
-  local targetName = mobTargetName ~= 'None' and mobTargetName or blockTargetName
-  local targetActive = mobTargetName ~= 'None' or self.interaction.targetHit ~= nil
+  local targetName = blockTargetName
+  if entityTargetActive then
+    targetName = entityTargetName
+  end
+  if mobTargetName ~= 'None' then
+    targetName = mobTargetName
+  end
+  local targetActive = mobTargetName ~= 'None' or entityTargetActive or self.interaction.targetHit ~= nil
   local shaderStatusText = self:_getShaderStatusText()
   local updateTotalMs, updateTotalWorstMs = self:_getStagePerf('updateTotal')
   local updateSimMs, updateSimWorstMs = self:_getStagePerf('updateSim')
@@ -1343,7 +1855,15 @@ function GameState:draw(pass)
   hudState.simulationRadiusChunks = tonumber(self._simulationChunkRadius) or 4
   hudState.inventory = self.inventory
   hudState.inventoryMenuOpen = self.inventoryMenuOpen
+  hudState.inventoryMenuScreen = self.inventoryMenuOpen and self.inventoryMenuUi ~= nil
+  hudState.inventoryMenuMode = self.inventoryMenuMode
   hudState.inventoryMenuCursor = self.inventoryMenuCursorIndex
+  hudState.bagCraftSlots = self.bagCraftSlots
+  hudState.workbenchCraftSlots = self.workbenchCraftSlots
+  hudState.craftableOutputs = self.craftableOutputs
+  hudState.uiHover = self._uiHover
+  hudState.uiMouseInsideMenu = self._uiMouseInsideMenu
+  hudState.uiMenuMouseDebug = self._uiMenuMouseDebug
   hudState.health = stats and stats.health or 20
   hudState.maxHealth = stats and stats.maxHealth or 20
   hudState.hunger = stats and stats.hunger or 20
@@ -1427,6 +1947,25 @@ function GameState:draw(pass)
   hudState.enqueuedCount = self._enqueuedCount
   hudState.enqueuedTimer = self._enqueuedTimer
   self.hud:draw(pass, hudState)
+  self._uiHover = hudState.uiHover or self._uiHover
+  self._uiMouseInsideMenu = hudState.uiMouseInsideMenu == true
+
+  if self.inventoryMenuOpen and self.inventoryMenuUi and self.inventoryMenuUi.draw then
+    local menuState = {
+      inventory = self.inventory,
+      inventoryMenuMode = self.inventoryMenuMode,
+      bagCraftSlots = self.bagCraftSlots,
+      workbenchCraftSlots = self.workbenchCraftSlots,
+      craftableOutputs = self.craftableOutputs,
+      uiHover = self._uiHover,
+      uiMouseInsideMenu = self._uiMouseInsideMenu,
+      uiMouseDebug = self._uiMenuMouseDebug
+    }
+    self.inventoryMenuUi:draw(pass, menuState)
+    self._uiHover = menuState.uiHover or self._uiHover
+    self._uiMouseInsideMenu = menuState.uiMouseInsideMenu == true
+    self._uiMenuMouseDebug = menuState.uiMouseDebug or self._uiMenuMouseDebug
+  end
 end
 
 function GameState:_toggleFullscreen()

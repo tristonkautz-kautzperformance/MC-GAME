@@ -2,6 +2,90 @@
 
 ## 2026-02-21
 
+### Bag UI Refactor (Pause-Style Screen Menu)
+- Added `src/ui/InventoryMenu.lua` to move bag/workbench interaction to a dedicated screen-space UI:
+  - orthographic menu rendering with fixed rectangle hitboxes (no 3D HUD raycast dependency)
+  - hover/click detection now uses direct mouse-vs-rect checks against inventory/ingredient/output entries
+  - preserves existing LMB/RMB/shift-click interaction rules by continuing to use `GameState:_handleInventoryClick`.
+- Updated `src/game/GameState.lua`:
+  - integrated `InventoryMenu` for per-frame hover updates while bag/workbench is open
+  - draws `InventoryMenu` as an overlay and keeps world simulation paused while the bag/workbench menu is active.
+- Updated `src/ui/HUD.lua`:
+  - skips legacy 3D bag panel rendering when the dedicated screen-space inventory menu is active.
+  - when the screen-space inventory menu is active, debug overlay now reports menu mouse-mapping diagnostics instead of legacy 3D UI ray text.
+
+### Inventory Menu Mouse Mapping Calibration
+- Updated `src/ui/InventoryMenu.lua` to auto-calibrate mouse coordinate mapping at runtime:
+  - tests candidate mappings from both mouse APIs (`lovr.system` / `lovr.mouse`) across raw, density-scaled, and window-scale conversions.
+  - picks the best candidate against the actual menu panel bounds each frame, then uses that coordinate for hover/click hit-testing.
+- Updated `src/game/GameState.lua` to store and forward inventory-menu mouse debug text (`uiMouseDebug`) to HUD diagnostics.
+
+### Inventory Menu Vertical Flip Fix
+- Corrected `src/ui/InventoryMenu.lua` orthographic projection setup to match LÖVR's top-left 2D screen-space convention.
+- This fixes a vertical inversion where visual slot placement and mouse hit-testing were mirrored on the Y axis.
+
+### Inventory Hover Alignment Stabilization
+- Updated `src/ui/HUD.lua` inventory hover mapping to remove drift across slots:
+  - mouse/window input now prefers `lovr.system.getMousePosition()` + window dimensions first, with `lovr.mouse` as fallback.
+  - projection sampling now uses a simpler `pass:getProjection(1)` angle/tangent path and avoids the previous matrix-extraction fallback branch.
+  - hover hit-testing now computes panel-local coordinates directly from frustum tangents and HUD panel distance (instead of world-space ray/plane intersection), keeping slot hitboxes aligned with rendered slot positions across the full menu.
+  - HUD panel draw distance is now a single shared value (`self._hudDistance`) for both rendering and hover mapping to prevent accidental mismatch.
+
+### Inventory Hover Hotfix (Non-Responsive Bag UI)
+- Updated `src/ui/HUD.lua` after bag hover/click became non-responsive:
+  - restored robust projection parsing for `pass:getProjection(1)` (frustum/near handling, angle/tangent fallback, matrix fallback).
+  - restored `lovr.mouse`-first mouse/window pairing path for environments using `lovr-mouse.lua` scaling behavior.
+  - kept direct local HUD-plane mapping (`tan * hudDistance`) so slot hit tests remain simple and deterministic.
+
+### Inventory Hover Robustness Pass (Mixed Coordinate Spaces)
+- Updated `src/ui/HUD.lua` hover mapping to tolerate runtime coordinate-space mismatches:
+  - bag hover now samples both mouse APIs (`lovr.mouse` and `lovr.system`) and multiple dimension spaces (`pass:getDimensions`, window pixel size, window logical size).
+  - per frame, the HUD picks the best candidate mapping against the actual bag panel bounds instead of assuming one fixed coordinate source.
+  - added richer `UI Ray` debug source strings (`angle-source | mouse-source/dim-source/y-origin`) to make future hover issues diagnosable immediately.
+
+### Survival Baseline Pass (Crafting, Tools, Drops, Pickups)
+- Updated `src/constants.lua` for survival content/data:
+  - empty spawn defaults (`HOTBAR_DEFAULTS = {}`, start count `0`)
+  - added `WORKBENCH` block id and item ids for stick/flint/berry + flint/stone tools
+  - tool metadata (`stackable = false`, `toolType`, durability values)
+  - added crafting data for bag (2 slots) and workbench (25 slots)
+  - added block break requirements (`wood -> axe`, `stone -> pickaxe`)
+- Reworked inventory stack logic in `src/inventory.lua`:
+  - non-stackable item handling, slot durability support, and generic slot interaction rules for LMB/RMB cursor behavior
+  - added held-stack drop/stow behavior and durability-aware state serialization
+- Added world item entity system in `src/items/ItemEntities.lua`:
+  - spawn/update/draw/raycast/pickup APIs
+  - active-entity cap + distance cull
+  - deterministic ambient chunk spawns for stick/flint/berry (session-tracked to avoid respawn spam)
+- Reworked world interaction flow in `src/game/GameState.lua`:
+  - RMB priority: entity pickup -> workbench open (unless Shift) -> berry use -> placement
+  - hold-to-break flow via `lovr.system.isMouseDown(1)` + block drop spawning into world entities
+  - bag/workbench crafting slot containers, shapeless fully-satisfied recipe output list, click-to-craft (+ shift craft max)
+  - closing crafting UIs now returns ingredients to inventory and drops overflow into world entities
+- Updated `src/interaction/Interaction.lua`:
+  - added break-progress state, tool-gated break checks, durability loss on successful tool-assisted breaks, and crack overlay rendering
+- Updated `src/ui/HUD.lua` and `src/input/Input.lua` for mouse-driven crafting UI:
+  - true pointer hover/hit-test against HUD plane using mouse position + `pass:getProjection(1)` ray generation
+  - inventory and ingredient slot click rules now use LMB/RMB behavior
+  - craft output buttons and held-stack outside-click drop behavior
+- Extended save compatibility in `src/save/SaveSystem.lua`:
+  - slot durability now serializes with save format and loads with backward compatibility
+- Updated `README.md` controls/features to document survival baseline interactions and crafting behavior.
+
+### Survival Follow-Up Fixes (Ground Pickups + Bag Mouse)
+- Updated `src/items/ItemEntities.lua` so world pickups render as static ground objects (removed bob/spin animation) and ambient spawns snap to terrain surface.
+- Improved ambient pickup availability across exploration:
+  - raised cull/draw distance defaults and reduced ambient spawn radius to near-player chunks
+  - guaranteed per-chunk ambient stick/flint/berry spawns for newly seen chunks
+- Fixed bag/workbench mouse click reliability:
+  - normalized mouse button handling in `src/input/Input.lua` for both numeric and string button IDs
+  - hardened HUD mouse ray generation in `src/ui/HUD.lua` with projection/view-angle fallbacks so hover hit-testing works across desktop projection variants.
+  - added mouse-position and window-size API fallbacks (`lovr.mouse.getPosition`, `lovr.system.getWindowWidth/Height`) for runtimes without `lovr.system.getMousePosition/getWindowDimensions`.
+  - hardened `main.lua` mouse callback argument parsing so button extraction works for multiple callback signatures.
+  - corrected hit-test distortion by keeping mouse/window units in the same coordinate space and coercing projection angle units (deg/rad) before ray generation.
+  - fixed a projection-path bug where `pass:getProjection` results with extra values (`near/far`) were ignored; HUD raycast now accepts the first four view angles from 4+ value returns and uses pass dimensions when available.
+  - revised HUD raycast frustum handling so `pass:getProjection` is interpreted correctly across angle/tangent/frustum-plane variants (including near/far-based frustum values) while keeping a stable angle-based world ray path.
+
 ### Mountain Biome Terrain Pass
 - Added mountain biome controls to `Constants.GEN` in `src/constants.lua`:
   - biome mask frequency/octaves/threshold

@@ -289,12 +289,16 @@ local function parseSave(lines, constants, options)
 
   local seenSlot = {}
   for i = 1, slotCount do
-    local slotIndexToken, blockToken, countToken = (lines[index] or ''):match(
-      '^slot%s+(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)$'
+    local slotIndexToken, blockToken, countToken, durabilityToken = (lines[index] or ''):match(
+      '^slot%s+(%-?%d+)%s+(%-?%d+)%s+(%-?%d+)%s*(%-?%d*)$'
     )
     local slotIndex = parseInteger(slotIndexToken)
     local blockId = parseInteger(blockToken)
     local count = parseInteger(countToken)
+    local durability = parseInteger(durabilityToken)
+    if durability == nil then
+      durability = 0
+    end
     if not slotIndex or slotIndex < 1 or slotIndex > slotCount or seenSlot[slotIndex] or not blockId or not count then
       return nil, 'corrupt', buildErrorInfo(version, savedAt)
     end
@@ -303,7 +307,8 @@ local function parseSave(lines, constants, options)
     if inventoryState then
       inventoryState.slots[slotIndex] = {
         block = blockId,
-        count = count
+        count = count,
+        durability = durability
       }
     end
     index = index + 1
@@ -559,16 +564,22 @@ function SaveSystem:save(world, constants, player, inventory, sky, stats)
     local slot = slotLines[i]
     local blockId = 0
     local count = 0
+    local durability = 0
     if slot then
       blockId = parseInteger(slot.block) or 0
       count = parseInteger(slot.count) or 0
+      durability = parseInteger(slot.durability) or 0
+      if durability < 0 then
+        durability = 0
+      end
       if blockId <= 0 or count <= 0 then
         blockId = 0
         count = 0
+        durability = 0
       end
     end
     lineCount = lineCount + 1
-    lines[lineCount] = string.format('slot %d %d %d', i, blockId, count)
+    lines[lineCount] = string.format('slot %d %d %d %d', i, blockId, count, durability)
   end
 
   local statsState = self._statsScratch

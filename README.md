@@ -4,21 +4,33 @@ Simple Minecraft-style prototype in Lua using LOVR.
 
 ## Features
 
-- Fixed voxel world size: `1280 x 1280 x 64` (`X x Z x Y`)
-- Block types: grass, dirt, stone, sand, water, bedrock, wood (tree), leaf
+- Fixed voxel world size: `1280 x 1280 x 96` (`X x Z x Y`)
+- Block types: grass, dirt, stone, sand, water, bedrock, wood (tree), leaf, workbench
   - Leaf rendering: opaque leaves with uniform color
 - First-person character controller:
   - WASD movement
   - Mouse look
   - Jump + gravity
   - Collision with blocks
-- Block interaction:
-  - Break blocks (except bedrock)
-  - Place selected block from inventory
+- Survival baseline loop:
+  - Start with an empty inventory
+  - Find static on-ground item pickups (stick, flint, berry) and pick them up with `RMB` (no vacuum)
+  - Craft in bag (2 ingredient slots) and in workbench (5x5 ingredient slots)
+  - Hold `LMB` to break blocks over time with crack overlay feedback
+  - Breaking blocks drops world item entities (not auto-added to inventory)
+  - Wood requires an axe and stone requires a pickaxe (hands cannot break those)
+  - Flint/stone tools are non-stackable and lose durability on successful block breaks
+  - Berries restore hunger when used with `RMB`
 - Inventory / hotbar UI:
   - 8-slot hotbar + bag storage
   - Number keys and mouse wheel selection
-  - Tab bag menu with full-stack move/swap across storage + hotbar
+  - Bag/workbench now open as a dedicated pause-style screen menu (world simulation pauses while open)
+  - Mouse-driven slot interactions (LMB move/swap, RMB split/place-one)
+  - Clicking outside the bag/workbench UI drops the held stack into the world
+- Workbench interaction:
+  - Craft a workbench from wood in the bag crafting UI
+  - `RMB` on placed workbench opens workbench crafting UI
+  - `Shift+RMB` on a workbench bypasses open behavior and performs normal placement logic
 - Basic survival stats scaffold:
   - Health and hunger values feed the HUD
   - Hunger drains over time
@@ -30,8 +42,8 @@ Simple Minecraft-style prototype in Lua using LOVR.
   - Default spawn caps are set to `0`, so no mobs spawn right now
   - Mob AI runs on a fixed tick and is temporarily skipped during heavy chunk-rebuild backlog
 - Combat starter:
-  - Added Sword item to hotbar
-  - Left click attacks targeted mobs (when enabled); sword deals higher damage than hand hits
+  - Left click attacks targeted mobs (when enabled)
+  - Sword-type tools deal higher mob damage than hand hits
 - Day/night cycle with animated sky color and sun/moon
 - Seeded procedural terrain (height + beaches + sea level) with sparse edit/feature overlays (no eager per-voxel base storage)
 - Chunked `16 x 16 x 16` mesh-based rendering + conservative culling + mesh cache pruning
@@ -55,13 +67,18 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - `WASD`: move
 - `Mouse`: look (when captured)
 - `Space`: jump
-- `Left Mouse`: click to capture mouse, then attack / break block
-- `Right Mouse`: place selected block (when captured)
+- `Left Mouse`: click to capture mouse, then hold to break blocks / attack mobs
+- `Right Mouse` world priority (when captured):
+  - pickup targeted world item entity
+  - open targeted workbench (`Shift` overrides this open behavior)
+  - consume selected berry
+  - place selected placeable block/item
 - `Mouse Wheel`: cycle hotbar
 - `1-8`: select hotbar slot
 - `Tab`: open/close bag menu (restores previous capture state when closed)
-- `Arrows` / `WASD` (bag open): move bag cursor
-- `Enter` / `Space` / `Left Mouse` (bag open): pick/place full stack
+- `Left Mouse` (bag/workbench open): pick/place/merge/swap full stack
+- `Right Mouse` (bag/workbench open): pick/place exactly 1 for stackable items
+- `Shift+Left Mouse` on craft output: craft as many as possible
 - `F1`: toggle help text
 - `F3`: toggle performance overlay (FPS + frame/chunk stats)
 - `F11`: toggle fullscreen (restarts app)

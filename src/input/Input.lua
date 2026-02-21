@@ -1,6 +1,25 @@
 local Input = {}
 Input.__index = Input
 
+local function normalizeMouseButton(button)
+  if button == 1 or button == 'l' or button == 'left' then
+    return 1
+  end
+  if button == 2 or button == 'r' or button == 'right' then
+    return 2
+  end
+  if button == 3 or button == 'm' or button == 'middle' then
+    return 3
+  end
+
+  local numeric = tonumber(button)
+  if numeric then
+    return math.floor(numeric)
+  end
+
+  return nil
+end
+
 function Input.new(mouseLock, inventory)
   local self = setmetatable({}, Input)
   self.mouseLock = mouseLock
@@ -21,9 +40,8 @@ function Input.new(mouseLock, inventory)
   self.wantToggleInventoryMenu = false
 
   self.inventoryMenuOpen = false
-  self.inventoryMoveX = 0
-  self.inventoryMoveY = 0
-  self.wantInventoryInteract = false
+  self.wantInventoryLeftClick = false
+  self.wantInventoryRightClick = false
 
   return self
 end
@@ -33,9 +51,8 @@ function Input:beginFrame()
   self.lookDy = 0
   self.wantBreak = false
   self.wantPlace = false
-  self.inventoryMoveX = 0
-  self.inventoryMoveY = 0
-  self.wantInventoryInteract = false
+  self.wantInventoryLeftClick = false
+  self.wantInventoryRightClick = false
 end
 
 function Input:onKeyPressed(key)
@@ -62,16 +79,6 @@ function Input:onKeyPressed(key)
   if self.inventoryMenuOpen then
     if key == 'escape' then
       self.wantToggleInventoryMenu = true
-    elseif key == 'left' or key == 'a' then
-      self.inventoryMoveX = self.inventoryMoveX - 1
-    elseif key == 'right' or key == 'd' then
-      self.inventoryMoveX = self.inventoryMoveX + 1
-    elseif key == 'up' or key == 'w' then
-      self.inventoryMoveY = self.inventoryMoveY - 1
-    elseif key == 'down' or key == 's' then
-      self.inventoryMoveY = self.inventoryMoveY + 1
-    elseif key == 'space' or key == 'return' or key == 'kpenter' then
-      self.wantInventoryInteract = true
     else
       local index = tonumber(key)
       if index and self.inventory then
@@ -120,9 +127,13 @@ function Input:onMouseMoved(dx, dy)
 end
 
 function Input:onMousePressed(button)
+  local mouseButton = normalizeMouseButton(button)
+
   if self.inventoryMenuOpen then
-    if button == 1 then
-      self.wantInventoryInteract = true
+    if mouseButton == 1 then
+      self.wantInventoryLeftClick = true
+    elseif mouseButton == 2 then
+      self.wantInventoryRightClick = true
     end
     return
   end
@@ -134,9 +145,9 @@ function Input:onMousePressed(button)
     return
   end
 
-  if button == 1 then
+  if mouseButton == 1 then
     self.wantBreak = true
-  elseif button == 2 then
+  elseif mouseButton == 2 then
     self.wantPlace = true
   end
 end
@@ -171,9 +182,8 @@ function Input:onFocus(focused)
     self.wantQuit = false
     self.wantToggleInventoryMenu = false
     self.inventoryMenuOpen = false
-    self.inventoryMoveX = 0
-    self.inventoryMoveY = 0
-    self.wantInventoryInteract = false
+    self.wantInventoryLeftClick = false
+    self.wantInventoryRightClick = false
   end
 end
 
@@ -186,9 +196,8 @@ function Input:setInventoryMenuOpen(open)
   self.wantJump = false
   self.wantBreak = false
   self.wantPlace = false
-  self.inventoryMoveX = 0
-  self.inventoryMoveY = 0
-  self.wantInventoryInteract = false
+  self.wantInventoryLeftClick = false
+  self.wantInventoryRightClick = false
 end
 
 function Input:isInventoryMenuOpen()
@@ -263,18 +272,24 @@ function Input:consumeToggleInventoryMenu()
   return v
 end
 
+function Input:consumeInventoryLeftClick()
+  local v = self.wantInventoryLeftClick
+  self.wantInventoryLeftClick = false
+  return v
+end
+
+function Input:consumeInventoryRightClick()
+  local v = self.wantInventoryRightClick
+  self.wantInventoryRightClick = false
+  return v
+end
+
 function Input:consumeInventoryMove()
-  local x = self.inventoryMoveX
-  local y = self.inventoryMoveY
-  self.inventoryMoveX = 0
-  self.inventoryMoveY = 0
-  return x, y
+  return 0, 0
 end
 
 function Input:consumeInventoryInteract()
-  local v = self.wantInventoryInteract
-  self.wantInventoryInteract = false
-  return v
+  return false
 end
 
 function Input:consumeQuit()

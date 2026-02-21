@@ -186,11 +186,22 @@ Constants.BLOCK = {
   WOOD = 5,
   LEAF = 6,
   SAND = 7,
-  WATER = 8
+  WATER = 8,
+  WORKBENCH = 9
 }
 
 Constants.ITEM = {
-  SWORD = 1001
+  -- Legacy sword id kept for save compatibility.
+  SWORD = 1001,
+  STICK = 1101,
+  FLINT = 1102,
+  BERRY = 1103,
+  FLINT_SWORD = 1201,
+  FLINT_AXE = 1202,
+  FLINT_PICKAXE = 1203,
+  STONE_SWORD = 1301,
+  STONE_AXE = 1302,
+  STONE_PICKAXE = 1303
 }
 
 Constants.BLOCK_INFO = {
@@ -286,6 +297,16 @@ Constants.BLOCK_INFO = {
     placeable = true,
     alpha = .74
   },
+  [Constants.BLOCK.WORKBENCH] = {
+    name = 'Workbench',
+    color = { .53, .37, .20 },
+    solid = true,
+    opaque = true,
+    lightOpacity = 15,
+    breakable = true,
+    placeable = true,
+    alpha = 1
+  },
   [Constants.ITEM.SWORD] = {
     name = 'Sword',
     color = { .76, .78, .84 },
@@ -294,24 +315,193 @@ Constants.BLOCK_INFO = {
     lightOpacity = 0,
     breakable = false,
     placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'sword',
+    maxDurability = 80
+  },
+  [Constants.ITEM.STICK] = {
+    name = 'Stick',
+    color = { .60, .45, .28 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
     alpha = 1
+  },
+  [Constants.ITEM.FLINT] = {
+    name = 'Flint',
+    color = { .45, .45, .48 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1
+  },
+  [Constants.ITEM.BERRY] = {
+    name = 'Berry',
+    color = { .82, .15, .26 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    food = 5
+  },
+  [Constants.ITEM.FLINT_SWORD] = {
+    name = 'Flint Sword',
+    color = { .71, .73, .78 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'sword',
+    maxDurability = 80
+  },
+  [Constants.ITEM.FLINT_AXE] = {
+    name = 'Flint Axe',
+    color = { .67, .70, .76 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'axe',
+    maxDurability = 80
+  },
+  [Constants.ITEM.FLINT_PICKAXE] = {
+    name = 'Flint Pickaxe',
+    color = { .68, .72, .79 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'pickaxe',
+    maxDurability = 80
+  },
+  [Constants.ITEM.STONE_SWORD] = {
+    name = 'Stone Sword',
+    color = { .60, .61, .64 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'sword',
+    maxDurability = 160
+  },
+  [Constants.ITEM.STONE_AXE] = {
+    name = 'Stone Axe',
+    color = { .57, .58, .62 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'axe',
+    maxDurability = 160
+  },
+  [Constants.ITEM.STONE_PICKAXE] = {
+    name = 'Stone Pickaxe',
+    color = { .56, .58, .63 },
+    solid = false,
+    opaque = false,
+    lightOpacity = 0,
+    breakable = false,
+    placeable = false,
+    alpha = 1,
+    stackable = false,
+    toolType = 'pickaxe',
+    maxDurability = 160
+  }
+}
+
+Constants.BLOCK_BREAK_REQUIREMENTS = {
+  [Constants.BLOCK.WOOD] = 'axe',
+  [Constants.BLOCK.STONE] = 'pickaxe'
+}
+
+Constants.BLOCK_BREAK_TIME_SECONDS = {
+  default = 0.55,
+  [Constants.BLOCK.GRASS] = 0.45,
+  [Constants.BLOCK.DIRT] = 0.48,
+  [Constants.BLOCK.SAND] = 0.45,
+  [Constants.BLOCK.LEAF] = 0.32,
+  [Constants.BLOCK.WATER] = 0.30,
+  [Constants.BLOCK.WOOD] = 0.90,
+  [Constants.BLOCK.STONE] = 1.10,
+  [Constants.BLOCK.WORKBENCH] = 0.90
+}
+
+Constants.ITEM_ENTITIES = {
+  maxActive = 384,
+  maxDistance = 96,
+  drawDistance = 80,
+  pickupRadius = 0.33,
+  pickupReach = 6.0,
+  itemSize = 0.22,
+  ambientSpawnRadiusChunks = 1,
+  ambientMinPerChunk = 1,
+  ambientMaxPerChunk = 3
+}
+
+Constants.CRAFTING = {
+  bagSlotCount = 2,
+  workbenchSlotCount = 25,
+  bagRecipes = {
+    {
+      output = { id = Constants.BLOCK.WORKBENCH, count = 1 },
+      ingredients = { [Constants.BLOCK.WOOD] = 4 }
+    },
+    {
+      output = { id = Constants.ITEM.FLINT_SWORD, count = 1, durability = 80 },
+      ingredients = { [Constants.ITEM.FLINT] = 2, [Constants.ITEM.STICK] = 1 }
+    },
+    {
+      output = { id = Constants.ITEM.FLINT_AXE, count = 1, durability = 80 },
+      ingredients = { [Constants.ITEM.FLINT] = 2, [Constants.ITEM.STICK] = 2 }
+    },
+    {
+      output = { id = Constants.ITEM.FLINT_PICKAXE, count = 1, durability = 80 },
+      ingredients = { [Constants.ITEM.FLINT] = 3, [Constants.ITEM.STICK] = 2 }
+    }
+  },
+  workbenchRecipes = {
+    {
+      output = { id = Constants.ITEM.STONE_SWORD, count = 1, durability = 160 },
+      ingredients = { [Constants.BLOCK.STONE] = 2, [Constants.ITEM.STICK] = 1, [Constants.ITEM.FLINT] = 1 }
+    },
+    {
+      output = { id = Constants.ITEM.STONE_AXE, count = 1, durability = 160 },
+      ingredients = { [Constants.BLOCK.STONE] = 2, [Constants.ITEM.STICK] = 2, [Constants.ITEM.FLINT] = 1 }
+    },
+    {
+      output = { id = Constants.ITEM.STONE_PICKAXE, count = 1, durability = 160 },
+      ingredients = { [Constants.BLOCK.STONE] = 3, [Constants.ITEM.STICK] = 2, [Constants.ITEM.FLINT] = 1 }
+    }
   }
 }
 
 Constants.HOTBAR_SLOT_COUNT = 8
 Constants.INVENTORY_STORAGE_SLOT_COUNT = 24
 Constants.INVENTORY_SLOT_COUNT = Constants.HOTBAR_SLOT_COUNT + Constants.INVENTORY_STORAGE_SLOT_COUNT
-Constants.INVENTORY_START_COUNT = 48
-Constants.HOTBAR_DEFAULTS = {
-  { block = Constants.ITEM.SWORD, count = 1 },
-  Constants.BLOCK.GRASS,
-  Constants.BLOCK.DIRT,
-  Constants.BLOCK.STONE,
-  Constants.BLOCK.SAND,
-  Constants.BLOCK.WATER,
-  Constants.BLOCK.WOOD,
-  Constants.BLOCK.LEAF
-}
+Constants.INVENTORY_START_COUNT = 0
+Constants.HOTBAR_DEFAULTS = {}
 
 Constants.COMBAT = {
   handDamage = 1,

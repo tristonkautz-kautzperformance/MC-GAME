@@ -48,6 +48,14 @@ Constants.DAY_LENGTH_SECONDS = 300
 
 Constants.SKY_DAY = { .53, .78, .96 }
 Constants.SKY_NIGHT = { .03, .04, .09 }
+Constants.SKY_BODIES = {
+  enabled = true,
+  distance = 260,
+  sunSize = 18,
+  moonSize = 16,
+  orbitTiltDegrees = 22,
+  moonAlpha = 0.96
+}
 
 Constants.LIGHTING = {
   enabled = true,

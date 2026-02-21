@@ -31,6 +31,14 @@
   - fog uses horizontal camera distance only for low cost,
   - fog color follows day/night sky colors to blend naturally at the render edge.
 
+### Large Sun/Moon Sky Cycle (Low-Cost)
+- Updated `src/sky/Sky.lua` to draw large Minecraft-style sky bodies:
+  - sun and moon now orbit opposite each other around the camera with a configurable tilted orbit.
+  - render path uses two camera-facing planes (fallback to spheres only if needed), keeping draw cost extremely low.
+- Added tuning config in `src/constants.lua` as `Constants.SKY_BODIES`:
+  - `distance`, `sunSize`, `moonSize`, `orbitTiltDegrees`, `moonAlpha`, `enabled`.
+- Updated `src/game/GameState.lua` to pass camera position/orientation into `Sky:draw(...)` so sky bodies remain stable in view while moving through the world.
+
 ## 2026-02-20
 
 ### Floodfill Vertical Intermediate Regression Fix

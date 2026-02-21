@@ -1252,7 +1252,7 @@ function GameState:draw(pass)
   local drawRendererMs = 0
   local drawWorldStartTime = getTimerNow()
 
-  self.sky:draw(pass)
+  self.sky:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation)
   local drawRendererStartTime = getTimerNow()
   self.renderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, self.voxelShader, self.sky.timeOfDay)
   local drawRendererEndTime = getTimerNow()

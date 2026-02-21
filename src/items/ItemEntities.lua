@@ -1,5 +1,6 @@
 local ItemEntities = {}
 ItemEntities.__index = ItemEntities
+local RNG_MOD = 2147483648
 
 local function clamp(value, minValue, maxValue)
   if value < minValue then
@@ -44,10 +45,24 @@ function ItemEntities.new(constants, world)
   self.itemSize = math.max(0.12, tonumber(cfg.itemSize) or 0.22)
   self.itemHalfSize = self.itemSize * 0.5
   self._groundOffsetY = self.itemHalfSize + 0.01
+  self.gravity = math.max(0, tonumber(cfg.gravity) or 24)
+  self.airDrag = math.max(0, tonumber(cfg.airDrag) or 1.8)
+  self.groundFriction = math.max(0, tonumber(cfg.groundFriction) or 14)
+  self.bounce = clamp(tonumber(cfg.bounce) or 0.18, 0, 0.98)
+  self.restSpeed = math.max(0, tonumber(cfg.restSpeed) or 0.08)
+  self.scatterHorizontalMin = math.max(0, tonumber(cfg.scatterHorizontalMin) or 0.9)
+  self.scatterHorizontalMax = math.max(self.scatterHorizontalMin, tonumber(cfg.scatterHorizontalMax) or 1.8)
+  self.scatterUpMin = math.max(0, tonumber(cfg.scatterUpMin) or 1.4)
+  self.scatterUpMax = math.max(self.scatterUpMin, tonumber(cfg.scatterUpMax) or 2.3)
+  self._groundSnapEpsilon = 0.01
 
   self.entities = {}
   self.count = 0
   self._spawnSerial = 0
+  self._rngState = math.floor(tonumber(constants.WORLD_SEED) or 1) % RNG_MOD
+  if self._rngState <= 0 then
+    self._rngState = 1
+  end
   self._lastPlayerX = 0
   self._lastPlayerY = 0
   self._lastPlayerZ = 0
@@ -120,7 +135,140 @@ function ItemEntities:_removeAt(index)
   self.count = tail - 1
 end
 
-function ItemEntities:spawn(id, x, y, z, count, durability)
+function ItemEntities:_rand01()
+  self._rngState = (1103515245 * self._rngState + 12345) % RNG_MOD
+  return self._rngState / RNG_MOD
+end
+
+function ItemEntities:_computeInitialVelocity(options)
+  local vx = 0
+  local vy = 0
+  local vz = 0
+  if type(options) ~= 'table' then
+    return vx, vy, vz
+  end
+
+  vx = tonumber(options.vx) or 0
+  vy = tonumber(options.vy) or 0
+  vz = tonumber(options.vz) or 0
+
+  if options.scatter then
+    local angle = self:_rand01() * math.pi * 2
+    local horizontalSpeed = self.scatterHorizontalMin
+      + (self.scatterHorizontalMax - self.scatterHorizontalMin) * self:_rand01()
+    local upSpeed = self.scatterUpMin
+      + (self.scatterUpMax - self.scatterUpMin) * self:_rand01()
+
+    vx = vx + math.cos(angle) * horizontalSpeed
+    vy = vy + upSpeed
+    vz = vz + math.sin(angle) * horizontalSpeed
+  end
+
+  return vx, vy, vz
+end
+
+function ItemEntities:_simulateEntity(entity, dt)
+  if dt <= 0 then
+    return
+  end
+
+  entity.vx = tonumber(entity.vx) or 0
+  entity.vy = tonumber(entity.vy) or 0
+  entity.vz = tonumber(entity.vz) or 0
+
+  local dragFactor = 1 / (1 + self.airDrag * dt)
+  entity.vx = entity.vx * dragFactor
+  entity.vz = entity.vz * dragFactor
+  entity.vy = entity.vy - self.gravity * dt
+
+  local minX = 0.5
+  local maxX = self.world.sizeX - 0.5
+  local minZ = 0.5
+  local maxZ = self.world.sizeZ - 0.5
+
+  local nextX = entity.x + entity.vx * dt
+  local nextY = entity.y + entity.vy * dt
+  local nextZ = entity.z + entity.vz * dt
+
+  if nextX < minX then
+    nextX = minX
+    if entity.vx < 0 then
+      entity.vx = 0
+    end
+  elseif nextX > maxX then
+    nextX = maxX
+    if entity.vx > 0 then
+      entity.vx = 0
+    end
+  end
+
+  if nextZ < minZ then
+    nextZ = minZ
+    if entity.vz < 0 then
+      entity.vz = 0
+    end
+  elseif nextZ > maxZ then
+    nextZ = maxZ
+    if entity.vz > 0 then
+      entity.vz = 0
+    end
+  end
+
+  local half = self.itemHalfSize
+  local bottom = nextY - half
+  local sampleX = clamp(math.floor(nextX) + 1, 1, self.world.sizeX)
+  local sampleZ = clamp(math.floor(nextZ) + 1, 1, self.world.sizeZ)
+  local sampleY = math.floor(bottom - self._groundSnapEpsilon) + 1
+
+  if sampleY < 1 then
+    sampleY = 1
+  elseif sampleY > self.world.sizeY then
+    sampleY = self.world.sizeY
+  end
+
+  if self.world:isSolidAt(sampleX, sampleY, sampleZ) then
+    local supportTop = sampleY
+    local targetY = supportTop + half + self._groundSnapEpsilon
+    if bottom <= supportTop + self._groundSnapEpsilon then
+      nextY = targetY
+      if entity.vy < 0 then
+        local bounceVy = -entity.vy * self.bounce
+        if bounceVy > self.restSpeed then
+          entity.vy = bounceVy
+        else
+          entity.vy = 0
+        end
+      end
+
+      local friction = 1 / (1 + self.groundFriction * dt)
+      entity.vx = entity.vx * friction
+      entity.vz = entity.vz * friction
+      if math.abs(entity.vx) < self.restSpeed then
+        entity.vx = 0
+      end
+      if math.abs(entity.vz) < self.restSpeed then
+        entity.vz = 0
+      end
+      if math.abs(entity.vy) < self.restSpeed then
+        entity.vy = 0
+      end
+    end
+  end
+
+  local minY = half + self._groundSnapEpsilon
+  if nextY < minY then
+    nextY = minY
+    if entity.vy < 0 then
+      entity.vy = 0
+    end
+  end
+
+  entity.x = nextX
+  entity.y = nextY
+  entity.z = nextZ
+end
+
+function ItemEntities:spawn(id, x, y, z, count, durability, options)
   local blockId = parseInteger(id)
   local amount = parseInteger(count) or 1
   if not blockId or blockId <= 0 or amount <= 0 then
@@ -136,6 +284,7 @@ function ItemEntities:spawn(id, x, y, z, count, durability)
   local spawned = 0
 
   if stackable then
+    local vx, vy, vz = self:_computeInitialVelocity(options)
     self:_ensureCapacity()
     self.count = self.count + 1
     self._spawnSerial = self._spawnSerial + 1
@@ -146,6 +295,9 @@ function ItemEntities:spawn(id, x, y, z, count, durability)
       x = x,
       y = y,
       z = z,
+      vx = vx,
+      vy = vy,
+      vz = vz,
       serial = self._spawnSerial
     }
     return 1
@@ -157,6 +309,7 @@ function ItemEntities:spawn(id, x, y, z, count, durability)
   end
 
   for _ = 1, amount do
+    local vx, vy, vz = self:_computeInitialVelocity(options)
     self:_ensureCapacity()
     self.count = self.count + 1
     self._spawnSerial = self._spawnSerial + 1
@@ -167,6 +320,9 @@ function ItemEntities:spawn(id, x, y, z, count, durability)
       x = x,
       y = y,
       z = z,
+      vx = vx,
+      vy = vy,
+      vz = vz,
       serial = self._spawnSerial
     }
     spawned = spawned + 1
@@ -175,12 +331,12 @@ function ItemEntities:spawn(id, x, y, z, count, durability)
   return spawned
 end
 
-function ItemEntities:dropStack(x, y, z, block, count, durability)
+function ItemEntities:dropStack(x, y, z, block, count, durability, options)
   if not block or not count or count <= 0 then
     return 0
   end
 
-  local spawned = self:spawn(block, x, y, z, count, durability)
+  local spawned = self:spawn(block, x, y, z, count, durability, options)
   return spawned
 end
 
@@ -189,10 +345,20 @@ function ItemEntities:update(_dt, playerX, playerY, playerZ)
   self._lastPlayerY = playerY
   self._lastPlayerZ = playerZ
 
+  local dt = tonumber(_dt) or 0
+  if dt < 0 then
+    dt = 0
+  elseif dt > 0.1 then
+    dt = 0.1
+  end
+
   local write = 1
   local maxDistSq = self.maxDistanceSq
   for i = 1, self.count do
     local entity = self.entities[i]
+    if dt > 0 then
+      self:_simulateEntity(entity, dt)
+    end
 
     local dx = entity.x - playerX
     local dy = entity.y - playerY

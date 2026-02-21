@@ -448,6 +448,14 @@ Constants.BLOCK_BREAK_TIME_SECONDS = {
   [Constants.BLOCK.WORKBENCH] = 0.90
 }
 
+Constants.BLOCK_BREAK_SPECIAL = {
+  naturalTreeCascade = true,
+  naturalTreeMaxBlocks = 192,
+  stoneCascadeChance = 0.50,
+  stoneCascadeMin = 5,
+  stoneCascadeMax = 10
+}
+
 Constants.ITEM_ENTITIES = {
   maxActive = 384,
   maxDistance = 96,
@@ -455,6 +463,15 @@ Constants.ITEM_ENTITIES = {
   pickupRadius = 0.33,
   pickupReach = 6.0,
   itemSize = 0.22,
+  gravity = 24,
+  airDrag = 1.8,
+  groundFriction = 14,
+  bounce = 0.18,
+  restSpeed = 0.08,
+  scatterHorizontalMin = 0.9,
+  scatterHorizontalMax = 1.8,
+  scatterUpMin = 1.4,
+  scatterUpMax = 2.3,
   ambientSpawnRadiusChunks = 1,
   ambientMinPerChunk = 1,
   ambientMaxPerChunk = 3

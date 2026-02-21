@@ -876,6 +876,28 @@ function ChunkWorld:get(x, y, z)
   return self:_getByChunkKey(chunkKey, localIndex, x, y, z)
 end
 
+function ChunkWorld:isNaturallyGeneratedBlock(x, y, z, expectedBlock)
+  if not self:isInside(x, y, z) then
+    return false
+  end
+
+  local cx, cy, cz, lx, ly, lz = self:_toChunkCoords(x, y, z)
+  local chunkKey = self:chunkKey(cx, cy, cz)
+  local localIndex = self:_localIndex(lx, ly, lz)
+
+  local baseValue = self:_getBaseWithFeaturesByKey(x, y, z, chunkKey, localIndex)
+  if expectedBlock ~= nil and baseValue ~= expectedBlock then
+    return false
+  end
+
+  local editChunk = self._editChunks[chunkKey]
+  if editChunk and editChunk[localIndex] ~= nil then
+    return false
+  end
+
+  return true
+end
+
 function ChunkWorld:fillBlockHalo(cx, cy, cz, out)
   if not out then
     return nil

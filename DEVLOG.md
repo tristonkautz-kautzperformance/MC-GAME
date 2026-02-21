@@ -2,6 +2,20 @@
 
 ## 2026-02-21
 
+### Block Drop Physics + Natural Harvest Chain Breaks
+- Updated `src/items/ItemEntities.lua` item entities to simulate simple physics:
+  - entities now carry `vx/vy/vz`, apply gravity/drag, settle on solid ground, and stop with ground friction.
+  - added tunable physics/scatter values in `Constants.ITEM_ENTITIES` (`gravity`, drag/friction, bounce, rest speed, scatter ranges).
+- Updated break-drop spawning in `src/game/GameState.lua`:
+  - block drops now spawn from the broken block center (instead of snapped directly to ground),
+  - each break drop gets a slight randomized lateral + upward impulse (`scatter = true`) so stacks spread naturally while falling.
+- Added natural-block provenance query in `src/world/ChunkWorld.lua`:
+  - `isNaturallyGeneratedBlock(x, y, z, expectedBlock)` returns true only for unedited world-generated blocks.
+- Updated `src/interaction/Interaction.lua` break resolution to support multi-block results:
+  - natural tree harvest: breaking natural `WOOD` now traverses connected natural `WOOD/LEAF` at/above the break Y and breaks them together.
+  - natural stone cascade: breaking natural `STONE` now has a 50% chance to also break 5-10 connected natural stone blocks.
+  - added `Constants.BLOCK_BREAK_SPECIAL` to tune these behaviors.
+
 ### Floodfill Vertical Fallback Guard (Region-Task Backlog)
 - Updated `src/world/lighting/FloodfillLighting.lua` readiness/fallback gating to treat pending region relight tasks as active lighting backlog (same as sky column/dark/flood queues).
 - `ensureSkyLightForChunk(...)` now requires:

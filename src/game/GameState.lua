@@ -788,14 +788,33 @@ function GameState:_spawnBlockDrop(blockBreakResult)
     return
   end
 
-  local block = blockBreakResult.block
-  if block == self.constants.BLOCK.AIR then
+  local AIR = self.constants.BLOCK.AIR
+  local scatter = { scatter = true }
+  local batch = blockBreakResult.blocks
+
+  if batch and #batch > 0 then
+    for i = 1, #batch do
+      local entry = batch[i]
+      local block = entry and entry.block or AIR
+      if block ~= AIR then
+        self.itemEntities:spawn(block, entry.x - 0.5, entry.y - 0.5, entry.z - 0.5, 1, nil, scatter)
+      end
+    end
     return
   end
 
-  local halfSize = tonumber(self.itemEntities.itemHalfSize) or 0.11
-  local groundY = (blockBreakResult.y - 1) + halfSize + 0.01
-  self.itemEntities:spawn(block, blockBreakResult.x - 0.5, groundY, blockBreakResult.z - 0.5, 1)
+  local block = blockBreakResult.block
+  if block ~= AIR then
+    self.itemEntities:spawn(
+      block,
+      blockBreakResult.x - 0.5,
+      blockBreakResult.y - 0.5,
+      blockBreakResult.z - 0.5,
+      1,
+      nil,
+      scatter
+    )
+  end
 end
 
 function GameState:_spawnAmbientAroundChunk(cx, cz)

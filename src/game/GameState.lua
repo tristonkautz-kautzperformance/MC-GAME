@@ -586,7 +586,7 @@ function GameState:_startSession(loadSave)
     self.sky:setTime(savedTimeOfDay)
   end
   self.renderer = ChunkRenderer.new(self.constants, self.world)
-  local okShader, shaderOrErr = pcall(VoxelShader.new)
+  local okShader, shaderOrErr = pcall(VoxelShader.new, self.constants)
   if okShader then
     self.voxelShader = shaderOrErr
     self._voxelShaderError = nil

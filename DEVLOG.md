@@ -1,5 +1,36 @@
 # Dev Log
 
+## 2026-02-21
+
+### Mountain Biome Terrain Pass
+- Added mountain biome controls to `Constants.GEN` in `src/constants.lua`:
+  - biome mask frequency/octaves/threshold
+  - ridge noise frequency/octaves/persistence
+  - mountain height boost/amplitude
+  - mountain stone-cap start Y and transition band
+- Updated terrain generation in `src/world/ChunkWorld.lua`:
+  - `_computeTerrainColumnData(...)` now blends a sparse mountain biome mask into base terrain height and applies ridged elevation for mountain regions.
+  - high-elevation mountain surfaces now transition into stone composition using a configurable Y threshold with a natural blend band.
+  - mountain stone surfaces now use stone subsurface composition (no dirt layer under stone caps).
+- Updated generation bounds estimation:
+  - `_computeGenerationThresholds()` now accounts for possible mountain height raise when computing max active chunk Y range, keeping streaming/meshing ranges aligned with generated terrain.
+- Retuned mountain defaults for stronger visibility with seed `1337`:
+  - increased mountain biome coverage and lowered threshold.
+  - increased mountain vertical boost/amplitude so mountains are encounterable near spawn and can reach stone-cap elevations.
+- Follow-up tuning for much higher, true-mountain relief:
+  - increased `WORLD_SIZE_Y` from `64` to `96` to add vertical headroom for tall peaks.
+  - further increased mountain coverage/intensity (`mountainBiomeFrequency`, lower threshold, higher boost/amplitude).
+  - raised mountain stone-cap profile (`mountainStoneStartY`, `mountainStoneTransition`) to fit the taller terrain scale.
+  - note: save files from the previous world-size config are incompatible by design and will not load under the new world dimensions.
+
+### Low-Cost World-Edge Fog
+- Added simple edge fog config in `src/constants.lua` (`Constants.FOG`) with conservative defaults.
+- Updated shader initialization in `src/game/GameState.lua` to pass constants into `VoxelShader`.
+- Added lightweight fog blending in `src/render/VoxelShader.lua`:
+  - fog distance derives from render radius (with optional overrides in config),
+  - fog uses horizontal camera distance only for low cost,
+  - fog color follows day/night sky colors to blend naturally at the render edge.
+
 ## 2026-02-20
 
 ### Floodfill Vertical Intermediate Regression Fix

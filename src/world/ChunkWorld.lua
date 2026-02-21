@@ -142,6 +142,16 @@ function ChunkWorld.new(constants)
   self._genDetailPersistence = 0.5
   self._genContinentFrequency = 0.0035
   self._genContinentAmplitude = 8
+  self._genMountainBiomeFrequency = 0.0028
+  self._genMountainBiomeOctaves = 2
+  self._genMountainBiomeThreshold = 0.52
+  self._genMountainRidgeFrequency = 0.0085
+  self._genMountainRidgeOctaves = 3
+  self._genMountainRidgePersistence = 0.55
+  self._genMountainHeightBoost = 20
+  self._genMountainHeightAmplitude = 52
+  self._genMountainStoneStartY = 58
+  self._genMountainStoneTransition = 8
   self._genBeachBand = 2
   self._genDirtMinDepth = 2
   self._genDirtMaxDepth = 4
@@ -417,6 +427,20 @@ function ChunkWorld:_computeGenerationThresholds()
   local detailPersistence = tonumber(gen.detailPersistence) or 0.5
   local continentFrequency = tonumber(gen.continentFrequency) or 0.0035
   local continentAmplitude = tonumber(gen.continentAmplitude) or 8
+  local mountainBiomeFrequency = tonumber(gen.mountainBiomeFrequency) or 0.0028
+  local mountainBiomeOctaves = math.floor(tonumber(gen.mountainBiomeOctaves) or 2)
+  local mountainBiomeThreshold = tonumber(gen.mountainBiomeThreshold)
+  if mountainBiomeThreshold == nil then
+    mountainBiomeThreshold = 0.52
+  end
+  local mountainRidgeFrequency = tonumber(gen.mountainRidgeFrequency) or 0.0085
+  local mountainRidgeOctaves = math.floor(tonumber(gen.mountainRidgeOctaves) or 3)
+  local mountainRidgePersistence = tonumber(gen.mountainRidgePersistence) or 0.55
+  local mountainHeightBoost = tonumber(gen.mountainHeightBoost) or 20
+  local mountainHeightAmplitude = tonumber(gen.mountainHeightAmplitude) or 52
+  local defaultStoneStart = math.floor(self.sizeY * 0.66 + 0.5)
+  local mountainStoneStartY = math.floor(tonumber(gen.mountainStoneStartY) or defaultStoneStart)
+  local mountainStoneTransition = math.floor(tonumber(gen.mountainStoneTransition) or 8)
   local beachBand = math.floor(tonumber(gen.beachBand) or 2)
   local dirtMinDepth = math.floor(tonumber(gen.dirtMinDepth) or 2)
   local dirtMaxDepth = math.floor(tonumber(gen.dirtMaxDepth) or 4)
@@ -461,6 +485,48 @@ function ChunkWorld:_computeGenerationThresholds()
   if continentFrequency <= 0 then
     continentFrequency = 0.0035
   end
+  if mountainBiomeFrequency <= 0 then
+    mountainBiomeFrequency = 0.0028
+  end
+  if mountainBiomeOctaves < 1 then
+    mountainBiomeOctaves = 1
+  elseif mountainBiomeOctaves > 4 then
+    mountainBiomeOctaves = 4
+  end
+  if mountainBiomeThreshold < 0 then
+    mountainBiomeThreshold = 0
+  elseif mountainBiomeThreshold > 0.98 then
+    mountainBiomeThreshold = 0.98
+  end
+  if mountainRidgeFrequency <= 0 then
+    mountainRidgeFrequency = 0.0085
+  end
+  if mountainRidgeOctaves < 1 then
+    mountainRidgeOctaves = 1
+  elseif mountainRidgeOctaves > 6 then
+    mountainRidgeOctaves = 6
+  end
+  if mountainRidgePersistence < 0 then
+    mountainRidgePersistence = 0
+  elseif mountainRidgePersistence > 1 then
+    mountainRidgePersistence = 1
+  end
+  if mountainHeightBoost < 0 then
+    mountainHeightBoost = 0
+  end
+  if mountainHeightAmplitude < 0 then
+    mountainHeightAmplitude = 0
+  end
+  local stoneStartMin = seaLevel + 2
+  if stoneStartMin > self.sizeY - 1 then
+    stoneStartMin = self.sizeY - 1
+  end
+  mountainStoneStartY = clampInt(mountainStoneStartY, stoneStartMin, self.sizeY - 1)
+  if mountainStoneTransition < 0 then
+    mountainStoneTransition = 0
+  elseif mountainStoneTransition > 16 then
+    mountainStoneTransition = 16
+  end
   if beachBand < 0 then
     beachBand = 0
   end
@@ -485,6 +551,16 @@ function ChunkWorld:_computeGenerationThresholds()
   self._genDetailPersistence = detailPersistence
   self._genContinentFrequency = continentFrequency
   self._genContinentAmplitude = continentAmplitude
+  self._genMountainBiomeFrequency = mountainBiomeFrequency
+  self._genMountainBiomeOctaves = mountainBiomeOctaves
+  self._genMountainBiomeThreshold = mountainBiomeThreshold
+  self._genMountainRidgeFrequency = mountainRidgeFrequency
+  self._genMountainRidgeOctaves = mountainRidgeOctaves
+  self._genMountainRidgePersistence = mountainRidgePersistence
+  self._genMountainHeightBoost = mountainHeightBoost
+  self._genMountainHeightAmplitude = mountainHeightAmplitude
+  self._genMountainStoneStartY = mountainStoneStartY
+  self._genMountainStoneTransition = mountainStoneTransition
   self._genBeachBand = beachBand
   self._genDirtMinDepth = dirtMinDepth
   self._genDirtMaxDepth = dirtMaxDepth
@@ -501,7 +577,8 @@ function ChunkWorld:_computeGenerationThresholds()
   elseif minSurface > self.sizeY - 1 then
     minSurface = self.sizeY - 1
   end
-  local maxSurface = math.floor(baseHeight + terrainAmplitude + continentAmplitude + 0.5)
+  local mountainMaxRaise = mountainHeightBoost + mountainHeightAmplitude
+  local maxSurface = math.floor(baseHeight + terrainAmplitude + continentAmplitude + mountainMaxRaise + 0.5)
   if maxSurface < 2 then
     maxSurface = 2
   elseif maxSurface > self.sizeY - 1 then
@@ -582,29 +659,93 @@ function ChunkWorld:_computeTerrainColumnData(x, z)
     self._genContinentFrequency,
     0.5
   )
+  local mountainBiome = fbm2D(
+    seed + 15877,
+    x,
+    z,
+    self._genMountainBiomeOctaves,
+    self._genMountainBiomeFrequency,
+    0.5
+  ) * 0.5 + 0.5
+  local mountainMask = 0
+  local mountainThreshold = self._genMountainBiomeThreshold
+  if mountainBiome > mountainThreshold then
+    local mountainRange = 1 - mountainThreshold
+    if mountainRange > 0 then
+      mountainMask = (mountainBiome - mountainThreshold) / mountainRange
+      if mountainMask < 0 then
+        mountainMask = 0
+      elseif mountainMask > 1 then
+        mountainMask = 1
+      end
+      mountainMask = smoothstep(mountainMask)
+    else
+      mountainMask = 1
+    end
+  end
 
   local rawHeight = self._genBaseHeight
     + detail * self._genTerrainAmplitude
     + continent * self._genContinentAmplitude
+  if mountainMask > 0 then
+    local mountainRidge = fbm2D(
+      seed + 26153,
+      x,
+      z,
+      self._genMountainRidgeOctaves,
+      self._genMountainRidgeFrequency,
+      self._genMountainRidgePersistence
+    )
+    local ridge = 1 - math.abs(mountainRidge)
+    ridge = ridge * ridge
+    rawHeight = rawHeight + mountainMask * (
+      self._genMountainHeightBoost + ridge * self._genMountainHeightAmplitude
+    )
+  end
   local surfaceY = clampInt(math.floor(rawHeight + 0.5), 2, self.sizeY - 1)
 
   local blocks = self.constants.BLOCK
   local beachMax = self._genSeaLevel + self._genBeachBand
   local isBeach = surfaceY <= beachMax
   local surfaceBlock = isBeach and blocks.SAND or blocks.GRASS
-  local depthMin = isBeach and self._genSandMinDepth or self._genDirtMinDepth
-  local depthMax = isBeach and self._genSandMaxDepth or self._genDirtMaxDepth
-  local depthRange = depthMax - depthMin + 1
-  if depthRange < 1 then
-    depthRange = 1
+  if not isBeach and mountainMask > 0 then
+    local stoneStartY = self._genMountainStoneStartY
+    local stoneTransition = self._genMountainStoneTransition
+    local stoneBandStart = stoneStartY - stoneTransition
+    if surfaceY >= stoneBandStart then
+      local stoneChance = 1
+      if surfaceY < stoneStartY then
+        local t = (surfaceY - stoneBandStart + 1) / (stoneTransition + 1)
+        if t < 0 then
+          t = 0
+        elseif t > 1 then
+          t = 1
+        end
+        stoneChance = t * t
+      end
+      stoneChance = stoneChance * (0.4 + mountainMask * 0.6)
+      if stoneChance >= 1 or hashToUnit(seed + 33391, x, z) < stoneChance then
+        surfaceBlock = blocks.STONE
+      end
+    end
   end
-  local depthNoise = hashToUnit(seed + 33391, x, z)
-  local layerDepth = depthMin + math.floor(depthNoise * depthRange)
-  if layerDepth > depthMax then
-    layerDepth = depthMax
-  end
-  if layerDepth > surfaceY - 1 then
-    layerDepth = surfaceY - 1
+
+  local layerDepth = 0
+  if surfaceBlock ~= blocks.STONE then
+    local depthMin = surfaceBlock == blocks.SAND and self._genSandMinDepth or self._genDirtMinDepth
+    local depthMax = surfaceBlock == blocks.SAND and self._genSandMaxDepth or self._genDirtMaxDepth
+    local depthRange = depthMax - depthMin + 1
+    if depthRange < 1 then
+      depthRange = 1
+    end
+    local depthNoise = hashToUnit(seed + 37961, x, z)
+    layerDepth = depthMin + math.floor(depthNoise * depthRange)
+    if layerDepth > depthMax then
+      layerDepth = depthMax
+    end
+    if layerDepth > surfaceY - 1 then
+      layerDepth = surfaceY - 1
+    end
   end
 
   return self:_packTerrainColumnData(surfaceY, surfaceBlock, layerDepth)
@@ -641,7 +782,10 @@ function ChunkWorld:_getBaseBlock(x, y, z)
       if surfaceBlock == blockIds.SAND then
         return blockIds.SAND
       end
-      return blockIds.DIRT
+      if surfaceBlock == blockIds.GRASS then
+        return blockIds.DIRT
+      end
+      return blockIds.STONE
     end
 
     return blockIds.STONE

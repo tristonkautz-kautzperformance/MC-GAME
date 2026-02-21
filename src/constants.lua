@@ -2,7 +2,7 @@ local Constants = {}
 
 Constants.WORLD_SIZE_X = 1280
 Constants.WORLD_SIZE_Z = 1280
-Constants.WORLD_SIZE_Y = 64
+Constants.WORLD_SIZE_Y = 96
 Constants.CHUNK_SIZE = 16
 Constants.CHUNK_VOLUME = Constants.CHUNK_SIZE * Constants.CHUNK_SIZE * Constants.CHUNK_SIZE
 Constants.WORLD_CHUNKS_X = math.ceil(Constants.WORLD_SIZE_X / Constants.CHUNK_SIZE)
@@ -23,6 +23,16 @@ Constants.GEN = {
   detailPersistence = 0.5,
   continentFrequency = 0.0035,
   continentAmplitude = 8,
+  mountainBiomeFrequency = 0.0028,
+  mountainBiomeOctaves = 2,
+  mountainBiomeThreshold = 0.52,
+  mountainRidgeFrequency = 0.0085,
+  mountainRidgeOctaves = 3,
+  mountainRidgePersistence = 0.55,
+  mountainHeightBoost = 20,
+  mountainHeightAmplitude = 52,
+  mountainStoneStartY = 58,
+  mountainStoneTransition = 8,
   beachBand = 2,
   dirtMinDepth = 2,
   dirtMaxDepth = 4,
@@ -85,6 +95,17 @@ Constants.CULL = {
   horizontalOnly = true,
   alwaysVisiblePaddingChunks = 1,
   meshCachePaddingChunks = 2
+}
+
+Constants.FOG = {
+  enabled = true,
+  -- If startDistance is nil, it derives from endDistance * startRatio.
+  -- startDistance = 0,
+  -- If endDistance is nil, it derives from draw radius minus endPaddingBlocks.
+  -- endDistance = 0,
+  startRatio = 0.72,
+  endPaddingBlocks = 4,
+  strength = 1.0
 }
 
 Constants.MESH = {

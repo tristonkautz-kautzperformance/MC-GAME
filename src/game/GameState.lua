@@ -94,6 +94,41 @@ local function isShiftDown()
   return lovr.system.isKeyDown('lshift') or lovr.system.isKeyDown('rshift')
 end
 
+local function checkMouseDown(fn)
+  if not fn then
+    return false
+  end
+
+  local ok, down = pcall(fn, 1)
+  if ok and down then
+    return true
+  end
+
+  ok, down = pcall(fn, 'l')
+  if ok and down then
+    return true
+  end
+
+  ok, down = pcall(fn, 'left')
+  if ok and down then
+    return true
+  end
+
+  return false
+end
+
+local function isPrimaryMouseDown()
+  if lovr.system and checkMouseDown(lovr.system.isMouseDown) then
+    return true
+  end
+
+  if lovr.mouse and checkMouseDown(lovr.mouse.isDown) then
+    return true
+  end
+
+  return false
+end
+
 local function newStagePerfEntry()
   return {
     frameMs = 0,
@@ -1543,8 +1578,8 @@ function GameState:_updateGame(dt)
   end
 
   local holdingBreak = false
-  if self.mouseLock and self.mouseLock.isLocked and self.mouseLock:isLocked() and lovr.system and lovr.system.isMouseDown then
-    holdingBreak = lovr.system.isMouseDown(1)
+  if self.mouseLock and self.mouseLock.isLocked and self.mouseLock:isLocked() then
+    holdingBreak = isPrimaryMouseDown()
   end
   if attackedMob then
     holdingBreak = false

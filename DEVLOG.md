@@ -2,6 +2,21 @@
 
 ## 2026-02-21
 
+### Floodfill Vertical Fallback Guard (Region-Task Backlog)
+- Updated `src/world/lighting/FloodfillLighting.lua` readiness/fallback gating to treat pending region relight tasks as active lighting backlog (same as sky column/dark/flood queues).
+- `ensureSkyLightForChunk(...)` now requires:
+  - local halo column readiness, and
+  - no pending sky backlog work (`queues + region tasks`)
+  before allowing chunk meshing.
+- `ensureSkyLightForChunk(...)` now temporarily lifts edit-only propagation bounds during mesh-prep catch-up and restores them afterward, so local chunk solve is not trapped in a vertical-only intermediate state.
+- `fillSkyLightHalo(...)` now keeps full-skylight fallback active while region tasks are still pending, preventing intermediate vertical-style snapshots from being meshed.
+
+### Block Breaking Input Regression Fix
+- Updated hold-to-break polling in `src/game/GameState.lua` to avoid hard dependency on a single mouse API:
+  - added `isPrimaryMouseDown()` with runtime-safe fallback order: `lovr.system.isMouseDown(1)` then `lovr.mouse.isDown(1)`.
+  - break-progress polling now uses this helper whenever pointer lock is active.
+- Fixes a regression where hold-to-break could remain permanently inactive on runtimes exposing only one of the mouse button APIs, making all blocks effectively unbreakable.
+
 ### Bag UI Refactor (Pause-Style Screen Menu)
 - Added `src/ui/InventoryMenu.lua` to move bag/workbench interaction to a dedicated screen-space UI:
   - orthographic menu rendering with fixed rectangle hitboxes (no 3D HUD raycast dependency)

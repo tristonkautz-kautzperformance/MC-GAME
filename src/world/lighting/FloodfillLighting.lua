@@ -267,6 +267,10 @@ function FloodfillLighting:_hasSkyQueueWork()
     or self:_hasSkyFloodQueue()
 end
 
+function FloodfillLighting:_hasSkyBacklogWork()
+  return self:_hasSkyQueueWork() or self:_hasRegionTasks()
+end
+
 function FloodfillLighting:_setSkyStageFromQueues()
   if self:_hasSkyColumnsQueue() then
     self.skyStage = 'vertical'
@@ -749,7 +753,7 @@ function FloodfillLighting:hasUrgentSkyWork()
 end
 
 function FloodfillLighting:hasSkyWork()
-  return self:_hasSkyQueueWork() or self:_hasRegionTasks()
+  return self:_hasSkyBacklogWork()
 end
 
 function FloodfillLighting:_enqueueSkyColumn(columnKey, urgent)
@@ -1969,36 +1973,59 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
     localMillis = localMillis * ensureScale
   end
 
+  local savedPropMinX = self.skyPropMinX
+  local savedPropMaxX = self.skyPropMaxX
+  local savedPropMinZ = self.skyPropMinZ
+  local savedPropMaxZ = self.skyPropMaxZ
+  local hadPropagationBounds = savedPropMinX ~= nil
+  if hadPropagationBounds then
+    -- Mesh-prep ensure should not be trapped by temporary edit-only propagation bounds.
+    self:_clearSkyPropagationBounds()
+  end
+
+  local readyForMesh = false
   world:prepareChunk(cx, cy, cz)
 
   local insideActiveRegion = self:_isChunkInsideSkyActiveRegion(cx, cz)
   if not insideActiveRegion then
     -- Outside simulation lighting region: skip sky solve work and render full skylight.
-    return true
-  end
+    readyForMesh = true
+  else
+    self:_ensureSkyHaloColumns(cx, cz, true, false, true)
+    local localReady = self:_areSkyHaloColumnsReady(cx, cz)
+    if localReady and not self:_hasSkyBacklogWork() then
+      readyForMesh = true
+    else
+      local ensurePasses = math.floor(tonumber(config.chunkEnsurePasses) or 2)
+      if ensurePasses < 1 then
+        ensurePasses = 1
+      end
 
-  self:_ensureSkyHaloColumns(cx, cz, true, false, true)
-  local localReady = self:_areSkyHaloColumnsReady(cx, cz)
-  if localReady and not self:_hasSkyQueueWork() then
-    return true
-  end
+      if localOps > 0 then
+        for _ = 1, ensurePasses do
+          self:updateSkyLight(localOps, localMillis, 'ensure')
+          localReady = self:_areSkyHaloColumnsReady(cx, cz)
+          if localReady and not self:_hasSkyBacklogWork() then
+            readyForMesh = true
+            break
+          end
+        end
+      end
 
-  local ensurePasses = math.floor(tonumber(config.chunkEnsurePasses) or 2)
-  if ensurePasses < 1 then
-    ensurePasses = 1
-  end
-
-  if localOps > 0 then
-    for _ = 1, ensurePasses do
-      self:updateSkyLight(localOps, localMillis, 'ensure')
-      localReady = self:_areSkyHaloColumnsReady(cx, cz)
-      if localReady and not self:_hasSkyQueueWork() then
-        return true
+      if not readyForMesh then
+        readyForMesh = self:_areSkyHaloColumnsReady(cx, cz) and not self:_hasSkyBacklogWork()
       end
     end
   end
 
-  return self:_areSkyHaloColumnsReady(cx, cz) and not self:_hasSkyQueueWork()
+  if hadPropagationBounds then
+    self.skyPropMinX = savedPropMinX
+    self.skyPropMaxX = savedPropMaxX
+    self.skyPropMinZ = savedPropMinZ
+    self.skyPropMaxZ = savedPropMaxZ
+  end
+
+  return readyForMesh
 end
 
 function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
@@ -2056,7 +2083,7 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
     return out
   end
 
-  local queueBacklog = self:_hasSkyQueueWork()
+  local queueBacklog = self:_hasSkyBacklogWork()
   local skyColumnsReady = self.skyColumnsReady
   local strideZ = haloSize
   local strideY = haloSize * haloSize

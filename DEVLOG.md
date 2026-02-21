@@ -2,6 +2,14 @@
 
 ## 2026-02-20
 
+### Floodfill Vertical Intermediate Regression Fix
+- Fixed a floodfill readiness regression in `src/world/lighting/FloodfillLighting.lua` that could reintroduce temporary vertical-style shadowing.
+- Updated `ensureSkyLightForChunk(...)` to require both:
+  - local halo-column readiness, and
+  - floodfill queue drain (`_hasSkyQueueWork() == false`)
+  before reporting chunk lighting ready for meshing.
+- Restored no-shadow mesh-prep fallback behavior in `fillSkyLightHalo(...)` while floodfill queues are still active (or local columns are not yet ready), preventing vertical intermediate lighting from being rendered.
+
 ### Frame-Time Spike Mitigation (Render Radius 16)
 - Optimized alpha draw ordering in `src/render/ChunkRenderer.lua`:
   - removed per-frame `alphaScratch` build/sort in `draw`.

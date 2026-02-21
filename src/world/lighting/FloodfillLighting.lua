@@ -1978,7 +1978,8 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
   end
 
   self:_ensureSkyHaloColumns(cx, cz, true, false, true)
-  if self:_areSkyHaloColumnsReady(cx, cz) then
+  local localReady = self:_areSkyHaloColumnsReady(cx, cz)
+  if localReady and not self:_hasSkyQueueWork() then
     return true
   end
 
@@ -1990,13 +1991,14 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
   if localOps > 0 then
     for _ = 1, ensurePasses do
       self:updateSkyLight(localOps, localMillis, 'ensure')
-      if self:_areSkyHaloColumnsReady(cx, cz) then
+      localReady = self:_areSkyHaloColumnsReady(cx, cz)
+      if localReady and not self:_hasSkyQueueWork() then
         return true
       end
     end
   end
 
-  return self:_areSkyHaloColumnsReady(cx, cz)
+  return self:_areSkyHaloColumnsReady(cx, cz) and not self:_hasSkyQueueWork()
 end
 
 function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
@@ -2054,6 +2056,7 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
     return out
   end
 
+  local queueBacklog = self:_hasSkyQueueWork()
   local skyColumnsReady = self.skyColumnsReady
   local strideZ = haloSize
   local strideY = haloSize * haloSize
@@ -2077,8 +2080,8 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
           out[index] = 0
         elseif wy > world.sizeY then
           out[index] = 15
-        elseif not skyColumnsReady[world:_worldColumnKey(wx, wz)] then
-          -- If this halo column is not ready yet, use a no-shadow fallback for mesh prep.
+        elseif queueBacklog or not skyColumnsReady[world:_worldColumnKey(wx, wz)] then
+          -- If floodfill queues are still active or this column is unready, keep no-shadow fallback.
           out[index] = 15
         else
           out[index] = self:_getSkyLightWorld(wx, wy, wz)

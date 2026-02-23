@@ -1,0 +1,87 @@
+Performance Audit Results #3
+============================
+
+Date: 2026-02-23
+Scope: Read-only audit (no code changes).
+
+Findings (ordered by impact)
+----------------------------
+
+1) High: Main-thread meshing prep is still heavy before worker dispatch.
+- `src/render/ChunkRenderer.lua:843` does prep on the main thread before handing work to mesher threads.
+- Costs include chunk prep/light ensure and halo fill/pack:
+  - `src/render/ChunkRenderer.lua:885`
+  - `src/render/ChunkRenderer.lua:894`
+  - `src/render/ChunkRenderer.lua:902`
+- Result: chunk movement/edit bursts can still spike frametime even with worker threads enabled.
+
+2) High: Dirty-queue churn when prep budget is reached.
+- Rebuild loop can continue pop/defer/requeue behavior after prep caps are hit:
+  - `src/render/ChunkRenderer.lua:2160`
+  - `src/render/ChunkRenderer.lua:2204`
+  - `src/render/ChunkRenderer.lua:2240`
+- Result: CPU time is spent cycling queue entries without equivalent visible progress.
+
+3) High: Geometry generation/upload path is expensive.
+- Vertex output uses Lua table-per-vertex writes:
+  - `src/render/ChunkRenderer.lua:17`
+- Config currently disables indexed meshes:
+  - `src/constants.lua:121`
+- Mesh creation currently uses CPU storage:
+  - `src/render/ChunkRenderer.lua:758`
+- Result: higher vertex count and upload overhead than necessary under large chunk counts.
+
+4) High: Render traversal and draw-call count scale directly with chunk mesh count.
+- Per-frame iteration over all chunk mesh entries:
+  - `src/render/ChunkRenderer.lua:2401`
+- Per-chunk draw calls for opaque and alpha:
+  - `src/render/ChunkRenderer.lua:2437`
+  - `src/render/ChunkRenderer.lua:2451`
+- Radii are large by default (`drawRadiusChunks = 16`):
+  - `src/constants.lua:98`
+  - `src/game/GameState.lua:1100`
+- Result: render CPU cost increases sharply in dense/fully-generated regions.
+
+5) Medium: Entity target raycast is duplicated each frame.
+- First raycast in update:
+  - `src/game/GameState.lua:1572`
+- Second raycast in draw for HUD target text:
+  - `src/game/GameState.lua:1853`
+- Result: avoidable duplicate O(entity_count) scan every frame.
+
+6) Medium: Ambient item spawn can cause chunk-crossing spikes.
+- Triggered on chunk transition:
+  - `src/game/GameState.lua:1521`
+- Spawns over neighborhood:
+  - `src/items/ItemEntities.lua:583`
+- Uses top-down world scan per spawn candidate:
+  - `src/items/ItemEntities.lua:516`
+- Result: transient CPU spikes when entering new chunk neighborhoods.
+
+7) Medium: Item rendering is draw-call/state-change heavy at scale.
+- Per-entity push/translate/cube/pop draw:
+  - `src/items/ItemEntities.lua:394`
+  - `src/items/ItemEntities.lua:413`
+  - `src/items/ItemEntities.lua:416`
+- Entity cap is high (`maxActive = 384`):
+  - `src/constants.lua:460`
+- Result: many tiny draw calls and state churn reduce render throughput.
+
+8) Low: Inventory UI allocates and rebuilds layout repeatedly while open.
+- Layout rebuilt each update:
+  - `src/ui/InventoryMenu.lua:418`
+  - `src/ui/InventoryMenu.lua:325`
+- Mouse candidate list rebuilt each update:
+  - `src/ui/InventoryMenu.lua:129`
+  - `src/ui/InventoryMenu.lua:177`
+- Result: avoidable GC churn while inventory is open.
+
+Most Effective Optimization Order
+---------------------------------
+
+1) Stop dirty-queue churn once threaded prep budget is saturated.
+2) Cache entity target from update and reuse in draw.
+3) Move chunk mesh path toward GPU-friendlier data flow (indexed + lower table churn).
+4) Reduce per-frame chunk candidate pressure (adaptive radius / stronger active-set pruning).
+5) Batch or instance item entity draws instead of per-entity immediate draws.
+

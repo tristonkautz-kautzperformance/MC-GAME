@@ -1350,6 +1350,35 @@ function FloodfillLighting:_ensureSkyHaloColumns(cx, cz, enqueueFlood, markDirty
   end
 end
 
+function FloodfillLighting:_queueSkyHaloColumns(cx, cz, seedUrgent)
+  local world = self.world
+  local cs = world.chunkSize
+  local minX = (cx - 1) * cs
+  local maxX = cx * cs + 1
+  local minZ = (cz - 1) * cs
+  local maxZ = cz * cs + 1
+  local ready = self.skyColumnsReady
+  local queued = 0
+
+  for z = minZ, maxZ do
+    if z >= 1 and z <= world.sizeZ then
+      for x = minX, maxX do
+        if x >= 1 and x <= world.sizeX then
+          local columnKey = world:_worldColumnKey(x, z)
+          if not ready[columnKey] and self:_enqueueSkyColumn(columnKey, seedUrgent) then
+            queued = queued + 1
+          end
+        end
+      end
+    end
+  end
+
+  if queued > 0 then
+    self:_setSkyStageFromQueues()
+  end
+  return queued
+end
+
 function FloodfillLighting:_clearSkyBounds(minX, maxX, minZ, maxZ)
   local world = self.world
   for z = minZ, maxZ do
@@ -1944,7 +1973,7 @@ function FloodfillLighting:_areSkyHaloColumnsReady(cx, cz)
   return true
 end
 
-function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
+function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz, options)
   local world = self.world
   if not self.enabled then
     return true
@@ -1956,21 +1985,27 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
     return false
   end
 
+  -- Threaded meshing can request a lightweight ensure path that only queues/validates local columns.
+  local skipLocalUpdate = type(options) == 'table' and options.skipLocalUpdate == true
   local config = self.lightingConfig or {}
-  local localOps = math.floor(tonumber(config.chunkEnsureOps) or 768)
-  local localMillis = tonumber(config.chunkEnsureMillis)
-  if localMillis == nil then
-    localMillis = 0.2
-  end
-
-  local ensureScale = self:_computeChunkEnsureScale(config)
-  self._chunkEnsureScaleLast = ensureScale
-  if ensureScale < 1 then
-    localOps = math.floor(localOps * ensureScale)
-    if localOps < 0 then
-      localOps = 0
+  local localOps = 0
+  local localMillis = 0
+  if not skipLocalUpdate then
+    localOps = math.floor(tonumber(config.chunkEnsureOps) or 768)
+    localMillis = tonumber(config.chunkEnsureMillis)
+    if localMillis == nil then
+      localMillis = 0.2
     end
-    localMillis = localMillis * ensureScale
+
+    local ensureScale = self:_computeChunkEnsureScale(config)
+    self._chunkEnsureScaleLast = ensureScale
+    if ensureScale < 1 then
+      localOps = math.floor(localOps * ensureScale)
+      if localOps < 0 then
+        localOps = 0
+      end
+      localMillis = localMillis * ensureScale
+    end
   end
 
   local savedPropMinX = self.skyPropMinX
@@ -1991,7 +2026,11 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
     -- Outside simulation lighting region: skip sky solve work and render full skylight.
     readyForMesh = true
   else
-    self:_ensureSkyHaloColumns(cx, cz, true, false, true)
+    if skipLocalUpdate then
+      self:_queueSkyHaloColumns(cx, cz, true)
+    else
+      self:_ensureSkyHaloColumns(cx, cz, true, false, true)
+    end
     local localReady = self:_areSkyHaloColumnsReady(cx, cz)
     if localReady and not self:_hasSkyBacklogWork() then
       readyForMesh = true
@@ -2001,7 +2040,7 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz)
         ensurePasses = 1
       end
 
-      if localOps > 0 then
+      if not skipLocalUpdate and localOps > 0 then
         for _ = 1, ensurePasses do
           self:updateSkyLight(localOps, localMillis, 'ensure')
           localReady = self:_areSkyHaloColumnsReady(cx, cz)

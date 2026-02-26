@@ -335,10 +335,10 @@ function ChunkWorld:_onSkyOpacityChanged(x, y, z, cx, cy, cz, oldOpacity, newOpa
   end
 end
 
-function ChunkWorld:ensureSkyLightForChunk(cx, cy, cz)
+function ChunkWorld:ensureSkyLightForChunk(cx, cy, cz, options)
   local backend = self._lightingBackend
   if backend and backend.ensureSkyLightForChunk then
-    return backend:ensureSkyLightForChunk(cx, cy, cz)
+    return backend:ensureSkyLightForChunk(cx, cy, cz, options)
   end
   return true
 end

@@ -253,7 +253,7 @@ function VerticalLighting:getSkyLight(x, y, z)
   return self:_getSkyLightWorld(x, y, z)
 end
 
-function VerticalLighting:ensureSkyLightForChunk(cx, cy, cz)
+function VerticalLighting:ensureSkyLightForChunk(cx, cy, cz, _options)
   local world = self.world
   if not self.enabled then
     return true

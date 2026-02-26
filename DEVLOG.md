@@ -1,5 +1,41 @@
 # Dev Log
 
+## 2026-02-23
+
+### Threaded Meshing Prep: Fast Sky Ensure Path
+- Reduced main-thread threaded-meshing prep cost in `src/render/ChunkRenderer.lua` by adding a fast sky-ensure mode during worker job dispatch:
+  - threaded prep now requests `ensureSkyLightForChunk(..., { skipLocalUpdate = true })` by default.
+  - this keeps local sky-column queueing/readiness checks but skips per-chunk local `updateSkyLight(...)` passes in prep.
+- Added `Constants.THREAD_MESH.useFastSkyEnsure` in `src/constants.lua` (default `true`) to make this behavior explicit/toggleable.
+- Extended lighting ensure plumbing to carry optional ensure options:
+  - `src/world/ChunkWorld.lua` now forwards optional ensure options to the active lighting backend.
+  - `src/world/lighting/FloodfillLighting.lua` supports `skipLocalUpdate` for lightweight ensure.
+  - `src/world/lighting/VerticalLighting.lua` signature updated for compatibility.
+- Goal: reduce frametime spikes from main-thread pre-dispatch meshing work while preserving lighting convergence through normal per-frame sky-light updates.
+
+### Dirty Queue Churn Guard (Threaded Prep Budget)
+- Updated `src/render/ChunkRenderer.lua` dirty rebuild loop to stop draining queue entries once threaded queue-prep caps are reached (`maxQueuePrepPerFrame` / `maxQueuePrepMillis`) while workers are active.
+- This prevents repeated pop/defer/requeue churn after budget saturation, so the frame does useful work instead of cycling dirty entries.
+- Removed synthetic "skip prep -> force defer" behavior in favor of an early loop break before popping the next dirty entry.
+- Preserved normal fallback behavior (`_rebuildChunk` sync path) when threaded meshing is unavailable.
+
+### Startup Chunk Stall Fix (Fast Sky Ensure Gating)
+- Fixed a startup stall where chunk rebuilds could get stuck with a large dirty queue when threaded fast sky ensure returned not-ready repeatedly.
+- Updated `src/render/ChunkRenderer.lua` so `THREAD_MESH.useFastSkyEnsure = true` is advisory:
+  - still queues/validates local sky-light requirements,
+  - but no longer hard-gates threaded mesh dispatch on immediate sky-ready completion.
+- Goal: keep chunk meshing progressing during initial lighting backlog while allowing normal lighting convergence to remesh chunks as sky data settles.
+
+### Geometry Upload Path Pass (Audit #3)
+- Updated `src/constants.lua` mesh defaults:
+  - `Constants.MESH.indexed = true` (indexed chunk quads on by default),
+  - `Constants.MESH.storage = 'gpu'` (prefer GPU mesh storage).
+- Updated `src/render/ChunkRenderer.lua` mesh creation to prefer configured storage and fall back to CPU mesh storage when needed.
+- Added indexed-upload safety fallback:
+  - if indexed index upload fails at runtime, renderer auto-disables indexed mode and retries chunk rebuilds non-indexed,
+  - stale in-flight indexed threaded results are requeued instead of being applied after indexed mode is disabled.
+- Goal: reduce vertex/upload bandwidth and keep geometry upload more GPU-friendly without hard-failing on platform-specific mesh-index limitations.
+
 ## 2026-02-21
 
 ### Block Drop Physics + Natural Harvest Chain Breaks

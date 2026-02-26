@@ -167,8 +167,14 @@ function ChunkRenderer.new(constants, world)
   self._pruneKeepRadius = 0
   self._skyLightKeepRadius = 0
   self._visibleCount = 0
-  self._useGreedyMeshing = not (constants.MESH and constants.MESH.greedy == false)
-  self._useIndexedMeshing = constants.MESH and constants.MESH.indexed == true
+  local meshConfig = constants.MESH or {}
+  self._useGreedyMeshing = meshConfig.greedy ~= false
+  self._useIndexedMeshing = meshConfig.indexed ~= false
+  if meshConfig.storage == 'cpu' then
+    self._meshStorage = 'cpu'
+  else
+    self._meshStorage = 'gpu'
+  end
   self._greedyMask = {}
   local greedyMaskSize = self.chunkSize * self.chunkSize
   for i = 1, greedyMaskSize do
@@ -215,6 +221,8 @@ function ChunkRenderer.new(constants, world)
   self._threadEnabled = threadConfig.enabled == true
   self._threadHaloBlob = threadConfig.haloBlob ~= false
   self._threadResultBlob = threadConfig.resultBlob ~= false
+  -- By default, threaded prep only queues sky-light work and avoids running local ensure passes.
+  self._threadUseFastSkyEnsure = threadConfig.useFastSkyEnsure ~= false
   local configuredMaxInFlight = tonumber(threadConfig.maxInFlight)
   self._threadMaxInFlightAuto = configuredMaxInFlight == nil or configuredMaxInFlight <= 0
   self._threadMaxInFlight = 2
@@ -332,6 +340,37 @@ function ChunkRenderer:getMeshingModeLabel()
     return 'Greedy'
   end
   return 'Naive'
+end
+
+local function isIndexedApplyError(err)
+  if not err then
+    return false
+  end
+  local text = tostring(err)
+  return string.find(text, 'indexed_', 1, true) ~= nil
+end
+
+function ChunkRenderer:_disableIndexedMeshing(reason)
+  if not self._useIndexedMeshing then
+    return false
+  end
+
+  self._useIndexedMeshing = false
+  self._indexCountOpaque = 0
+  self._indexCountAlpha = 0
+
+  local opaquePool = self._indexPoolOpaque
+  for i = 1, #opaquePool do
+    opaquePool[i] = nil
+  end
+
+  local alphaPool = self._indexPoolAlpha
+  for i = 1, #alphaPool do
+    alphaPool[i] = nil
+  end
+
+  self._meshWorkerError = tostring(reason or 'indexed_meshing_disabled')
+  return true
 end
 
 function ChunkRenderer:_releaseMesh(mesh)
@@ -755,7 +794,11 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
       return nil, 'missing_vertex_data'
     end
 
-    local okMesh, meshOrErr = pcall(lovr.graphics.newMesh, VERTEX_FORMAT, vertexData, 'cpu')
+    local preferredStorage = self._meshStorage or 'gpu'
+    local okMesh, meshOrErr = pcall(lovr.graphics.newMesh, VERTEX_FORMAT, vertexData, preferredStorage)
+    if not okMesh and preferredStorage ~= 'cpu' then
+      okMesh, meshOrErr = pcall(lovr.graphics.newMesh, VERTEX_FORMAT, vertexData, 'cpu')
+    end
     if not okMesh then
       return nil, meshOrErr
     end
@@ -766,7 +809,7 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
     if indexedMode and indexCount > 0 then
       if not indexData then
         self:_releaseMesh(mesh)
-        return nil, 'missing_index_data'
+        return nil, 'indexed_missing_index_data'
       end
 
       local okIndex, indexErr
@@ -782,7 +825,7 @@ function ChunkRenderer:_setChunkMeshEntry(key, cx, cy, cz,
 
       if not okIndex then
         self:_releaseMesh(mesh)
-        return nil, indexErr
+        return nil, 'indexed_set_indices_failed: ' .. tostring(indexErr)
       end
     end
 
@@ -867,11 +910,20 @@ function ChunkRenderer:_queueThreadedRebuild(cx, cy, cz, key)
     self.world:prepareChunk(cx, cy, cz)
   end
   if self.world.ensureSkyLightForChunk then
-    local ready = self.world:ensureSkyLightForChunk(cx, cy, cz)
+    local ready
+    local requireReady = true
+    if self._threadUseFastSkyEnsure then
+      -- Fast ensure queues/validates local sky columns but should not hard-gate mesh dispatch.
+      -- Lighting convergence happens in main-frame updates and will remesh dirty chunks as needed.
+      ready = self.world:ensureSkyLightForChunk(cx, cy, cz, { skipLocalUpdate = true })
+      requireReady = false
+    else
+      ready = self.world:ensureSkyLightForChunk(cx, cy, cz)
+    end
     if hasTimer then
       self._threadPrepEnsureMsLastFrame = self._threadPrepEnsureMsLastFrame + ((lovr.timer.getTime() - stepStartTime) * 1000)
     end
-    if ready == false then
+    if requireReady and ready == false then
       return 'defer'
     end
   elseif hasTimer then
@@ -1002,6 +1054,17 @@ function ChunkRenderer:_processThreadedResult(result)
     return true, 0
   end
 
+  if result.indexed == true and not self._useIndexedMeshing then
+    self:_requeueDirtyEntry({
+      key = key,
+      cx = result.cx,
+      cy = result.cy,
+      cz = result.cz,
+      dist = 0
+    })
+    return true, 0
+  end
+
   local okApply, applyErr = self:_setChunkMeshEntry(
     key,
     result.cx,
@@ -1020,6 +1083,21 @@ function ChunkRenderer:_processThreadedResult(result)
     result.indexed == true
   )
   if not okApply then
+    if result.indexed == true and isIndexedApplyError(applyErr) then
+      self:_disableIndexedMeshing(applyErr)
+      local rebuiltSync = self:_rebuildChunk(result.cx, result.cy, result.cz)
+      if rebuiltSync == false then
+        self:_requeueDirtyEntry({
+          key = key,
+          cx = result.cx,
+          cy = result.cy,
+          cz = result.cz,
+          dist = 0
+        })
+      end
+      return true, 0
+    end
+
     self:_disableMeshWorker(applyErr or 'mesh_apply_failed')
     local rebuiltSync = self:_rebuildChunk(result.cx, result.cy, result.cz)
     if rebuiltSync == false then
@@ -2064,6 +2142,11 @@ function ChunkRenderer:_rebuildChunk(cx, cy, cz)
     self._useIndexedMeshing
   )
   if not okApply then
+    if self._useIndexedMeshing and isIndexedApplyError(applyErr) then
+      self:_disableIndexedMeshing(applyErr)
+      return self:_rebuildChunk(cx, cy, cz)
+    end
+
     self._meshWorkerError = tostring(applyErr or 'mesh_apply_failed')
     return false
   end
@@ -2172,6 +2255,16 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
       break
     end
 
+    -- Once threaded queue-prep budget is spent, stop draining dirty entries this frame.
+    -- This avoids pop->defer->requeue churn when we already know prep work is capped.
+    if self._threadEnabled and self:_isMeshWorkerReady() then
+      local hitPrepOpsCap = maxQueuePrepOps > 0 and queuePrepOps >= maxQueuePrepOps
+      local hitPrepMsCap = maxQueuePrepMs > 0 and queuePrepMs >= maxQueuePrepMs
+      if hitPrepOpsCap or hitPrepMsCap then
+        break
+      end
+    end
+
     local entry = self:_popDirtyEntry()
     if not entry then
       break
@@ -2190,32 +2283,20 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
     end
 
     if entry then
-      local skipThreadPrep = false
-      if self._threadEnabled and self:_isMeshWorkerReady() then
-        if maxQueuePrepOps > 0 and queuePrepOps >= maxQueuePrepOps then
-          skipThreadPrep = true
-        end
-        if not skipThreadPrep and maxQueuePrepMs > 0 and queuePrepMs >= maxQueuePrepMs then
-          skipThreadPrep = true
-        end
-      end
-
       local threadStatus = nil
-      if skipThreadPrep then
-        threadStatus = 'defer'
+      local prepStartTime = 0
+      if hasTimer then
+        prepStartTime = lovr.timer.getTime()
+      end
+      threadStatus = self:_queueThreadedRebuild(entry.cx, entry.cy, entry.cz, entry.key)
+      if hasTimer and prepStartTime > 0 then
+        queuePrepMs = queuePrepMs + ((lovr.timer.getTime() - prepStartTime) * 1000)
+      end
+      if self._threadEnabled and threadStatus ~= 'fallback' then
+        queuePrepOps = queuePrepOps + 1
+      end
+      if threadStatus == 'defer' then
         queuePrepDeferred = queuePrepDeferred + 1
-      else
-        local prepStartTime = 0
-        if hasTimer then
-          prepStartTime = lovr.timer.getTime()
-        end
-        threadStatus = self:_queueThreadedRebuild(entry.cx, entry.cy, entry.cz, entry.key)
-        if hasTimer and prepStartTime > 0 then
-          queuePrepMs = queuePrepMs + ((lovr.timer.getTime() - prepStartTime) * 1000)
-        end
-        if self._threadEnabled and threadStatus ~= 'fallback' then
-          queuePrepOps = queuePrepOps + 1
-        end
       end
 
       if threadStatus == 'queued' then

@@ -118,7 +118,10 @@ Constants.FOG = {
 
 Constants.MESH = {
   greedy = true,
-  indexed = false
+  -- Indexed quads reduce vertex payload and upload bandwidth for chunk meshes.
+  indexed = true,
+  -- Prefer GPU-only mesh storage; renderer falls back to CPU storage if unsupported.
+  storage = 'gpu'
 }
 
 Constants.RENDER = {
@@ -134,6 +137,9 @@ Constants.THREAD_MESH = {
   enabled = true,
   workerCount = 0, -- 0 = auto (use logical cores - 1, clamped by maxWorkers)
   maxWorkers = 4,
+  -- Queue sky-light requirements during threaded prep but avoid running local ensure passes there.
+  -- Main-frame lighting updates still converge lighting and trigger remeshes as sky values settle.
+  useFastSkyEnsure = true,
   haloBlob = true,
   resultBlob = true,
   -- Limit expensive per-chunk main-thread prep before dispatching worker jobs.

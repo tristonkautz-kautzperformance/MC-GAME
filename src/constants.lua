@@ -59,7 +59,9 @@ Constants.SKY_BODIES = {
 
 Constants.LIGHTING = {
   enabled = true,
-  mode = 'floodfill',
+  -- 'vertical' = fast, top-down only (classic Minecraft style)
+  -- 'floodfill' = slower, sideways propagation (better shadows/caves)
+  mode = 'vertical',
   leafOpacity = 4,
   maxUpdatesPerFrame = 8192,
   maxMillisPerFrame = 1.25,

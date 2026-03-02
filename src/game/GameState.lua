@@ -187,6 +187,7 @@ function GameState.new(constants)
   self._enqueuedShowSeconds = 0.5
   self._cameraPosition = nil
   self._hudState = {}
+  self._menuState = {}
   self._shaderStatusText = nil
   self._shaderStatusSkySubtract = nil
   self._shaderStatusError = nil
@@ -1449,16 +1450,16 @@ function GameState:_updateGame(dt)
   if self.inventoryMenuOpen then
     self:_refreshCraftableOutputs()
     if self.inventoryMenuUi and self.inventoryMenuUi.update then
-      local menuState = {
-        inventory = self.inventory,
-        inventoryMenuMode = self.inventoryMenuMode,
-        bagCraftSlots = self.bagCraftSlots,
-        workbenchCraftSlots = self.workbenchCraftSlots,
-        craftableOutputs = self.craftableOutputs,
-        uiHover = self._uiHover,
-        uiMouseInsideMenu = self._uiMouseInsideMenu,
-        uiMouseDebug = self._uiMenuMouseDebug
-      }
+      -- Reuse persistent menuState table to avoid per-frame allocation
+      local menuState = self._menuState
+      menuState.inventory = self.inventory
+      menuState.inventoryMenuMode = self.inventoryMenuMode
+      menuState.bagCraftSlots = self.bagCraftSlots
+      menuState.workbenchCraftSlots = self.workbenchCraftSlots
+      menuState.craftableOutputs = self.craftableOutputs
+      menuState.uiHover = self._uiHover
+      menuState.uiMouseInsideMenu = self._uiMouseInsideMenu
+      menuState.uiMouseDebug = self._uiMenuMouseDebug
       self.inventoryMenuUi:update(menuState)
       self._uiHover = menuState.uiHover or self._uiHover
       self._uiMouseInsideMenu = menuState.uiMouseInsideMenu == true
@@ -2005,16 +2006,16 @@ function GameState:draw(pass)
   self._uiMouseInsideMenu = hudState.uiMouseInsideMenu == true
 
   if self.inventoryMenuOpen and self.inventoryMenuUi and self.inventoryMenuUi.draw then
-    local menuState = {
-      inventory = self.inventory,
-      inventoryMenuMode = self.inventoryMenuMode,
-      bagCraftSlots = self.bagCraftSlots,
-      workbenchCraftSlots = self.workbenchCraftSlots,
-      craftableOutputs = self.craftableOutputs,
-      uiHover = self._uiHover,
-      uiMouseInsideMenu = self._uiMouseInsideMenu,
-      uiMouseDebug = self._uiMenuMouseDebug
-    }
+    -- Reuse persistent menuState table to avoid per-frame allocation
+    local menuState = self._menuState
+    menuState.inventory = self.inventory
+    menuState.inventoryMenuMode = self.inventoryMenuMode
+    menuState.bagCraftSlots = self.bagCraftSlots
+    menuState.workbenchCraftSlots = self.workbenchCraftSlots
+    menuState.craftableOutputs = self.craftableOutputs
+    menuState.uiHover = self._uiHover
+    menuState.uiMouseInsideMenu = self._uiMouseInsideMenu
+    menuState.uiMouseDebug = self._uiMenuMouseDebug
     self.inventoryMenuUi:draw(pass, menuState)
     self._uiHover = menuState.uiHover or self._uiHover
     self._uiMouseInsideMenu = menuState.uiMouseInsideMenu == true

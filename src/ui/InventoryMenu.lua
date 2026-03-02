@@ -83,6 +83,15 @@ function InventoryMenu.new(constants)
   self._cameraOrientation = lovr.math.newQuat()
   self._layout = nil
   self._mouseDebug = 'n/a'
+  -- Layout cache keys for invalidation detection
+  self._layoutCache = {
+    width = 0,
+    height = 0,
+    slotCount = 0,
+    hotbarCount = 0,
+    mode = nil,
+    craftableCount = 0
+  }
   return self
 end
 
@@ -415,8 +424,37 @@ function InventoryMenu:update(state)
     return
   end
 
-  local layout = self:_computeLayout(state, width, height)
-  self._layout = layout
+  -- Determine cache validity keys
+  local inventory = state.inventory
+  local mode = state.inventoryMenuMode == 'workbench' and 'workbench' or 'bag'
+  local craftables = state.craftableOutputs or {}
+  local cache = self._layoutCache
+  local slotCount = inventory and inventory.slotCount or 0
+  local hotbarCount = inventory and inventory.hotbarCount or 0
+
+  -- Check if layout needs recomputation
+  local cacheValid = self._layout
+    and cache.width == width
+    and cache.height == height
+    and cache.slotCount == slotCount
+    and cache.hotbarCount == hotbarCount
+    and cache.mode == mode
+    and cache.craftableCount == #craftables
+
+  local layout
+  if cacheValid then
+    layout = self._layout
+  else
+    layout = self:_computeLayout(state, width, height)
+    self._layout = layout
+    -- Update cache keys
+    cache.width = width
+    cache.height = height
+    cache.slotCount = slotCount
+    cache.hotbarCount = hotbarCount
+    cache.mode = mode
+    cache.craftableCount = #craftables
+  end
   if not layout then
     state.uiMouseDebug = 'no-layout'
     return

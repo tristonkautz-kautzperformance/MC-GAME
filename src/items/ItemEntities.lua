@@ -172,10 +172,7 @@ function ItemEntities:_simulateEntity(entity, dt)
     return
   end
 
-  entity.vx = tonumber(entity.vx) or 0
-  entity.vy = tonumber(entity.vy) or 0
-  entity.vz = tonumber(entity.vz) or 0
-
+  -- Velocities are pre-validated on spawn; no need for per-frame tonumber() checks.
   local dragFactor = 1 / (1 + self.airDrag * dt)
   entity.vx = entity.vx * dragFactor
   entity.vz = entity.vz * dragFactor

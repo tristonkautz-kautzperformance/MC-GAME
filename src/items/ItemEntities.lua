@@ -98,22 +98,15 @@ function ItemEntities:_ensureCapacity()
     return
   end
 
+  -- LRU eviction: remove oldest entity (lowest serial number)
+  -- Much faster than distance-based eviction - just integer comparison
   local dropIndex = 1
-  local farthestDistSq = -1
-  local px = self._lastPlayerX
-  local py = self._lastPlayerY
-  local pz = self._lastPlayerZ
+  local oldestSerial = self.entities[1].serial
 
-  for i = 1, self.count do
+  for i = 2, self.count do
     local entity = self.entities[i]
-    local dx = entity.x - px
-    local dy = entity.y - py
-    local dz = entity.z - pz
-    local distSq = dx * dx + dy * dy + dz * dz
-    if distSq > farthestDistSq then
-      farthestDistSq = distSq
-      dropIndex = i
-    elseif distSq == farthestDistSq and entity.serial < self.entities[dropIndex].serial then
+    if entity.serial < oldestSerial then
+      oldestSerial = entity.serial
       dropIndex = i
     end
   end

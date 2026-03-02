@@ -176,9 +176,12 @@ function ChunkRenderer.new(constants, world)
     self._meshStorage = 'gpu'
   end
   self._greedyMask = {}
+  self._greedyMaskGen = {}  -- Generation array for lazy mask clearing
+  self._greedyMaskGenCounter = 1  -- Current generation number
   local greedyMaskSize = self.chunkSize * self.chunkSize
   for i = 1, greedyMaskSize do
     self._greedyMask[i] = 0
+    self._greedyMaskGen[i] = 0
   end
   self._blockHalo = {}
   self._skyHalo = {}
@@ -1953,14 +1956,17 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
   end
 
   local mask = self._greedyMask
+  local maskGen = self._greedyMaskGen
   local maskSize = cs * cs
   if #mask < maskSize then
     for i = #mask + 1, maskSize do
       mask[i] = 0
+      maskGen[i] = 0
     end
   elseif #mask > maskSize then
     for i = maskSize + 1, #mask do
       mask[i] = nil
+      maskGen[i] = nil
     end
   end
 
@@ -1975,9 +1981,10 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
     local neighborOffset = nx + nz * strideZ + ny * strideY
 
     for slice = 1, cs do
-      for i = 1, maskSize do
-        mask[i] = 0
-      end
+      -- Increment generation counter instead of O(N) zeroing
+      self._greedyMaskGenCounter = self._greedyMaskGenCounter + 1
+      local currentGen = self._greedyMaskGenCounter
+      local maskGen = self._greedyMaskGen
 
       for v = 1, cs do
         for u = 1, cs do
@@ -1996,7 +2003,9 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
           local shouldDraw = self:_shouldDrawFace(block, neighbor)
           if shouldDraw then
             local sky = skyHalo[index + neighborOffset] or 0
-            mask[(v - 1) * cs + u] = block * 16 + sky
+            local maskIndex = (v - 1) * cs + u
+            mask[maskIndex] = block * 16 + sky
+            maskGen[maskIndex] = currentGen
           end
         end
       end
@@ -2006,11 +2015,12 @@ function ChunkRenderer:_buildChunkGreedy(cx, cy, cz)
         while u <= cs do
           local index = (v - 1) * cs + u
           local mergeKey = mask[index]
-          if mergeKey == 0 then
+          -- Check if this slot was set in current generation
+          if mergeKey == 0 or maskGen[index] ~= currentGen then
             u = u + 1
           else
             local width = 1
-            while (u + width) <= cs and mask[index + width] == mergeKey do
+            while (u + width) <= cs and mask[index + width] == mergeKey and maskGen[index + width] == currentGen do
               width = width + 1
             end
 

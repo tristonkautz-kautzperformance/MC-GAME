@@ -757,8 +757,44 @@ function ChunkWorld:_getTerrainColumnData(x, z)
   if packed == nil then
     packed = self:_computeTerrainColumnData(x, z)
     self._terrainColumnData[key] = packed
+    -- Prune cache if it grows too large (prevent memory bloat during long sessions)
+    if self._terrainColumnData[key] and self:_getTerrainColumnCacheSize() > 10000 then
+      self:_pruneTerrainColumnCache(x, z)
+    end
   end
   return self:_unpackTerrainColumnData(packed)
+end
+
+function ChunkWorld:_getTerrainColumnCacheSize()
+  local count = 0
+  for _ in pairs(self._terrainColumnData) do
+    count = count + 1
+  end
+  return count
+end
+
+function ChunkWorld:_pruneTerrainColumnCache(centerX, centerZ)
+  -- Remove terrain column entries far from the given center position
+  -- This prevents unbounded memory growth during long play sessions
+  local maxDistSq = 96 * 96  -- Prune columns beyond 96 blocks (6 chunks at 16 blocks/chunk)
+  local toRemove = {}
+  local removeCount = 0
+  
+  for key, _ in pairs(self._terrainColumnData) do
+    local colX, colZ = self:_decodeWorldColumnKey(key)
+    local dx = colX - centerX
+    local dz = colZ - centerZ
+    local distSq = dx * dx + dz * dz
+    if distSq > maxDistSq then
+      removeCount = removeCount + 1
+      toRemove[removeCount] = key
+    end
+  end
+  
+  -- Remove in batch to avoid pairs() modification issues
+  for i = 1, removeCount do
+    self._terrainColumnData[toRemove[i]] = nil
+  end
 end
 
 function ChunkWorld:_getBaseBlock(x, y, z)

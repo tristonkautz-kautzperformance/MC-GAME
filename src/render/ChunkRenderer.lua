@@ -195,6 +195,8 @@ function ChunkRenderer.new(constants, world)
   self._opaqueScratch = {}
   self._opaqueScratchCount = 0
   self._drawFrameId = 0
+  self._alphaVisibleScratch = {}
+  self._alphaVisibleScratchCount = 0
   self._alphaOrder = {}
   self._alphaOrderCount = 0
   self._alphaOrderDirty = true
@@ -2475,28 +2477,101 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
   local opaqueScratch = self._opaqueScratch
   local prevOpaqueCount = self._opaqueScratchCount or 0
   local opaqueCount = 0
-  local visibleAlphaCount = 0
+  local alphaVisibleScratch = self._alphaVisibleScratch
+  local prevAlphaVisibleCount = self._alphaVisibleScratchCount or 0
+  local alphaVisibleCount = 0
   local sortOpaque = self._sortOpaqueFrontToBack
 
-  -- Gather visibility once per frame and build opaque draw list.
-  for _, entry in pairs(self._chunkMeshes) do
-    if entry.opaque or entry.alpha then
-      if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFrame) then
-        self._visibleCount = self._visibleCount + 1
-        entry._visibleFrame = drawFrameId
+  -- Gather visibility once per frame from a bounded chunk window around the camera.
+  -- This avoids scanning every cached mesh entry when far-away chunks are still retained.
+  local world = self.world
+  local chunkMeshes = self._chunkMeshes
+  if cullFrame.enabled and world then
+    local cs = self.chunkSize
+    local chunksX = world.chunksX
+    local chunksZ = world.chunksZ
+    local chunksPerLayer = chunksX * chunksZ
 
-        if entry.opaque then
-          if sortOpaque then
+    local pcx = clamp(math.floor((cameraX or 0) / cs) + 1, 1, chunksX)
+    local pcz = clamp(math.floor((cameraZ or 0) / cs) + 1, 1, chunksZ)
+    local minCy = 1
+    local maxCy = world.chunksY
+    if world.getActiveChunkYRange then
+      minCy, maxCy = world:getActiveChunkYRange()
+    end
+
+    local radiusChunks = math.floor((cullFrame.radiusWorld + cullFrame.padWorld) / cs) + 2
+    if radiusChunks < 0 then
+      radiusChunks = 0
+    end
+
+    local minCx = clamp(pcx - radiusChunks, 1, chunksX)
+    local maxCx = clamp(pcx + radiusChunks, 1, chunksX)
+    local minCz = clamp(pcz - radiusChunks, 1, chunksZ)
+    local maxCz = clamp(pcz + radiusChunks, 1, chunksZ)
+
+    if not cullFrame.horizontalOnly then
+      local pcy = clamp(math.floor((cameraY or 0) / cs) + 1, minCy, maxCy)
+      local minCyBound = minCy
+      local maxCyBound = maxCy
+      minCy = clamp(pcy - radiusChunks, minCyBound, maxCyBound)
+      maxCy = clamp(pcy + radiusChunks, minCyBound, maxCyBound)
+    end
+
+    for cy = minCy, maxCy do
+      local layerBase = (cy - 1) * chunksPerLayer
+      for cz = minCz, maxCz do
+        local rowBase = layerBase + (cz - 1) * chunksX
+        for cx = minCx, maxCx do
+          local entry = chunkMeshes[rowBase + cx]
+          if entry and (entry.opaque or entry.alpha) then
+            if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFrame) then
+              self._visibleCount = self._visibleCount + 1
+              entry._visibleFrame = drawFrameId
+
+              if sortOpaque or entry.alpha then
+                local dx = entry.centerX - cameraX
+                local dy = entry.centerY - cameraY
+                local dz = entry.centerZ - cameraZ
+                entry._sortDistSq = dx * dx + dy * dy + dz * dz
+              end
+
+              if entry.opaque then
+                opaqueCount = opaqueCount + 1
+                opaqueScratch[opaqueCount] = entry
+              end
+              if entry.alpha then
+                alphaVisibleCount = alphaVisibleCount + 1
+                alphaVisibleScratch[alphaVisibleCount] = entry
+              end
+            end
+          end
+        end
+      end
+    end
+  else
+    -- Culling disabled: preserve legacy behavior and scan all cached chunk meshes.
+    for _, entry in pairs(chunkMeshes) do
+      if entry.opaque or entry.alpha then
+        if self:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFrame) then
+          self._visibleCount = self._visibleCount + 1
+          entry._visibleFrame = drawFrameId
+
+          if sortOpaque or entry.alpha then
             local dx = entry.centerX - cameraX
             local dy = entry.centerY - cameraY
             local dz = entry.centerZ - cameraZ
             entry._sortDistSq = dx * dx + dy * dy + dz * dz
           end
-          opaqueCount = opaqueCount + 1
-          opaqueScratch[opaqueCount] = entry
-        end
-        if entry.alpha then
-          visibleAlphaCount = visibleAlphaCount + 1
+
+          if entry.opaque then
+            opaqueCount = opaqueCount + 1
+            opaqueScratch[opaqueCount] = entry
+          end
+          if entry.alpha then
+            alphaVisibleCount = alphaVisibleCount + 1
+            alphaVisibleScratch[alphaVisibleCount] = entry
+          end
         end
       end
     end
@@ -2506,6 +2581,11 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
     opaqueScratch[i] = nil
   end
   self._opaqueScratchCount = opaqueCount
+
+  for i = alphaVisibleCount + 1, prevAlphaVisibleCount do
+    alphaVisibleScratch[i] = nil
+  end
+  self._alphaVisibleScratchCount = alphaVisibleCount
 
   if sortOpaque and opaqueCount > 1 then
     table.sort(opaqueScratch, opaqueSortFrontToBack)
@@ -2519,16 +2599,14 @@ function ChunkRenderer:draw(pass, cameraX, cameraY, cameraZ, cameraOrientation, 
     end
   end
 
-  if self._alphaOrderDirty or visibleAlphaCount > 1 then
-    self:_ensureAlphaOrder(cameraX, cameraY, cameraZ)
+  if alphaVisibleCount > 1 then
+    table.sort(alphaVisibleScratch, alphaSortBackToFront)
   end
 
   pass:setCullMode(self._cullAlpha and 'back' or 'none')
-  local alphaOrder = self._alphaOrder
-  local alphaCount = self._alphaOrderCount or 0
-  for i = 1, alphaCount do
-    local entry = alphaOrder[i]
-    if entry and entry.alpha and entry._visibleFrame == drawFrameId then
+  for i = 1, alphaVisibleCount do
+    local entry = alphaVisibleScratch[i]
+    if entry and entry.alpha then
       pass:draw(entry.alpha, entry.originX, entry.originY, entry.originZ)
     end
   end

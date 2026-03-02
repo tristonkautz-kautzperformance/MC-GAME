@@ -62,6 +62,16 @@ Simple Minecraft-style prototype in Lua using LOVR.
 - Autosave system exists but is currently disabled by default for perf testing
 - Main menu save metadata (availability, last saved time, edit count, version health)
 
+## Documentation
+
+- `README.md` (this file): features, controls, and how to run.
+- `GAME_CONCEPT.md`: design outline + V1 milestones.
+- `DEVLOG.md`: chronological development log with technical details.
+- `AUDIT_RESULTS_CONSOLIDATED.md`: consolidated performance audit findings (OpenAI Codex 5.3).
+- `KIMI_AUDIT_RESULTS.md`: additional performance & memory audit (Kimi Code CLI).
+- `THIRD_PARTY_NOTICES.md`: license attributions for vendored code.
+- `Codex_Instructions`: current engineering task specification (AI agent context).
+
 ## Controls
 
 - `WASD`: move

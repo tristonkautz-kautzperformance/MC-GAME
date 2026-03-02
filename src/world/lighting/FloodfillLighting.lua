@@ -95,6 +95,10 @@ function FloodfillLighting:reset()
   self.skyRegionOpsPending = 0
   self.skyRegionOpsProcessedLast = 0
   self.skyRegionTaskPool = {}
+  self._backlogRemeshQueue = {}
+  self._backlogRemeshSet = {}
+  self._backlogRemeshHead = 1
+  self._backlogRemeshTail = 0
 
   self._frameMsHint = 0
   self._worstFrameMsHint = 0
@@ -269,6 +273,65 @@ end
 
 function FloodfillLighting:_hasSkyBacklogWork()
   return self:_hasSkyQueueWork() or self:_hasRegionTasks()
+end
+
+function FloodfillLighting:_queueBacklogRemeshChunk(cx, cy, cz)
+  local world = self.world
+  if cx < 1 or cx > world.chunksX
+    or cy < 1 or cy > world.chunksY
+    or cz < 1 or cz > world.chunksZ then
+    return false
+  end
+
+  local chunkKey = world:chunkKey(cx, cy, cz)
+  local set = self._backlogRemeshSet
+  if set[chunkKey] then
+    return false
+  end
+
+  local queue = self._backlogRemeshQueue
+  local tail = (self._backlogRemeshTail or 0) + 1
+  self._backlogRemeshTail = tail
+  queue[tail] = chunkKey
+  set[chunkKey] = true
+  return true
+end
+
+function FloodfillLighting:_flushBacklogRemeshChunks(maxChunks)
+  local limit = math.floor(tonumber(maxChunks) or 0)
+  if limit <= 0 then
+    return 0
+  end
+
+  local queue = self._backlogRemeshQueue
+  local set = self._backlogRemeshSet
+  local head = self._backlogRemeshHead or 1
+  local tail = self._backlogRemeshTail or 0
+  local world = self.world
+  local flushed = 0
+
+  while head <= tail and flushed < limit do
+    local chunkKey = queue[head]
+    queue[head] = nil
+    head = head + 1
+
+    if chunkKey ~= nil then
+      set[chunkKey] = nil
+      local cx, cy, cz = world:decodeChunkKey(chunkKey)
+      world:_markDirty(cx, cy, cz)
+      flushed = flushed + 1
+    end
+  end
+
+  if head > tail then
+    self._backlogRemeshHead = 1
+    self._backlogRemeshTail = 0
+  else
+    self._backlogRemeshHead = head
+    self._backlogRemeshTail = tail
+  end
+
+  return flushed
 end
 
 function FloodfillLighting:_setSkyStageFromQueues()
@@ -1350,7 +1413,7 @@ function FloodfillLighting:_ensureSkyHaloColumns(cx, cz, enqueueFlood, markDirty
   end
 end
 
-function FloodfillLighting:_queueSkyHaloColumns(cx, cz, seedUrgent)
+function FloodfillLighting:_queueSkyHaloColumns(cx, cz, seedUrgent, trackDirty)
   local world = self.world
   local cs = world.chunkSize
   local minX = (cx - 1) * cs
@@ -1374,6 +1437,11 @@ function FloodfillLighting:_queueSkyHaloColumns(cx, cz, seedUrgent)
   end
 
   if queued > 0 then
+    if trackDirty then
+      -- Mesh-prep queued columns must be allowed to trigger chunk remeshes as values settle.
+      self.skyTrackDirtyVertical = true
+      self.skyTrackDirtyFlood = true
+    end
     self:_setSkyStageFromQueues()
   end
   return queued
@@ -2027,7 +2095,7 @@ function FloodfillLighting:ensureSkyLightForChunk(cx, cy, cz, options)
     readyForMesh = true
   else
     if skipLocalUpdate then
-      self:_queueSkyHaloColumns(cx, cz, true)
+      self:_queueSkyHaloColumns(cx, cz, true, true)
     else
       self:_ensureSkyHaloColumns(cx, cz, true, false, true)
     end
@@ -2123,7 +2191,12 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
   end
 
   local queueBacklog = self:_hasSkyBacklogWork()
+  if queueBacklog then
+    -- This chunk is being meshed with temporary full-skylight fallback; re-mesh it once backlog clears.
+    self:_queueBacklogRemeshChunk(cx, cy, cz)
+  end
   local skyColumnsReady = self.skyColumnsReady
+  local skyColumnProgress = self.skyColumnProgress
   local strideZ = haloSize
   local strideY = haloSize * haloSize
   local baseOriginX = (cx - 1) * cs
@@ -2146,11 +2219,14 @@ function FloodfillLighting:fillSkyLightHalo(cx, cy, cz, out)
           out[index] = 0
         elseif wy > world.sizeY then
           out[index] = 15
-        elseif queueBacklog or not skyColumnsReady[world:_worldColumnKey(wx, wz)] then
-          -- If floodfill queues are still active or this column is unready, keep no-shadow fallback.
-          out[index] = 15
         else
-          out[index] = self:_getSkyLightWorld(wx, wy, wz)
+          local columnKey = world:_worldColumnKey(wx, wz)
+          if queueBacklog or (not skyColumnsReady[columnKey]) or skyColumnProgress[columnKey] ~= nil then
+            -- Keep full-skylight fallback while floodfill backlog exists to avoid vertical/intermediate snapshots.
+            out[index] = 15
+          else
+            out[index] = self:_getSkyLightWorld(wx, wy, wz)
+          end
         end
       end
     end
@@ -2171,6 +2247,10 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis, sourceTag)
   end
 
   local config = self.lightingConfig or {}
+  local backlogRemeshFlushPerFrame = math.floor(tonumber(config.backlogRemeshFlushPerFrame) or 96)
+  if backlogRemeshFlushPerFrame < 1 then
+    backlogRemeshFlushPerFrame = 1
+  end
   local dequeueScanLimit = math.floor(tonumber(config.dequeueScanLimitPerCall) or 0)
   if dequeueScanLimit < 0 then
     dequeueScanLimit = 0
@@ -2299,6 +2379,9 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis, sourceTag)
   end
 
   self:_setSkyStageFromQueues()
+  if not self:_hasSkyBacklogWork() then
+    self:_flushBacklogRemeshChunks(backlogRemeshFlushPerFrame)
+  end
   if self.skyStage == 'idle' then
     local updateMs = 0
     if hasTimer and updateStartTime > 0 then
@@ -2485,6 +2568,9 @@ function FloodfillLighting:updateSkyLight(maxOps, maxMillis, sourceTag)
   )
 
   self:_setSkyStageFromQueues()
+  if not self:_hasSkyBacklogWork() then
+    self:_flushBacklogRemeshChunks(backlogRemeshFlushPerFrame)
+  end
   return processed + regionProcessed
 end
 

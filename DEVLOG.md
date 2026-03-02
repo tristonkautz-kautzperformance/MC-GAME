@@ -36,6 +36,24 @@
   - stale in-flight indexed threaded results are requeued instead of being applied after indexed mode is disabled.
 - Goal: reduce vertex/upload bandwidth and keep geometry upload more GPU-friendly without hard-failing on platform-specific mesh-index limitations.
 
+### Draw Traversal Bounded Window (Audit #4)
+- Updated `src/render/ChunkRenderer.lua` draw visibility gather to iterate a bounded chunk window around the camera (by draw-radius chunk bounds) instead of scanning all cached chunk meshes every frame.
+- Window iteration uses direct chunk-key math (`rowBase + cx`) against `_chunkMeshes` for low-overhead lookups.
+- Updated alpha pass to sort/draw only visible alpha entries gathered this frame, rather than iterating the full global alpha mesh order list.
+- Goal: keep render CPU cost tied to active near-camera candidates instead of total cached mesh count.
+
+### Shadow Recovery Fix (Feature Trees / Sky-Light Convergence)
+- Updated `src/world/lighting/FloodfillLighting.lua` mesh-prep sky queue path so queued local halo columns can mark chunks dirty as sky values converge:
+  - `_queueSkyHaloColumns(...)` now accepts `trackDirty` and enables dirty tracking when used by fast threaded ensure.
+- Updated fast ensure path in `ensureSkyLightForChunk(...)` to call `_queueSkyHaloColumns(cx, cz, true, true)`.
+- Reconfirmed `fillSkyLightHalo(...)` backlog policy:
+  - while floodfill backlog is active (`columns/dark/flood/region tasks`), keep full-skylight fallback (no lighting system),
+  - once backlog clears, use converged floodfill sky-light data.
+- Added automatic backlog-clear remesh flush:
+  - chunks meshed with full-skylight fallback during backlog are queued for remesh,
+  - when backlog clears, a bounded number of queued chunks are marked dirty each update (`backlogRemeshFlushPerFrame`, default `96`).
+- Goal: prevent naturally generated tree shadows from staying incorrect until manual block edits while preserving the project rule to avoid vertical/intermediate lighting snapshots before floodfill is ready.
+
 ## 2026-02-21
 
 ### Block Drop Physics + Natural Harvest Chain Breaks

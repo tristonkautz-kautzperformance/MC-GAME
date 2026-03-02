@@ -44,6 +44,9 @@ This file describes the project's intent, tech stack, and engineering constraint
   - `README.md`: run + controls.
   - `GAME_CONCEPT.md`: design outline + milestones.
   - `DEVLOG.md`: chronological progress notes.
+  - `AUDIT_RESULTS_CONSOLIDATED.md`: performance audit findings (OpenAI Codex 5.3).
+  - `KIMI_AUDIT_RESULTS.md`: additional performance & memory audit (Kimi Code CLI).
+  - `THIRD_PARTY_NOTICES.md`: license attributions.
   - `Codex_Instructions`: current engineering task spec for Codex.
 
 ## Engineering Guidelines

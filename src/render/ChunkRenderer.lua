@@ -1152,13 +1152,6 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
       break
     end
 
-    if useTimeBudget and applied > 0 then
-      local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
-      if elapsedMs >= maxMillis then
-        break
-      end
-    end
-
     local hadResult = false
     for i = 1, workerCount do
       local worker = workers[i]
@@ -1173,17 +1166,6 @@ function ChunkRenderer:_applyThreadedResults(maxMillis)
             self._threadApplyMsLastFrame = (self._threadApplyMsLastFrame or 0) + ((lovr.timer.getTime() - callStartTime) * 1000)
           end
           return applied
-        end
-
-        if useTimeBudget and applied > 0 then
-          local elapsedMs = (lovr.timer.getTime() - startTime) * 1000
-          if elapsedMs >= maxMillis then
-            self._threadApplyResultsLastFrame = (self._threadApplyResultsLastFrame or 0) + applied
-            if hasTimer and callStartTime > 0 then
-              self._threadApplyMsLastFrame = (self._threadApplyMsLastFrame or 0) + ((lovr.timer.getTime() - callStartTime) * 1000)
-            end
-            return applied
-          end
         end
       end
     end
@@ -1288,6 +1270,9 @@ local function buildCullFrame(renderer, cameraX, cameraY, cameraZ, forwardX, for
   frame.forwardY = fy * invFl
   frame.forwardZ = fz * invFl
   frame.forwardValid = true
+
+  frame.useFrustumPlanes = false -- Disabled: cone-based culling is more reliable
+
   return frame
 end
 
@@ -2198,6 +2183,8 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
     startTime = lovr.timer.getTime()
   end
 
+
+
   self._threadQueuePrepMsLastFrame = 0
   self._threadQueuePrepOpsLastFrame = 0
   self._threadQueuePrepDeferredLastFrame = 0
@@ -2260,7 +2247,7 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
       end
     end
 
-    -- Avoid pop->defer->requeue churn when worker slots are saturated.
+    -- Avoid pop->defer->requeue churn when worker slots is saturated.
     if self._threadEnabled
       and self._threadInFlightCount >= self._threadMaxInFlight
       and self:_isMeshWorkerReady() then
@@ -2317,12 +2304,20 @@ function ChunkRenderer:rebuildDirty(maxPerFrame, maxMillisPerFrame)
         deferredCount = deferredCount + 1
         deferredEntries[deferredCount] = entry
       else
-        local rebuiltSync = self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
-        if rebuiltSync == false then
+        -- Fallback: defer instead of sync rebuild to avoid frame spikes
+        -- Only do sync rebuild if absolutely necessary (no threads available at all)
+        if not self._threadEnabled or self._meshWorkerFailed then
+          local rebuiltSync = self:_rebuildChunk(entry.cx, entry.cy, entry.cz)
+          if rebuiltSync == false then
+            deferredCount = deferredCount + 1
+            deferredEntries[deferredCount] = entry
+          else
+            rebuilt = rebuilt + 1
+          end
+        else
+          -- Defer to next frame - thread workers are just busy
           deferredCount = deferredCount + 1
           deferredEntries[deferredCount] = entry
-        else
-          rebuilt = rebuilt + 1
         end
       end
     end
@@ -2384,6 +2379,7 @@ function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFra
     return true
   end
 
+  -- Cone-based FOV culling (reliable and simple)
   local dl = math.sqrt(distSq)
   if dl < 1e-4 then
     return true
@@ -2398,7 +2394,8 @@ function ChunkRenderer:_isVisibleChunk(entry, cameraX, cameraY, cameraZ, cullFra
     1
   )
   local chunkAngle = math.asin(clamp(chunkRadius / dl, 0, 1))
-  local maxAngle = cullFrame.fovBaseRadians + chunkAngle
+  -- Widen the cone by 15% to ensure we don't cull visible edge chunks
+  local maxAngle = cullFrame.fovBaseRadians * 1.15 + chunkAngle
 
   if maxAngle >= math.pi then
     return true

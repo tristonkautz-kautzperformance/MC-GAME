@@ -97,9 +97,9 @@ Constants.LIGHTING = {
 
 Constants.CULL = {
   enabled = true,
-  drawRadiusChunks = 16,
-  -- Reserved for gameplay tick radius; runtime is currently locked to 4 chunks.
-  simulationRadiusChunks = 4,
+  drawRadiusChunks = 6,
+  -- Gameplay simulation radius (mobs, items, etc.) - matches render for consistent experience
+  simulationRadiusChunks = 6,
   fovDegrees = 110,
   fovPaddingDegrees = 8,
   horizontalOnly = true,
@@ -146,31 +146,33 @@ Constants.THREAD_MESH = {
   resultBlob = true,
   -- Limit expensive per-chunk main-thread prep before dispatching worker jobs.
   maxQueuePrepPerFrame = 1,
-  maxQueuePrepMillis = 0.8,
+  maxQueuePrepMillis = 0.5,
   maxInFlight = 2,
   -- Cap how many worker results are applied on the main thread each frame.
+  -- Reduced to prevent spikes when multiple results are ready simultaneously.
   maxApplyResultsPerFrame = 1,
-  maxApplyMillis = 0.6
+  maxApplyMillis = 0.4
 }
 
 Constants.REBUILD = {
-  maxPerFrame = 10,
-  maxMillisPerFrame = 1.2,
+  -- Reduced from 10/1.2 to prevent frame spikes - better to spread work across more frames
+  maxPerFrame = 3,
+  maxMillisPerFrame = 0.8,
   -- Releasing many meshes during movement can stall on some drivers.
   -- Keep runtime releases off by default; meshes are still released on shutdown.
   releaseMeshesRuntime = false,
   -- Prevents a huge startup hitch when the world has many chunks.
-  initialBurstMax = 700,
-  initialBurstMaxMillis = 12.0,
+  initialBurstMax = 200,
+  initialBurstMaxMillis = 8.0,
   prioritize = true,
   prioritizeHorizontalOnly = true,
   -- Only perform full O(queue) rebucket when backlog is small.
-  rebucketFullThreshold = 128,
+  rebucketFullThreshold = 64,
   -- Max stale entries requeued per rebuild call before forcing progress.
-  staleRequeueCap = 32,
+  staleRequeueCap = 16,
   -- Incremental mesh-cache pruning budget to avoid chunk-crossing spikes.
-  pruneMaxChecksPerFrame = 128,
-  pruneMaxMillisPerFrame = 0.25
+  pruneMaxChecksPerFrame = 64,
+  pruneMaxMillisPerFrame = 0.15
 }
 
 Constants.PERF = {

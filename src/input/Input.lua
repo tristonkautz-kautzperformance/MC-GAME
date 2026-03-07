@@ -122,8 +122,26 @@ function Input:onMouseMoved(dx, dy)
     return
   end
 
-  self.lookDx = self.lookDx + dx
-  self.lookDy = self.lookDy + dy
+  -- Clamp individual mouse deltas to prevent spurious large inputs
+  -- from OS-level mouse acceleration or driver bugs.
+  local maxDelta = 100
+  if dx > maxDelta then
+    dx = maxDelta
+  elseif dx < -maxDelta then
+    dx = -maxDelta
+  end
+  if dy > maxDelta then
+    dy = maxDelta
+  elseif dy < -maxDelta then
+    dy = -maxDelta
+  end
+
+  -- CRITICAL FIX: Replace instead of accumulate.
+  -- During frame hitches, multiple mouse events can fire before the frame processes.
+  -- Accumulating causes huge camera jumps. Using only the most recent delta
+  -- maintains smooth feel even during stutters.
+  self.lookDx = dx
+  self.lookDy = dy
 end
 
 function Input:onMousePressed(button)

@@ -1,5 +1,42 @@
 # Dev Log
 
+## 2026-03-06
+
+### FOV Culling Adjustment
+- Widened cone-based FOV culling in `src/render/ChunkRenderer.lua`:
+  - Increased effective culling angle by 15% to prevent edge chunks from disappearing.
+  - Removed experimental frustum plane culling (too aggressive, caused visible popping).
+  - Cone-based approach is simpler and more reliable for voxel chunks.
+- Culling is now more conservative (renders slightly more off-screen chunks) to avoid any visible popping.
+
+### Adjusted Render & Simulation Distance
+- Set both `drawRadiusChunks` and `simulationRadiusChunks` to **6** in `src/constants.lua`:
+  - Render distance: 16 → 6 chunks (96 blocks view distance).
+  - Simulation distance: 4 → 6 chunks (mobs/items now match render range).
+  - Provides consistent gameplay experience - entities exist where you can see them.
+  - Good balance between visual range and performance.
+
+
+
+### Mouse Input Fix - Camera Jolting
+- Fixed camera jolting bug caused by mouse delta accumulation during frame hitches:
+  - **Root cause**: `Input:onMouseMoved()` was accumulating deltas (`self.lookDx = self.lookDx + dx`), 
+    so during a 30ms frame hitch, 3-5 mouse events would accumulate and cause a huge camera jump.
+  - **Fix**: Changed to use only the most recent delta (`self.lookDx = dx`) instead of accumulating.
+  - Added per-event clamping (max 100 pixels) as safety net for driver/OS issues.
+  - This prevents the "small mouse input causes huge camera jump" issue while maintaining
+    responsive feel during normal gameplay.
+
+### Reduced Rebuild Budgets to Prevent Spikes
+- Lowered mesh rebuild budgets in `src/constants.lua`:
+  - `REBUILD.maxPerFrame`: 10 → **3** chunks max per frame
+  - `REBUILD.maxMillisPerFrame`: 1.2 → **0.8** ms budget
+  - `REBUILD.initialBurstMax`: 700 → **200** (reduced startup hitch)
+  - Pruning budgets also reduced by ~50%
+- Modified `ChunkRenderer:rebuildDirty()` to prefer deferring over sync rebuild:
+  - When threads are busy (fallback status), defer to next frame instead of rebuilding synchronously.
+  - Only do synchronous rebuilds when threading is completely disabled/failed.
+
 ## 2026-03-03
 
 ### Head Bob Camera Effect

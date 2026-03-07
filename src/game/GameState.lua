@@ -175,7 +175,7 @@ function GameState.new(constants)
   self._autosaveTimer = 0
   self._saveStatusText = nil
   self._saveStatusTimer = 0
-  self._simulationChunkRadius = 4
+  self._simulationChunkRadius = 6
   self._chunkDirtyRadius = 0
   self._activeMinChunkY = 1
   self._activeMaxChunkY = 1
@@ -976,7 +976,7 @@ function GameState:_teardownSession()
   self._shaderStatusSkySubtract = nil
   self._shaderStatusError = nil
   self._autosaveTimer = 0
-  self._simulationChunkRadius = 4
+  self._simulationChunkRadius = 6
   self._chunkDirtyRadius = 0
   self._activeMinChunkY = 1
   self._activeMaxChunkY = 1

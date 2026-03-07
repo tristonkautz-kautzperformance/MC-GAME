@@ -1540,6 +1540,15 @@ function GameState:_updateGame(dt)
 
   local dx, dy = self.input:getLookDelta()
   if dx ~= 0 or dy ~= 0 then
+    -- Frame hitch detection: if dt is large, we're stuttering.
+    -- Mouse deltas during hitches are unreliable due to event accumulation.
+    -- Scale down input proportionally to hitch severity.
+    local expectedDt = 1 / 60
+    if dt > expectedDt * 1.5 then
+      local scale = expectedDt / dt
+      dx = dx * scale
+      dy = dy * scale
+    end
     self.player:applyLook(dx, dy)
   end
   self.player:updateLook(dt)

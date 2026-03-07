@@ -26,6 +26,10 @@
   - Added per-event clamping (max 100 pixels) as safety net for driver/OS issues.
   - This prevents the "small mouse input causes huge camera jump" issue while maintaining
     responsive feel during normal gameplay.
+- Added **frame hitch detection** (`GameState:_updateGame()`):
+  - If frame time (dt) exceeds 1.5x expected (indicating a stutter), mouse input is scaled down.
+  - Formula: `scale = expectedDt / dt`, so a 30ms hitch reduces mouse input by 50%.
+  - This counteracts the "mouse sensitivity increases during lag" feel.
 
 ### Reduced Rebuild Budgets to Prevent Spikes
 - Lowered mesh rebuild budgets in `src/constants.lua`:

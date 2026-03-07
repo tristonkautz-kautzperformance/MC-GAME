@@ -122,24 +122,11 @@ function Input:onMouseMoved(dx, dy)
     return
   end
 
-  -- Clamp individual mouse deltas to prevent spurious large inputs
-  -- from OS-level mouse acceleration or driver bugs.
-  local maxDelta = 100
-  if dx > maxDelta then
-    dx = maxDelta
-  elseif dx < -maxDelta then
-    dx = -maxDelta
-  end
-  if dy > maxDelta then
-    dy = maxDelta
-  elseif dy < -maxDelta then
-    dy = -maxDelta
-  end
+  -- Simple clamping for obviously broken values
+  local hardMax = 100
+  if dx > hardMax then dx = hardMax elseif dx < -hardMax then dx = -hardMax end
+  if dy > hardMax then dy = hardMax elseif dy < -hardMax then dy = -hardMax end
 
-  -- CRITICAL FIX: Replace instead of accumulate.
-  -- During frame hitches, multiple mouse events can fire before the frame processes.
-  -- Accumulating causes huge camera jumps. Using only the most recent delta
-  -- maintains smooth feel even during stutters.
   self.lookDx = dx
   self.lookDy = dy
 end

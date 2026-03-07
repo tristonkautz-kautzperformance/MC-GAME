@@ -1,5 +1,44 @@
 # Dev Log
 
+## 2026-03-03
+
+### Head Bob Camera Effect
+- Added subtle head bob to camera when walking in `src/player.lua`:
+  - Bob activates when player is moving on ground, fades in/out smoothly.
+  - Sine wave based with configurable amplitude (0.06 default) and frequency (2.2 default).
+  - Bob pauses when jumping/falling (not on ground).
+  - Added `headBobEnabled`, `headBobAmplitude`, `headBobFrequency` to `Constants.PLAYER` in `src/constants.lua`.
+  - Bob phase advances continuously while moving, amount fades smoothly to avoid jarring starts/stops.
+
+### Camera Sensitivity Options Menu
+- Added Options submenu to pause menu in `src/ui/MainMenu.lua`:
+  - New 'Options' button in pause menu that opens the submenu.
+  - Sensitivity slider with visual bar `[||||||----]` adjusted via Left/Right or A/D keys.
+  - Slider value (0.0-1.0) mapped to sensitivity range 0.0005-0.006 in `src/game/GameState.lua`.
+  - Added `_updatePlayerSensitivity()` to sync menu setting to player.
+- Reduced default `lookSensitivity` from 0.0028 to 0.0022 in `src/constants.lua`.
+
+### Mouse Camera Smoothing
+- Added smoothing to mouse camera movement in `src/player.lua`:
+  - `Player` now tracks target yaw/pitch separately from current values.
+  - `applyLook()` updates target angles; `updateLook(dt)` interpolates current toward target.
+  - Uses exponential decay smoothing for natural-feeling camera weight.
+  - Handles yaw wrap-around for shortest-path interpolation (prevents spins when crossing 180°).
+- Added `lookSmoothing` config to `Constants.PLAYER` in `src/constants.lua` (default 0.15).
+  - Higher values = snappier, lower = smoother/heavier feel.
+- Updated `src/game/GameState.lua` to call `player:updateLook(dt)` each frame.
+
+## 2026-03-02
+
+### Leaf Drop Rate Adjustment
+- Updated `src/game/GameState.lua` `_spawnBlockDrop()` to reduce leaf block clutter when trees are harvested:
+  - Leaf blocks now have a 25% total chance of dropping anything when broken.
+  - When a drop occurs (within that 25%), it's split 50/50 between:
+    - Dropping a leaf block (12.5% overall chance)
+    - Dropping a stick (12.5% overall chance)
+  - This applies to both single leaf block breaks and tree cascade breaks.
+- Goal: reduce inventory clutter from excessive leaf blocks while maintaining some resource rewards from tree harvesting.
+
 ## 2026-02-23
 
 ### Threaded Meshing Prep: Fast Sky Ensure Path

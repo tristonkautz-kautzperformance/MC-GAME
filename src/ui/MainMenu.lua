@@ -25,6 +25,7 @@ end
 function MainMenu.new()
   local self = setmetatable({}, MainMenu)
   self.mode = 'main'
+  self.submenu = nil
   self.hasSave = false
   self.canContinue = false
   self.saveMeta = nil
@@ -36,6 +37,10 @@ function MainMenu.new()
   self._cameraPosition = lovr.math.newVec3(0, 1.6, 0)
   self._cameraOrientation = lovr.math.newQuat()
   self._textOrientation = lovr.math.newQuat()
+  -- Options settings
+  self.options = {
+    sensitivity = 0.5 -- 0.0 to 1.0, will be mapped to actual sensitivity range
+  }
   self:_rebuildItems()
   return self
 end
@@ -53,8 +58,16 @@ function MainMenu:setMode(mode)
   end
 
   self.mode = mode
+  self.submenu = nil
   self.confirmAction = nil
   self._nextAction = nil
+  self:_rebuildItems()
+end
+
+function MainMenu:setSubmenu(submenu)
+  self.submenu = submenu
+  self.selected = 1
+  self.confirmAction = nil
   self:_rebuildItems()
 end
 
@@ -74,6 +87,14 @@ function MainMenu:setStatusText(statusText)
   self.statusText = statusText
 end
 
+function MainMenu:setOptionSensitivity(value)
+  self.options.sensitivity = math.max(0.0, math.min(1.0, value))
+end
+
+function MainMenu:getOptionSensitivity()
+  return self.options.sensitivity
+end
+
 function MainMenu:_rebuildItems()
   local selectedAction = nil
   local current = self.items[self.selected]
@@ -82,7 +103,14 @@ function MainMenu:_rebuildItems()
   end
 
   local items = {}
-  if self.mode == 'main' then
+  if self.submenu == 'options' then
+    -- Options submenu
+    items[1] = {
+      label = 'Back',
+      action = 'back',
+      enabled = true
+    }
+  elseif self.mode == 'main' then
     items[1] = {
       label = 'Continue',
       action = 'continue',
@@ -115,11 +143,16 @@ function MainMenu:_rebuildItems()
       enabled = true
     }
     items[3] = {
+      label = 'Options',
+      action = 'options',
+      enabled = true
+    }
+    items[4] = {
       label = 'Delete Save',
       action = 'delete_save',
       enabled = true
     }
-    items[4] = {
+    items[5] = {
       label = 'Quit',
       action = 'quit',
       enabled = true
@@ -164,9 +197,25 @@ function MainMenu:_moveSelection(delta)
   end
 end
 
+function MainMenu:_adjustSensitivity(delta)
+  local step = 0.1
+  self.options.sensitivity = math.max(0.0, math.min(1.0, self.options.sensitivity + delta * step))
+  self._nextAction = 'sensitivity_changed'
+end
+
 function MainMenu:_activateSelected()
   local item = self.items[self.selected]
   if not item or not item.enabled then
+    return
+  end
+
+  if item.action == 'options' then
+    self:setSubmenu('options')
+    return
+  end
+
+  if item.action == 'back' then
+    self:setSubmenu(nil)
     return
   end
 
@@ -219,6 +268,18 @@ function MainMenu:onKeyPressed(key)
     return
   end
 
+  if self.submenu == 'options' and self.selected == 1 then
+    -- On sensitivity slider row
+    if key == 'left' or key == 'a' then
+      self:_adjustSensitivity(-1)
+      return
+    end
+    if key == 'right' or key == 'd' then
+      self:_adjustSensitivity(1)
+      return
+    end
+  end
+
   if key == 'return' or key == 'kpenter' then
     self:_activateSelected()
     return
@@ -230,6 +291,10 @@ function MainMenu:onKeyPressed(key)
         self.statusText = nil
       end
       self.confirmAction = nil
+      return
+    end
+    if self.submenu then
+      self:setSubmenu(nil)
       return
     end
     if self.mode == 'pause' then
@@ -246,14 +311,34 @@ function MainMenu:consumeAction()
   return action
 end
 
+function MainMenu:_drawSlider(pass, label, value, y, isSelected)
+  local prefix = isSelected and '> ' or '  '
+  local filled = math.floor(value * 10 + 0.5)
+  local empty = 10 - filled
+  local bar = '[' .. string.rep('|', filled) .. string.rep('-', empty) .. ']'
+  local text = prefix .. label .. ' ' .. bar
+  
+  if isSelected then
+    pass:setColor(1.00, 0.95, 0.72, 1)
+  else
+    pass:setColor(0.92, 0.92, 0.92, 1)
+  end
+  pass:text(text, -0.90, y, -2.6, 0.07, self._textOrientation)
+end
+
 function MainMenu:draw(pass)
   pass:setViewPose(1, self._cameraPosition, self._cameraOrientation)
   pass:push('state')
 
   local title = self.mode == 'main' and 'Voxel Clone' or 'Paused'
-  local subtitle = self.mode == 'main'
-    and 'Enter: Select  Up/Down: Navigate  Esc: Quit'
-    or 'Enter: Select  Up/Down: Navigate  Esc: Resume'
+  local subtitle
+  if self.submenu == 'options' then
+    subtitle = 'Left/Right: Adjust  Enter: Back'
+  elseif self.mode == 'main' then
+    subtitle = 'Enter: Select  Up/Down: Navigate  Esc: Quit'
+  else
+    subtitle = 'Enter: Select  Up/Down: Navigate  Esc: Resume'
+  end
 
   pass:setColor(0.95, 0.96, 0.98, 1)
   pass:text(title, -0.90, 2.10, -2.6, 0.14, self._textOrientation)
@@ -261,31 +346,51 @@ function MainMenu:draw(pass)
   pass:text(subtitle, -0.90, 1.95, -2.6, 0.05, self._textOrientation)
 
   local y = 1.72
-  for i = 1, #self.items do
-    local item = self.items[i]
-    local isSelected = (i == self.selected)
-    local prefix = isSelected and '> ' or '  '
-    local label = prefix .. item.label
-    if not item.enabled then
-      label = label .. ' (Unavailable)'
-    end
-
-    if item.enabled then
+  
+  if self.submenu == 'options' then
+    -- Draw sensitivity slider
+    self:_drawSlider(pass, 'Sensitivity', self.options.sensitivity, y, self.selected == 1)
+    y = y - 0.12
+    -- Draw back button
+    local backItem = self.items[2]
+    if backItem then
+      local isSelected = (self.selected == 2)
+      local prefix = isSelected and '> ' or '  '
       if isSelected then
         pass:setColor(1.00, 0.95, 0.72, 1)
       else
         pass:setColor(0.92, 0.92, 0.92, 1)
       end
-    else
-      pass:setColor(0.48, 0.50, 0.53, 1)
+      pass:text(prefix .. backItem.label, -0.90, y, -2.6, 0.07, self._textOrientation)
+      y = y - 0.12
     end
+  else
+    for i = 1, #self.items do
+      local item = self.items[i]
+      local isSelected = (i == self.selected)
+      local prefix = isSelected and '> ' or '  '
+      local label = prefix .. item.label
+      if not item.enabled then
+        label = label .. ' (Unavailable)'
+      end
 
-    pass:text(label, -0.90, y, -2.6, 0.07, self._textOrientation)
-    y = y - 0.12
+      if item.enabled then
+        if isSelected then
+          pass:setColor(1.00, 0.95, 0.72, 1)
+        else
+          pass:setColor(0.92, 0.92, 0.92, 1)
+        end
+      else
+        pass:setColor(0.48, 0.50, 0.53, 1)
+      end
+
+      pass:text(label, -0.90, y, -2.6, 0.07, self._textOrientation)
+      y = y - 0.12
+    end
   end
 
   local messageY = y - 0.06
-  if self.mode == 'main' then
+  if self.mode == 'main' and not self.submenu then
     local saveMeta = self.saveMeta
     local saveSummary = 'Save: None'
     local lastSaved = 'Last saved: Unknown'

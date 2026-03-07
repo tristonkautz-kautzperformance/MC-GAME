@@ -421,6 +421,22 @@ function GameState:_getCraftingConfig()
   return self.constants.CRAFTING or {}
 end
 
+function GameState:_updatePlayerSensitivity()
+  if not self.player then
+    return
+  end
+  local menu = self.menu
+  if not menu then
+    return
+  end
+  -- Map 0.0-1.0 slider to sensitivity range (0.0005 to 0.006)
+  local sliderValue = menu:getOptionSensitivity()
+  local minSens = 0.0005
+  local maxSens = 0.006
+  local newSensitivity = minSens + sliderValue * (maxSens - minSens)
+  self.player.lookSensitivity = newSensitivity
+end
+
 function GameState:_resetCraftingSlots()
   local crafting = self:_getCraftingConfig()
   local bagCount = math.max(1, math.floor(tonumber(crafting.bagSlotCount) or 2))
@@ -790,15 +806,34 @@ function GameState:_spawnBlockDrop(blockBreakResult)
   end
 
   local AIR = self.constants.BLOCK.AIR
+  local LEAF = self.constants.BLOCK.LEAF
+  local STICK = self.constants.ITEM.STICK
   local scatter = { scatter = true }
   local batch = blockBreakResult.blocks
+
+  -- Leaf drop configuration: 25% total chance, split 50/50 between leaf block and stick
+  local LEAF_DROP_CHANCE = 0.25
+  local LEAF_VS_STICK_SPLIT = 0.5
 
   if batch and #batch > 0 then
     for i = 1, #batch do
       local entry = batch[i]
       local block = entry and entry.block or AIR
       if block ~= AIR then
-        self.itemEntities:spawn(block, entry.x - 0.5, entry.y - 0.5, entry.z - 0.5, 1, nil, scatter)
+        local dropBlock = block
+        -- For leaf blocks, apply drop chance: 25% chance of any drop,
+        -- split 50/50 between leaf block and stick
+        if block == LEAF then
+          if math.random() > LEAF_DROP_CHANCE then
+            dropBlock = nil -- No drop
+          elseif math.random() <= LEAF_VS_STICK_SPLIT then
+            dropBlock = STICK -- Drop stick instead of leaf
+          end
+          -- else: dropBlock remains LEAF (50% of the 25% = 12.5% overall)
+        end
+        if dropBlock then
+          self.itemEntities:spawn(dropBlock, entry.x - 0.5, entry.y - 0.5, entry.z - 0.5, 1, nil, scatter)
+        end
       end
     end
     return
@@ -806,15 +841,26 @@ function GameState:_spawnBlockDrop(blockBreakResult)
 
   local block = blockBreakResult.block
   if block ~= AIR then
-    self.itemEntities:spawn(
-      block,
-      blockBreakResult.x - 0.5,
-      blockBreakResult.y - 0.5,
-      blockBreakResult.z - 0.5,
-      1,
-      nil,
-      scatter
-    )
+    local dropBlock = block
+    -- Apply same leaf drop logic for single block breaks
+    if block == LEAF then
+      if math.random() > LEAF_DROP_CHANCE then
+        dropBlock = nil -- No drop
+      elseif math.random() <= LEAF_VS_STICK_SPLIT then
+        dropBlock = STICK -- Drop stick instead of leaf
+      end
+    end
+    if dropBlock then
+      self.itemEntities:spawn(
+        dropBlock,
+        blockBreakResult.x - 0.5,
+        blockBreakResult.y - 0.5,
+        blockBreakResult.z - 0.5,
+        1,
+        nil,
+        scatter
+      )
+    end
   end
 end
 
@@ -1016,6 +1062,7 @@ function GameState:_startSession(loadSave)
   self.player.pitch = startPitch
   self.player.velocityY = 0
   self.player.onGround = false
+  self:_updatePlayerSensitivity()
 
   if savedPlayerState and self.player:_collides(self.world) then
     self.player.x = spawnX
@@ -1252,6 +1299,16 @@ function GameState:_handleMenuAction(action)
     return
   end
 
+  if action == 'options' then
+    -- Options submenu is handled by the menu itself
+    return
+  end
+
+  if action == 'sensitivity_changed' then
+    self:_updatePlayerSensitivity()
+    return
+  end
+
   if action == 'quit' then
     local savedOk = true
     local savedReason = nil
@@ -1485,6 +1542,7 @@ function GameState:_updateGame(dt)
   if dx ~= 0 or dy ~= 0 then
     self.player:applyLook(dx, dy)
   end
+  self.player:updateLook(dt)
 
   local forward, right = self.input:getMoveAxes()
   local wantJump = self.input:consumeJump()

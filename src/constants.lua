@@ -562,7 +562,11 @@ Constants.PLAYER = {
   gravity = 22.0,
   jumpSpeed = 8.0,
   reach = 6.0,
-  lookSensitivity = 0.0028
+  lookSensitivity = 0.0022,
+  lookSmoothing = 0.15,
+  headBobEnabled = true,
+  headBobAmplitude = 0.06,
+  headBobFrequency = 2.2
 }
 
 Constants.STATS = {

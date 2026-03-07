@@ -29,21 +29,53 @@ function Player.new(config, x, y, z)
   self.jumpSpeed = config.jumpSpeed
   self.reach = config.reach
   self.lookSensitivity = config.lookSensitivity
+  self.lookSmoothing = config.lookSmoothing or 0.15
+  self.headBobEnabled = config.headBobEnabled ~= false
+  self.headBobAmplitude = config.headBobAmplitude or 0.06
+  self.headBobFrequency = config.headBobFrequency or 10.5
 
   self.yaw = 0
   self.pitch = 0
+  self._targetYaw = 0
+  self._targetPitch = 0
   self.velocityY = 0
   self.onGround = false
   self._cameraYawQuat = lovr.math.newQuat(0, 0, 1, 0)
   self._cameraPitchQuat = lovr.math.newQuat(0, 1, 0, 0)
 
+  -- Head bob state
+  self._bobPhase = 0
+  self._bobAmount = 0
+  self._wasMoving = false
+
   return self
 end
 
 function Player:applyLook(mouseDx, mouseDy)
-  self.yaw = self.yaw - mouseDx * self.lookSensitivity
-  self.pitch = self.pitch - mouseDy * self.lookSensitivity
-  self.pitch = clamp(self.pitch, -1.50, 1.50)
+  self._targetYaw = self._targetYaw - mouseDx * self.lookSensitivity
+  self._targetPitch = self._targetPitch - mouseDy * self.lookSensitivity
+  self._targetPitch = clamp(self._targetPitch, -1.50, 1.50)
+end
+
+function Player:updateLook(dt)
+  dt = dt or (1 / 60)
+  -- Exponential decay smoothing: faster when further from target
+  local smoothing = self.lookSmoothing or 0.15
+  local factor = 1.0 - math.exp(-smoothing * 60 * dt)
+  
+  -- Handle yaw wrap-around for shortest-path interpolation
+  local yawDiff = self._targetYaw - self.yaw
+  while yawDiff > math.pi do
+    yawDiff = yawDiff - 2 * math.pi
+    self._targetYaw = self._targetYaw - 2 * math.pi
+  end
+  while yawDiff < -math.pi do
+    yawDiff = yawDiff + 2 * math.pi
+    self._targetYaw = self._targetYaw + 2 * math.pi
+  end
+  
+  self.yaw = self.yaw + yawDiff * factor
+  self.pitch = self.pitch + (self._targetPitch - self.pitch) * factor
 end
 
 function Player:getLookVector()
@@ -55,7 +87,42 @@ function Player:getLookVector()
 end
 
 function Player:getCameraPosition()
-  return self.x, self.y + self.eyeHeight, self.z
+  local bobOffset = self.headBobEnabled and self:_getHeadBobOffset() or 0
+  return self.x, self.y + self.eyeHeight + bobOffset, self.z
+end
+
+function Player:_getHeadBobOffset()
+  -- Smooth fade in/out of bob
+  return self._bobAmount * math.sin(self._bobPhase)
+end
+
+function Player:updateHeadBob(dt, isMovingOnGround)
+  if not self.headBobEnabled then
+    self._bobAmount = 0
+    return
+  end
+
+  dt = dt or (1 / 60)
+  local targetAmount = isMovingOnGround and self.headBobAmplitude or 0
+  
+  -- Smoothly fade bob in/out when starting/stopping
+  local fadeSpeed = 8.0
+  local diff = targetAmount - self._bobAmount
+  if math.abs(diff) < 0.001 then
+    self._bobAmount = targetAmount
+  else
+    self._bobAmount = self._bobAmount + diff * math.min(1.0, fadeSpeed * dt)
+  end
+
+  -- Advance phase when moving or when bob hasn't settled
+  if isMovingOnGround or self._bobAmount > 0.001 then
+    self._bobPhase = self._bobPhase + self.headBobFrequency * dt * math.pi * 2
+  end
+  
+  -- Keep phase bounded to prevent floating point issues
+  if self._bobPhase > math.pi * 1000 then
+    self._bobPhase = self._bobPhase % (math.pi * 2)
+  end
 end
 
 function Player:getCameraOrientation()
@@ -191,6 +258,11 @@ function Player:update(dt, world, input)
   else
     self.onGround = false
   end
+
+  -- Update head bob based on movement
+  local isMoving = (math.abs(forwardInput) > 0 or math.abs(rightInput) > 0)
+  local isMovingOnGround = isMoving and self.onGround
+  self:updateHeadBob(dt, isMovingOnGround)
 end
 
 function Player:overlapsBlock(x, y, z)
